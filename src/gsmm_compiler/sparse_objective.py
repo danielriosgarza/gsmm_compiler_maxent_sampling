@@ -40,7 +40,7 @@ from numpy.typing import NDArray
 
 from gsmm_compiler.config import ObjectiveConfig
 from gsmm_compiler.flux_polytope import FluxPolytope, ReducedPolytope
-from gsmm_compiler.highs_backend import HighsLinearProgram, LPSolution
+from gsmm_compiler.highs_backend import HighsLinearProgram, LPNotOptimalError, LPSolution
 from gsmm_compiler.native_csc import INDEX_DTYPE, VALUE_DTYPE, NativeCSC
 from gsmm_compiler.provenance import content_key
 
@@ -199,26 +199,40 @@ class SparseFluxObjective:
 
     # ---- construction ---------------------------------------------------------------------------
 
+    def with_l1_penalty(self, l1_penalty: float) -> SparseFluxObjective:
+        """A copy carrying a different λ. The penalty set and weights are unchanged, so ``λ*`` —
+        which depends only on those — is unchanged too. This is how `resolve_objective` turns a
+        dimensionless ``λ̃`` into the raw λ that ``J`` actually uses."""
+        return SparseFluxObjective(
+            reaction_ids=self.reaction_ids,
+            biomass_index=self.biomass_index,
+            l1_penalty=l1_penalty,
+            penalty_mask=self.penalty_mask,
+            weights=self.weights,
+        )
+
     @classmethod
     def from_polytope(
         cls,
         polytope: FluxPolytope,
-        config: ObjectiveConfig | None = None,
         *,
+        l1_penalty: float = 0.0,
+        exclude_biomass_from_penalty: bool = True,
         penalty_ids: tuple[str, ...] | None = None,
         weights: NDArray[np.float64] | None = None,
     ) -> SparseFluxObjective:
         """Build the objective: by default every reaction penalized except biomass, unit weights.
 
-        Exchange, demand and sink reactions stay **in** the penalty set (spec §3.2). Excluding them
-        would change what the cost means — it would make import free.
+        Takes a **raw** λ and touches no solver — `resolve_objective` is the config-driven entry
+        point that computes λ from the model's own scale. Exchange, demand and sink reactions stay
+        **in** the penalty set (spec §3.2). Excluding them would change what the cost means: it
+        would make import free.
         """
-        settings = config if config is not None else ObjectiveConfig()
         n = polytope.n_reactions
 
         if penalty_ids is None:
             mask = np.ones(n, dtype=np.bool_)
-            if settings.exclude_biomass_from_penalty:
+            if exclude_biomass_from_penalty:
                 mask[polytope.biomass_index] = False
         else:
             index_of = {rid: i for i, rid in enumerate(polytope.reaction_ids)}
@@ -241,7 +255,7 @@ class SparseFluxObjective:
         return cls(
             reaction_ids=polytope.reaction_ids,
             biomass_index=polytope.biomass_index,
-            l1_penalty=settings.l1_penalty,
+            l1_penalty=l1_penalty,
             penalty_mask=mask,
             weights=weight_vector,
         )
@@ -626,3 +640,239 @@ def _reject_singleton(reduced: ReducedPolytope, what: str) -> None:
             f"cannot build a {what}: every reaction is fixed, so the reduced polytope is a single "
             "point with no variables. Callers must handle the singleton case (M4's dim-0 path)."
         )
+
+
+# ---- λ's scale: the sparsity cliff (BUILD_PLAN §1.7) ---------------------------------------------
+
+
+def origin_is_feasible(polytope: FluxPolytope) -> bool:
+    """Is ``v = 0`` inside the polytope?
+
+    ``S·0 = 0`` always, so this asks only whether any reaction is *forced* to carry flux — an
+    ``l > 0`` or ``u < 0``, typically an ATP-maintenance demand. It is the precondition for the
+    collapse in §1.7: a cell that must spend ATP to stay alive cannot answer a large λ by shutting
+    down, because shutting down is not available to it.
+    """
+    return bool(np.all(polytope.lower_bounds <= 0.0) and np.all(polytope.upper_bounds >= 0.0))
+
+
+def critical_l1_penalty(
+    reduced: ReducedPolytope, objective: SparseFluxObjective, *, threads: int = 1
+) -> float:
+    """``λ* = max_{v ∈ P, C(v) > 0} μ(v) / C(v)`` — the λ at which growth stops paying for itself.
+
+    Depends only on the polytope, the penalty set and the **weights** — not on λ itself, so it is
+    the natural unit in which to express λ. Above it, ``μ − λC`` is maximized by ``v = 0`` (when the
+    origin is feasible), and every downstream stage would tilt toward a cell that does nothing.
+
+    Computed **exactly, with one LP**, not by bisection. ``μ/C`` is a linear-fractional program, and
+    the Charnes–Cooper substitution ``y = v·t, t = 1/C(v)`` turns it into a linear one: maximizing
+    ``μ(y)`` subject to a unit cost budget ``C(y) ≤ 1``. The bounds ``l ≤ v ≤ u`` are not a cone, so
+    they homogenize into rows ``l·t ≤ y ≤ u·t`` rather than staying column bounds, and the absolute
+    value in ``C`` linearizes with the same ``z ≥ ±y`` trick as §12.
+
+    Returns ``inf`` when the LP is unbounded — a growth path whose weighted L1 cost is zero, so no λ
+    can ever suppress it and there is no cliff at all.
+    """
+    _reject_singleton(reduced, "critical-λ LP")
+
+    n = reduced.n_free
+    m = len(reduced.metabolite_ids)
+    weights_free = objective.weights[reduced.free_indices]
+    penalized = np.flatnonzero(weights_free > 0.0).astype(np.intp)
+    p = int(penalized.size)
+
+    # The fixed reactions' share of C(v) is a constant, so under y = v·t it scales with t.
+    fixed_cost = objective.evaluate(reduced.offset).cost
+
+    row_of_lower = m
+    row_of_upper = m + n
+    row_of_z = m + 2 * n
+    row_of_budget = m + 2 * n + 2 * p
+    n_rows = row_of_budget + 1
+    column_of_t = n + p
+
+    lp_column_of: dict[int, int] = {int(j): k for k, j in enumerate(penalized)}
+    columns: list[dict[int, float]] = []
+
+    for j in range(n):
+        column: dict[int, float] = {
+            int(row): float(value)
+            for row, value in zip(
+                reduced.stoichiometry.indices[
+                    reduced.stoichiometry.starts[j] : reduced.stoichiometry.starts[j + 1]
+                ],
+                reduced.stoichiometry.values[
+                    reduced.stoichiometry.starts[j] : reduced.stoichiometry.starts[j + 1]
+                ],
+                strict=True,
+            )
+        }
+        column[row_of_lower + j] = 1.0  # y_j − l_j·t ≥ 0
+        column[row_of_upper + j] = 1.0  # y_j − u_j·t ≤ 0
+        if j in lp_column_of:
+            k = lp_column_of[j]
+            column[row_of_z + 2 * k] = 1.0  # +y_j − z_k ≤ 0
+            column[row_of_z + 2 * k + 1] = -1.0  # −y_j − z_k ≤ 0
+        columns.append(column)
+
+    for k, penalized_column in enumerate(penalized):
+        columns.append(
+            {
+                row_of_z + 2 * k: -1.0,
+                row_of_z + 2 * k + 1: -1.0,
+                row_of_budget: float(weights_free[penalized_column]),
+            }
+        )
+
+    t_column: dict[int, float] = {
+        int(row): -float(value) for row, value in enumerate(reduced.rhs) if value != 0.0
+    }
+    for j in range(n):
+        if reduced.lower_bounds[j] != 0.0:
+            t_column[row_of_lower + j] = -float(reduced.lower_bounds[j])
+        if reduced.upper_bounds[j] != 0.0:
+            t_column[row_of_upper + j] = -float(reduced.upper_bounds[j])
+    if fixed_cost != 0.0:
+        t_column[row_of_budget] = fixed_cost
+    columns.append(t_column)
+
+    row_lower = np.concatenate(
+        [
+            reduced.rhs * 0.0,  # S_F y − rhs·t = 0
+            np.zeros(n, dtype=VALUE_DTYPE),  # y − l·t ≥ 0
+            np.full(n + 2 * p + 1, -np.inf, dtype=VALUE_DTYPE),
+        ]
+    )
+    row_upper = np.concatenate(
+        [
+            reduced.rhs * 0.0,
+            np.full(n, np.inf, dtype=VALUE_DTYPE),
+            np.zeros(n + 2 * p, dtype=VALUE_DTYPE),  # y − u·t ≤ 0 and the z rows
+            np.ones(1, dtype=VALUE_DTYPE),  # the unit cost budget: C(y) ≤ 1
+        ]
+    )
+
+    # y is free (it is v·t, not v); z ≥ 0 and t ≥ 0 by construction.
+    col_lower = np.concatenate([np.full(n, -np.inf), np.zeros(p + 1)]).astype(VALUE_DTYPE)
+    col_upper = np.full(n + p + 1, np.inf, dtype=VALUE_DTYPE)
+
+    cost = np.zeros(n + p + 1, dtype=VALUE_DTYPE)
+    if reduced.biomass_index is not None:
+        cost[reduced.biomass_index] = 1.0
+    else:
+        # Biomass is fixed, so μ(v) is the constant c_b and μ(y) = c_b·t.
+        cost[column_of_t] = float(reduced.offset[objective.biomass_index])
+
+    program = HighsLinearProgram(
+        matrix=NativeCSC.from_columns(n_rows, columns),
+        col_lower=col_lower,
+        col_upper=col_upper,
+        row_lower=row_lower,
+        row_upper=row_upper,
+        col_cost=cost,
+        maximize=True,
+        threads=threads,
+        name="critical_l1_penalty",
+    )
+    try:
+        return float(program.solve().objective_value)
+    except LPNotOptimalError as unbounded:
+        if "Unbounded" not in unbounded.model_status:
+            raise
+        # Growth at zero weighted L1 cost: no λ can ever suppress it, so there is no cliff.
+        return float("inf")
+
+
+@dataclass(frozen=True)
+class ObjectiveScale:
+    """How the raw λ in `SparseFluxObjective` was arrived at (BUILD_PLAN §1.7).
+
+    Recorded in full — spec §3.6 forbids hidden scaling — so a reader can always recover the raw λ
+    the mathematics actually used, and compare ``λ̃`` across strains that have different ``λ*``.
+    """
+
+    l1_penalty_scaled: float
+    """``λ̃``, dimensionless. The knob the user turns; comparable across models."""
+    critical_l1_penalty: float
+    """``λ*``, this model's own cliff. ``inf`` if the model has no cliff."""
+    l1_penalty: float
+    """``λ = λ̃ · λ*`` — the raw penalty ``J`` is actually computed with."""
+    origin_is_feasible: bool
+    """Whether ``v = 0`` is available to the model. If not, no λ can collapse it."""
+
+    def manifest(self) -> dict[str, object]:
+        return {
+            "l1_penalty_scaled": self.l1_penalty_scaled,
+            "critical_l1_penalty": self.critical_l1_penalty,
+            "l1_penalty": self.l1_penalty,
+            "origin_is_feasible": self.origin_is_feasible,
+        }
+
+
+@dataclass(frozen=True)
+class ResolvedObjective:
+    """A `SparseFluxObjective` together with the scale reasoning that produced its λ."""
+
+    objective: SparseFluxObjective
+    scale: ObjectiveScale
+
+    def manifest(self) -> dict[str, object]:
+        return {**self.objective.manifest(), "scale": self.scale.manifest()}
+
+
+def resolve_objective(
+    polytope: FluxPolytope,
+    reduced: ReducedPolytope,
+    config: ObjectiveConfig | None = None,
+    *,
+    penalty_ids: tuple[str, ...] | None = None,
+    weights: NDArray[np.float64] | None = None,
+    threads: int = 1,
+) -> ResolvedObjective:
+    """Turn the config's dimensionless ``λ̃`` into the raw λ that ``J`` uses (BUILD_PLAN §1.7).
+
+    ``λ = λ̃ · λ*``, where ``λ*`` is *this model's* sparsity cliff. So ``λ̃ = 0`` is plain FBA and
+    ``λ̃ → 1`` is the most sparsity pressure the model can carry while still growing — and the same
+    ``λ̃`` means the same *selection pressure* in every strain of a batch, which a shared raw λ
+    emphatically does not (§1.1's cross-model comparison depends on this).
+
+    Costs one extra LP per model. Both λ̃ and the raw λ land in the manifest.
+    """
+    settings = config if config is not None else ObjectiveConfig()
+
+    base = SparseFluxObjective.from_polytope(
+        polytope,
+        l1_penalty=0.0,
+        exclude_biomass_from_penalty=settings.exclude_biomass_from_penalty,
+        penalty_ids=penalty_ids,
+        weights=weights,
+    )
+    critical = critical_l1_penalty(reduced, base, threads=threads)
+    origin_feasible = origin_is_feasible(polytope)
+    scaled = settings.l1_penalty_scaled
+
+    if origin_feasible and scaled >= 1.0:
+        raise ObjectiveError(
+            f"objective.l1_penalty_scaled = {scaled} would put λ at or past this model's sparsity "
+            f"cliff (λ* = {critical:.6g}), where the LP optimum is v = 0 and the sampler would "
+            "tilt toward a cell that does nothing. The origin is feasible for this model (no "
+            "reaction is forced to carry flux), so λ̃ must be < 1. See BUILD_PLAN §1.7."
+        )
+    if not np.isfinite(critical):
+        raise ObjectiveError(
+            "this model has a growth path with zero weighted L1 cost, so λ* is unbounded and a "
+            "scale-referenced λ has nothing to reference. Check the penalty set and weights — "
+            "some reaction carrying biomass flux is evidently unpenalized."
+        )
+
+    raw = scaled * critical
+    return ResolvedObjective(
+        objective=base.with_l1_penalty(raw),
+        scale=ObjectiveScale(
+            l1_penalty_scaled=scaled,
+            critical_l1_penalty=critical,
+            l1_penalty=raw,
+            origin_is_feasible=origin_feasible,
+        ),
+    )

@@ -27,22 +27,26 @@
 | Field | Value |
 |---|---|
 | **Active milestone** | **M4 — Affine geometry + span certificate** |
-| **Status** | ⬜ NOT STARTED (M0–M3 gates passed 2026-07-13; 369 tests green) |
+| **Status** | ⬜ NOT STARTED (M0–M3 gates passed 2026-07-13; 392 tests green) |
 | **Next action** | `affine_geometry.py` — scaled coords `s_i`, orthonormal basis (2-pass MGS), support-LP discovery with warm starts (M3 fact: warm starts pay off; `build_flux_lp` is the §14 model to re-solve) |
-| **Blockers** | none for M4. ⚠️ **λ scale is an OPEN decision that blocks M6** — see BUILD_PLAN §1.7 |
+| **Blockers** | none |
 | **Last updated** | 2026-07-13 |
 
 > 🤝 **M4 requires a `/collab` adversarial review as a gate step** — completeness of the deterministic
 > span certificate; scaling/tolerance coupling to LP feasibility tolerance. See CLAUDE.md.
 
-### ⚠️ Open decision: the λ scale (raised by M3, blocks M6)
+### ✅ Settled by M3: λ is scale-referenced (`λ = λ̃ · λ*`)
 
-`J = μ − λC` compares a biomass flux with a sum of hundreds of absolute fluxes. Above a
-model-specific `λ* = max_v μ(v)/C(v)`, **the LP optimum is exactly the origin** — the cell stops
-growing. On the example model `λ* = 1.89e-3`, so our default `λ = 1.0` is **529× past the cliff** and
-the spec's suggested `0.01` is **5.3×** past it. Geometry (M4) and β=0 (M5) are λ-independent, so this
-does not block them; **M6 must not tilt by a `J` whose optimum is zero flux.** Full analysis and the
-raw-vs-scale-referenced fork: BUILD_PLAN §1.7.
+`J = μ − λC` compares a biomass flux with a sum of hundreds of absolute fluxes; above a
+model-specific `λ* = max_v μ(v)/C(v)` the LP optimum is **exactly the origin** and the cell stops
+growing. The old default `λ = 1.0` was **529× past that cliff** on the example model. So the config
+now takes a **dimensionless `λ̃`** (`objective.l1_penalty_scaled`, default 0.5) and `resolve_objective`
+computes `λ = λ̃ · λ*` per model — `λ*` exactly, from one Charnes–Cooper LP. `λ̃ = 0` is plain FBA;
+`λ̃ → 1` is maximum sparsity pressure that still grows; `λ̃ ≥ 1` is refused when the origin is
+feasible. **Same `λ̃` = same selection pressure in every strain**, which is what the cross-model
+comparison needs. Full reasoning: BUILD_PLAN §1.7. **M7 must still decide** whether λ stays frozen at
+its base-weight value through the reweighting loop or is re-resolved from the frozen final weights
+(`λ*` depends on `w`).
 
 ### Platform facts established by M0 (build on these, don't re-derive)
 
@@ -70,7 +74,12 @@ raw-vs-scale-referenced fork: BUILD_PLAN §1.7.
   can now assert *and* prohibit.
 - **Warm starts pay off at genome scale**: 50 random objectives on the §14 flux LP re-solve in well
   under the cold-start pivot count. The sequential geometry phase (§1.2) is on solid ground.
-- ⚠️ **λ has a model-specific cliff** — see the open decision above and BUILD_PLAN §1.7.
+- **λ is scale-referenced, and `λ*` is exact.** `critical_l1_penalty` gets `λ* = max_v μ(v)/C(v)` from
+  **one** LP — `max μ/C` is linear-fractional, and Charnes–Cooper (`y = v·t, t = 1/C(v)`) turns it
+  into "maximize μ(y) subject to a unit cost budget". Don't bisect it. `resolve_objective` is the
+  config-driven entry point; `SparseFluxObjective.from_polytope` stays pure and takes a **raw** λ.
+- ⚠️ **`λ*` depends on the weights** (doubling `w` halves `λ*`). M7 must decide whether λ stays frozen
+  at its base-weight value or is re-resolved from the frozen final weights — it moves `J` either way.
 
 ### Facts established by M2 (the line kernel is now a trusted oracle — build on it)
 
@@ -100,7 +109,7 @@ raw-vs-scale-referenced fork: BUILD_PLAN §1.7.
 ```bash
 cd /home/mcpu/GitHub/gsmm_compiler_maxent_sampling
 .venv/bin/python -V                                    # expect 3.11.15
-.venv/bin/python -m pytest -q | tail -3                # expect 369 passed
+.venv/bin/python -m pytest -q | tail -3                # expect 392 passed
 .venv/bin/ruff check . && .venv/bin/mypy               # expect clean
 .venv/bin/gsmm-compiler model inspect examples/toy_network.json     # affine RHS: nonzero
 .venv/bin/gsmm-compiler model inspect models/GCF_000010425_1_ASM1042v1_protein_non_gapfilled_latest_gapfilled_noO2.json
@@ -145,6 +154,7 @@ Gate: solver objective == direct J · feasibility on degenerate toys · z=|v| wi
 - [x] `sparse_objective.py` — `SparseFluxObjective`; (v,z) LP by **direct CSC assembly** (no scipy blocks); z=|v| checks; biomass-only diagnostic LP; recompute + compare J; `SparseObjectiveSolution` (the L2 bundle: J*, v*, μ*, C*, μ_max, retention, **sparsity-dominated flag**)
 - [x] unit tests: analytic toy optimum, solver-obj==direct-J, z=|v|, feasibility, λ sensitivity, biomass excluded by default, custom weights
 - [x] **gate**: solver obj == direct J on toy + genome-scale across λ ∈ {0, 1e-4, 1e-3, 0.01, 1}; v* feasible in the *full* 773-reaction polytope; degenerate toys (singleton / infeasible / unique-point / tied optima / λ=0) all classified right; no scipy
+- [x] **addendum (settled by user, 2026-07-13)**: λ is **scale-referenced** — `critical_l1_penalty` (exact λ*, one Charnes–Cooper LP), `origin_is_feasible`, `resolve_objective`; config takes dimensionless `l1_penalty_scaled`. See BUILD_PLAN §1.7
 
 ### 🟨 M4 — Affine geometry + span certificate  *(ACTIVE)*
 Gate: known toy dims recovered · truncated basis rejected · ‖S·diag(s)·B‖≈0 · singleton path.
@@ -207,3 +217,4 @@ Only after M0–M9: pilot rerounding + pilot-based `s_J` (bootstrap→pilot→fi
 - 2026-07-13 — **M1 gate PASSED.** Built `native_csc` (int32 CSC + `matvec`/`rmatvec` via `bincount`), `flux_polytope` (canonical + reduced IR with the explicit affine RHS), `model_input` (validation → canonical L0 IR + `model_report.json`), `config` (TOML + overrides, unknown keys rejected), and a new `provenance` module for L0/L1 content keys. Added `examples/toy_network.json` — 7 reactions, with **FIX pinned at 2.0** so the reduced mass balance is genuinely affine, the case the Bifido model cannot exercise (all 513 of its fixed reactions sit at zero). Gate closed by LP-level equivalence: full-vs-reduced optima agree under 200 random objectives on the toy and 10 on the genome-scale model, including the fixed-flux objective constant that §1.5 warns about. 164 tests green; ruff + mypy --strict clean. Findings: (a) **HiGHS uses a 32-bit `HighsInt`** (`kHighsIInf == 2**31-1`), so the spec's `int64` CSC would be silently narrowed on every `passModel` — we store int32 and bound-check nnz; (b) **cobra already rejects NaN/inverted/duplicate-ID models but accepts infinite bounds**, so that is the one malformation our parser layer must catch itself. `.collab/specs/collab-outcome.md` is referenced by three docs but **does not exist** (the directory is empty) — decisions survive in BUILD_PLAN §1. **Next: M2** (math-critical — `/collab` review required at the gate).
 - 2026-07-13 — **M2 gate PASSED (math-critical).** Built `line_geometry` (feasible chord) and `line_distribution` (breakpoints → piecewise-linear concave `J` → segment log-masses → categorical choice → truncated-exp inverse CDF). 287 tests green; ruff + mypy --strict clean. `log φ = log(expm1(x)/x)` is checked against a **60-digit `decimal` oracle** rather than a restatement of itself, and the statistical tests KS the sampler against exact analytic CDFs *and* against an independent fine-grid quadrature of the **directly evaluated** `J` — a reference that never touches the piecewise machinery, so a misplaced breakpoint cannot cancel out against itself. **The `/collab` review ran 4 rounds and earned its keep: it found two bugs that corrupted the sampled distribution while 264 tests passed.** (a) *The absolute magnitude of `J` reached the probabilities.* `h_a = β(J−J*)/s_J` built from absolute knot values cancels catastrophically; with a biomass flux of 1e16 the true segment probabilities [0.387, 0.613] came back as [0.632, 0.368] — **the favoured segment reversed**, from slopes that were themselves exactly right. Fixed by storing knot heights relative to the **peak** of `J` and anchoring each segment's mass integral at its **higher endpoint**; `J*` left the API entirely (it provably cancels). (b) *Redrawing a coordinate on a degenerate chord breaks stationarity* — spec §19 and BUILD_PLAN §1.6 both prescribed it, but it makes coordinate selection state-dependent and collapses the random-scan Gibbs invariance argument. Now a **self-loop**, and there is no minimum chord width at all. Round 2 is the one to remember: **both of its findings were defects in round 1's fixes**, not in the original code. Also corrected: the opening slope (spec §20.3's midpoint rule reads `sgn(0)=0` on a one-ULP first segment and is 2× off in a measured 10.5% of them); `UNIFORM_LIMIT = eps/4`, not `eps/2`, because float spacing is asymmetric about 1.0; `β/s_J` validated against a *silent* underflow. I rebutted one Codex claim with measurements (the `MIN_NORMAL` "collapse" was ≤1 ULP on a probability-1e-15 set, not distribution corruption) and it conceded. BUILD_PLAN §1.6 gains **deltas 6–9**; `.collab/specs/collab-outcome.md` now exists and records all four rounds. **Next: M3** (`highs_backend.py` — not math-critical, no collab gate).
 - 2026-07-13 — **M3 gate PASSED.** Built `highs_backend` (the only module that touches `highspy`) and `sparse_objective` (the objective, the (v,z) LP, the §14 flux-only LP, the biomass-only diagnostic). 369 tests green; ruff + mypy --strict clean. The gate is one equation — *solver objective == directly recomputed J* — and it is load-bearing: HiGHS optimizes a linearized surrogate over `(v,z)` on a **reduced** polytope with a constant folded into an **offset**, while `evaluate` computes `J` from the full 773-flux vector and knows none of that. They agree only if the linearization, the fixed-variable elimination, the objective lowering *and* the constant are all right. Verified on both models across λ ∈ {0, 1e-4, 1e-3, 0.01, 1}. Design notes: (a) HiGHS adds `lp.offset_` to the reported objective **sign-intact under `kMaximize`** — probed, then pinned by a test — so the fixed reactions' L1 cost reaches `J*` instead of being quietly dropped (only the toy, with `FIX = 2.0`, can catch that; all 513 of the example model's fixed reactions sit at zero); (b) a `z` column is built **only where `λw_r > 0`**, because a zero-cost `z` has nothing pushing it down onto `|v_r|` and would fail its own check on a solution that is perfectly correct in `v`; (c) the solve counter is **process-global** and programs can be `freeze()`d, so M5 can both assert and *prohibit* an inner-loop solve; (d) `highspy` is imported inside the constructor, so a worker can import the objective without loading a solver. **🔴 The milestone's real find is scientific, not structural: at the default λ = 1.0 the genome-scale LP optimum is *the origin* — `v* = 0`, `J* = 0`, zero growth — while `μ_max = 41.6`.** Above `λ* = max_v μ(v)/C(v)` the L1 cost of growing outruns the biomass it returns and the cell's best move is to shut down; on this model `λ* = 1.89e-3`, so our default is **529× past the cliff** and the spec's own suggested `0.01` is **5.3×** past it. Nothing inside the LP can see this — optimal status, zero residual, `z = |v|` exactly — so `solve_sparse_objective` now always solves the biomass-only LP too and flags `is_sparsity_dominated`. The collapse needs a feasible origin: this model has **no forced-flux reaction at all** (no `ATPM` lower bound), which is also why the toy (`FIX = 2.0`) cannot reproduce it and the genome-scale model can. **Decision left OPEN** (raw λ vs scale-referenced λ), recorded in BUILD_PLAN §1.7 — it does not block M4/M5 (geometry is λ-independent; β=0 ignores `J`) but **must be settled before M6 tilts by `J`**. **Next: M4** (math-critical — `/collab` review required at the gate).
+- 2026-07-13 — **M3 addendum: λ is now scale-referenced** (the open decision from the gate, settled by the user). The config takes a **dimensionless `λ̃`** (`objective.l1_penalty_scaled`, default 0.5) and `resolve_objective` computes the raw `λ = λ̃ · λ*` per model. **`λ*` is exact, from a single LP** — `λ* = max_v μ(v)/C(v)` is a linear-fractional program, and the Charnes–Cooper substitution (`y = v·t`, `t = 1/C(v)`) turns it into "maximize `μ(y)` subject to a unit cost budget `C(y) ≤ 1`", with the bounds homogenizing into rows `l·t ≤ y ≤ u·t` and the absolute value linearizing by the same `z ≥ ±y` trick as §12. It reproduces the 40-step bisection to 8 figures and hits the fork toy's hand-derived `λ* = 1/2` to 10 decimals, so it is checked against arithmetic rather than against itself. λ* is **exactly** the cliff, not merely near it: at `0.999·λ*` the model grows, at `1.001·λ*` the optimum is the origin — pinned as a test on the genome-scale model. The λ̃ ladder is now the selection-pressure dial the study wanted: **λ̃ = 0 → 100% of μ_max retained, 0.25 → 95%, 0.5 → 60%, 0.9 → 30%**. `λ̃ ≥ 1` is *refused* when the origin is feasible (a guaranteed collapse, nothing to sample) and *allowed* when it is not — a model with forced maintenance flux, like the toy, cannot answer a large λ by shutting down and so has no cliff at all. Why this matters beyond one model: λ̃ = 0.5 resolves to `λ = 9.4e-4` on Bifido and `λ = 0.25` on the toy — **a factor of 265** — so a shared *raw* λ would have meant wildly different selection pressures across a batch while looking, in the config file, like a controlled comparison. `λ̃`, `λ*`, the raw `λ` and `origin_is_feasible` all go to the manifest (spec §3.6: no hidden scaling). BUILD_PLAN §1.7 records the decision. **Left open for M7**: `λ*` is a function of `w` (doubling every weight halves it), so the reweighting loop must choose — and record — whether λ stays frozen at its base-weight value or is re-resolved from the frozen final weights. 392 tests green; ruff + mypy --strict clean.

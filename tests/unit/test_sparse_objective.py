@@ -34,6 +34,9 @@ from gsmm_compiler.sparse_objective import (
     biomass_maximum,
     build_flux_lp,
     build_sparse_objective_lp,
+    critical_l1_penalty,
+    origin_is_feasible,
+    resolve_objective,
     solve_sparse_objective,
 )
 
@@ -63,8 +66,10 @@ def _fork(
 
 
 def _objective(polytope: FluxPolytope, l1_penalty: float, **kwargs: object) -> SparseFluxObjective:
+    """A *raw*-λ objective. `resolve_objective` is what turns the config's λ̃ into a raw λ;
+    these tests pin the mathematics of J, so they set λ directly."""
     return SparseFluxObjective.from_polytope(
-        polytope, ObjectiveConfig(l1_penalty=l1_penalty), **kwargs  # type: ignore[arg-type]
+        polytope, l1_penalty=l1_penalty, **kwargs  # type: ignore[arg-type]
     )
 
 
@@ -458,6 +463,169 @@ class TestSparsityDomination:
         assert diagnostics["biomass_maximum"] == pytest.approx(10.0)
         assert diagnostics["mu_at_optimum"] == pytest.approx(10.0)
         assert diagnostics["sparsity_dominated"] is False
+
+
+class TestTheCriticalPenalty:
+    """``λ* = max_v μ(v)/C(v)`` — the cliff, and the unit λ is expressed in (BUILD_PLAN §1.7).
+
+    The fork toy pins it analytically. Both routes reach biomass ``t``; the short one costs ``2t``
+    and the long one ``3t``, so ``max μ/C = t/2t = 1/2`` **exactly** — the same ``λ* = 1/2`` this
+    module's docstring derives from the other direction, as the λ where ``J = t(1 − 2λ)`` turns
+    negative and the origin takes over.
+    """
+
+    def test_lambda_star_is_exactly_one_half_on_the_fork(self, reduced: ReducedPolytope) -> None:
+        """From one LP (Charnes–Cooper), not a bisection — so it is exact, not merely bracketed."""
+        critical = critical_l1_penalty(reduced, _objective(_fork(), 0.0))
+
+        assert critical == pytest.approx(0.5, rel=1e-12)
+
+    def test_lambda_star_does_not_depend_on_lambda(self, reduced: ReducedPolytope) -> None:
+        """``max μ/C`` is a property of the polytope, the penalty set and the *weights*. If it moved
+        with λ, `resolve_objective` would be solving a fixed-point problem instead of a division."""
+        criticals = [
+            critical_l1_penalty(reduced, _objective(_fork(), lam)) for lam in (0.0, 0.25, 7.0)
+        ]
+
+        assert criticals == pytest.approx([0.5, 0.5, 0.5], rel=1e-12)
+
+    def test_lambda_star_does_move_with_the_weights(self, reduced: ReducedPolytope) -> None:
+        """Doubling every weight doubles ``C`` and so halves ``λ*``. This is why M7's reweighting
+        cannot be allowed to silently drift λ: it changes the very scale λ is measured in."""
+        doubled = _objective(_fork(), 0.0, weights=np.array([2.0, 2.0, 2.0, 2.0, 0.0]))
+
+        assert critical_l1_penalty(reduced, doubled) == pytest.approx(0.25, rel=1e-12)
+
+    def test_lambda_star_is_exactly_where_growth_dies(self, reduced: ReducedPolytope) -> None:
+        """The property that makes λ* *the* right unit: it is not merely near the cliff, it is the
+        cliff. A hair below it the LP still grows; a hair above, the optimum is the origin."""
+        polytope = _fork()
+        critical = critical_l1_penalty(reduced, _objective(polytope, 0.0))
+
+        below = build_sparse_objective_lp(reduced, _objective(polytope, 0.999 * critical)).solve()
+        above = build_sparse_objective_lp(reduced, _objective(polytope, 1.001 * critical)).solve()
+
+        assert below.value.mu > 0.0
+        assert below.j_star > 0.0
+        assert above.value.mu == pytest.approx(0.0, abs=1e-9)
+        assert above.j_star == pytest.approx(0.0, abs=1e-9)
+
+    def test_an_unpenalized_growth_path_has_no_cliff_at_all(self, reduced: ReducedPolytope) -> None:
+        """With an empty penalty set, ``C ≡ 0``: growth is free, no λ can ever suppress it, and the
+        Charnes–Cooper LP is genuinely unbounded. Reported as ``inf``, not as a solver error."""
+        free_lunch = SparseFluxObjective.from_polytope(_fork(), penalty_ids=())
+
+        assert critical_l1_penalty(reduced, free_lunch) == float("inf")
+
+
+class TestScaleReferencedLambda:
+    """`resolve_objective`: the config's dimensionless λ̃ becomes the raw λ that ``J`` uses."""
+
+    def test_lambda_tilde_is_scaled_by_the_model_s_own_cliff(self, fork: FluxPolytope) -> None:
+        resolved = resolve_objective(fork, fork.reduce(), ObjectiveConfig(l1_penalty_scaled=0.5))
+
+        assert resolved.scale.critical_l1_penalty == pytest.approx(0.5)
+        assert resolved.scale.l1_penalty == pytest.approx(0.25)  # λ̃ · λ* = 0.5 · 0.5
+        assert resolved.objective.l1_penalty == pytest.approx(0.25)
+
+    def test_lambda_tilde_zero_is_plain_fba(self, fork: FluxPolytope) -> None:
+        resolved = resolve_objective(fork, fork.reduce(), ObjectiveConfig(l1_penalty_scaled=0.0))
+        optimum = build_sparse_objective_lp(fork.reduce(), resolved.objective).solve()
+
+        assert resolved.objective.l1_penalty == 0.0
+        assert optimum.value.mu == pytest.approx(10.0)  # the full μ_max
+
+    def test_growth_always_survives_below_one(self, fork: FluxPolytope) -> None:
+        """The guarantee λ̃ buys: every λ̃ < 1 leaves the cell growing, on any model. Under a raw λ
+        you get no such promise — 1.0 is harmless here, ruinous on the genome-scale model."""
+        reduced = fork.reduce()
+
+        for scaled in (0.1, 0.5, 0.9, 0.99):
+            resolved = resolve_objective(
+                fork, reduced, ObjectiveConfig(l1_penalty_scaled=scaled)
+            )
+            solution = solve_sparse_objective(reduced, resolved.objective)
+
+            assert not solution.is_sparsity_dominated, f"λ̃ = {scaled} collapsed"
+            assert solution.optimum.value.mu > 0.0
+
+    def test_sparsity_pressure_rises_monotonically_with_lambda_tilde(
+        self, fork: FluxPolytope
+    ) -> None:
+        """λ̃ has to be a *dial*, not just a safe number: turning it up must cost biomass."""
+        reduced = fork.reduce()
+        costs = [
+            solve_sparse_objective(
+                reduced,
+                resolve_objective(
+                    fork, reduced, ObjectiveConfig(l1_penalty_scaled=scaled)
+                ).objective,
+            ).optimum.value.cost
+            for scaled in (0.0, 0.5, 0.9)
+        ]
+
+        assert np.all(np.diff(costs) <= 1e-9), costs
+
+    def test_lambda_tilde_at_or_past_one_is_refused_when_the_origin_is_feasible(
+        self, fork: FluxPolytope
+    ) -> None:
+        """Refused rather than warned: λ̃ ≥ 1 is a *guaranteed* collapse, and there is nothing to
+        sample on the far side of it."""
+        with pytest.raises(ObjectiveError, match="sparsity cliff"):
+            resolve_objective(fork, fork.reduce(), ObjectiveConfig(l1_penalty_scaled=1.0))
+
+    def test_lambda_tilde_past_one_is_allowed_when_flux_is_forced(self) -> None:
+        """A cell that *must* spend ATP cannot answer a large λ by shutting down — the origin is not
+        available to it. So there is no cliff, and λ̃ ≥ 1 is a legitimate (very sparse) request."""
+        forced = _fork(lower=[5.0, 0.0, 0.0, 0.0, 0.0], upper=[5.0, 10.0, 10.0, 10.0, 10.0])
+
+        assert not origin_is_feasible(forced)
+
+        resolved = resolve_objective(
+            forced, forced.reduce(), ObjectiveConfig(l1_penalty_scaled=3.0)
+        )
+        solution = solve_sparse_objective(forced.reduce(), resolved.objective)
+
+        assert not resolved.scale.origin_is_feasible
+        assert solution.optimum.value.mu > 0.0  # still alive: EX_A = 5 has to go somewhere
+
+    def test_the_manifest_records_both_lambdas_and_the_cliff(self, fork: FluxPolytope) -> None:
+        """Spec §3.6: "No hidden scaling is permitted." A reader must be able to recover the raw λ
+        the mathematics actually used, *and* the λ* it was measured against."""
+        manifest = resolve_objective(
+            fork, fork.reduce(), ObjectiveConfig(l1_penalty_scaled=0.5)
+        ).manifest()
+        scale = manifest["scale"]
+        assert isinstance(scale, dict)
+
+        assert scale["l1_penalty_scaled"] == pytest.approx(0.5)
+        assert scale["critical_l1_penalty"] == pytest.approx(0.5)
+        assert scale["l1_penalty"] == pytest.approx(0.25)
+        assert scale["origin_is_feasible"] is True
+        assert manifest["l1_penalty"] == pytest.approx(0.25)  # the raw λ, on the objective itself
+
+    def test_a_free_lunch_model_is_refused_rather_than_scaled_by_infinity(
+        self, fork: FluxPolytope
+    ) -> None:
+        with pytest.raises(ObjectiveError, match="unpenalized"):
+            resolve_objective(
+                fork, fork.reduce(), ObjectiveConfig(l1_penalty_scaled=0.5), penalty_ids=()
+            )
+
+
+class TestOriginFeasibility:
+    def test_the_origin_is_feasible_when_nothing_is_forced(self, fork: FluxPolytope) -> None:
+        assert origin_is_feasible(fork)
+
+    def test_a_forced_flux_puts_the_origin_out_of_reach(self) -> None:
+        """The ATP-maintenance case: ``l > 0`` on any reaction and ``v = 0`` leaves the polytope."""
+        assert not origin_is_feasible(_fork(lower=[1.0, 0.0, 0.0, 0.0, 0.0]))
+
+    def test_a_negative_forced_flux_counts_too(self) -> None:
+        """``u < 0`` forces flux just as firmly as ``l > 0``, in the other direction."""
+        assert not origin_is_feasible(
+            _fork(lower=[-10.0, 0.0, 0.0, 0.0, 0.0], upper=[-1.0, 10.0, 10.0, 10.0, 10.0])
+        )
 
 
 class TestLPChecks:

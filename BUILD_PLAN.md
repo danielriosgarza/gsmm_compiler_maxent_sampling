@@ -214,7 +214,7 @@ triggers are in `.collab/specs/collab-outcome.md`.
    overflows *or underflows to zero* (which would silently flatten the tilt). Computing it once also
    guarantees the mass stage and the sampling stage use the same `κ`.
 
-### 1.7 λ is not a dimensionless knob — the sparsity cliff  *(M3 finding; decision OPEN)*
+### 1.7 λ is scale-referenced: `λ = λ̃ · λ*`  *(M3 finding; decision SETTLED)*
 
 `J(v) = μ(v) − λ·C(v)` compares a **biomass flux** with a **sum of hundreds of absolute fluxes**.
 Those two quantities are not on the same scale, and their ratio is a property of each model:
@@ -243,12 +243,36 @@ lower bound), so it retreats to zero; a model with a maintenance demand pinned a
 That is also why the toy network cannot reproduce the failure — `FIX = 2.0` keeps it alive — and why
 it took the genome-scale model to find it.
 
-**Open decision (blocks M6, not M4/M5).** β=0 ignores `J` entirely and geometry is λ-independent, so
-M4 and M5 are unaffected. Before M6 tilts by `J`, we must settle whether λ stays **raw** (user picks
-per model, guarded by the diagnostic) or becomes **scale-referenced** (e.g. `λ = λ̃ · μ_max/C_ref`,
-recorded explicitly — no hidden scaling, spec §3.6). The batch/cross-model goal (§1.1: *"comparable
-selection pressure"* across strains) argues hard for the second: a single raw λ means a different
-selection pressure in every strain, which would make the cross-model comparison meaningless.
+**Decision (settled 2026-07-13): λ is scale-referenced.** The config takes a **dimensionless `λ̃`**
+(`objective.l1_penalty_scaled`, default 0.5) and the raw penalty is resolved *per model* as
+
+```
+λ = λ̃ · λ*        λ* = max_{v ∈ P} μ(v)/C(v)        (resolve_objective)
+```
+
+- `λ̃ = 0` is plain FBA; `λ̃ → 1` is the most sparsity pressure the model can carry while still
+  growing. `λ̃ ≥ 1` is **refused** when the origin is feasible (it is a guaranteed collapse), and
+  allowed when it is not (a forced-flux model has no cliff).
+- **`λ*` is computed exactly by one LP**, not by a search. `max μ/C` is a linear-fractional program;
+  the Charnes–Cooper substitution `y = v·t, t = 1/C(v)` linearizes it into "maximize `μ(y)` subject
+  to a unit cost budget `C(y) ≤ 1`" — the bounds homogenize into rows `l·t ≤ y ≤ u·t`, and the
+  absolute value linearizes with the same `z ≥ ±y` trick as §12. Verified against a 40-step
+  bisection (agrees to 8 figures) and against a toy whose `λ* = 1/2` is derivable on paper.
+- **No hidden scaling** (spec §3.6): `λ̃`, `λ*`, the raw `λ`, and `origin_is_feasible` all go into
+  the manifest, so the raw λ the mathematics used is always recoverable.
+
+Why this and not a raw λ: **the cross-model comparison is the point of the batch design** (§1.1 —
+*"do two species retain different amounts of metabolic flexibility at comparable selection
+pressure"*). λ̃ = 0.5 resolves to λ = 9.4e-4 on the Bifido model and λ = 0.25 on the toy — a factor
+of **265** — because their μ/C scales differ by that much. A shared *raw* λ would have meant wildly
+different selection pressures across strains while looking, in the config file, like a controlled
+comparison. Measured λ̃ ladder on the example model: `λ̃ = 0 → 100%` of μ_max retained, `0.25 → 95%`,
+`0.5 → 60%`, `0.9 → 30%`. A dial, not a trapdoor.
+
+**Open for M7.** Reweighting changes `w`, and `λ*` is a function of `w` (doubling every weight halves
+`λ*`). So M7 must decide whether the raw λ stays frozen at its base-weight value through the
+reweighting loop, or is re-resolved from the final frozen weights. Either is defensible; it must be
+*chosen* and recorded, because it moves `J`.
 
 ---
 

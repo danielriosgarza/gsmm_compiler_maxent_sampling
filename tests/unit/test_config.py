@@ -55,7 +55,7 @@ class TestOverrides:
             [
                 "sampler.n_chains=8",
                 "sampler.betas=[0.0, 2.0]",
-                "objective.l1_penalty=0.5",
+                "objective.l1_penalty_scaled=0.5",
                 "objective.exclude_biomass_from_penalty=false",
                 "model.path=examples/toy_network.json",
             ],
@@ -64,7 +64,7 @@ class TestOverrides:
 
         assert resolved.sampler.n_chains == 8
         assert resolved.sampler.betas == (0.0, 2.0)
-        assert resolved.objective.l1_penalty == 0.5
+        assert resolved.objective.l1_penalty_scaled == 0.5
         assert resolved.objective.exclude_biomass_from_penalty is False
         assert resolved.model.path == "examples/toy_network.json"  # bare string, unquoted
 
@@ -94,8 +94,8 @@ class TestConstraints:
             from_dict({"sampler": {"betas": []}})
 
     def test_negative_penalty_is_rejected(self) -> None:
-        with pytest.raises(ConfigError, match="l1_penalty must be >= 0"):
-            from_dict({"objective": {"l1_penalty": -1.0}})
+        with pytest.raises(ConfigError, match="l1_penalty_scaled must be >= 0"):
+            from_dict({"objective": {"l1_penalty_scaled": -1.0}})
 
     def test_multithreaded_highs_is_rejected(self) -> None:
         """Determinism of the geometry depends on this (BUILD_PLAN §1.2)."""

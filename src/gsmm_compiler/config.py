@@ -40,8 +40,21 @@ class ModelConfig:
 class ObjectiveConfig:
     """The sparse objective ``J(v) = v_biomass − λ Σ w_r |v_r|`` (spec §3)."""
 
-    l1_penalty: float = 1.0
-    """λ. Zero collapses J to pure biomass."""
+    l1_penalty_scaled: float = 0.5
+    """``λ̃``, **dimensionless** — the raw λ is ``λ̃ · λ*``, resolved per model (BUILD_PLAN §1.7).
+
+    λ is not a model-independent knob: it compares a biomass flux against a sum of hundreds of
+    absolute fluxes, and the exchange rate differs per organism. Above ``λ* = max_v μ(v)/C(v)`` the
+    LP optimum is *the origin* — the cell's best move is to stop growing. On the example model
+    ``λ* = 1.9e-3``, so a raw λ of 1.0 (our old default) sits 529× past the cliff and the spec's
+    suggested 0.01 sits 5.3× past it. Both would have sampled a distribution concentrated on no
+    metabolism at all.
+
+    So the config takes ``λ̃`` instead: 0 is plain FBA, and → 1 is the most sparsity pressure the
+    model can carry while still growing. The same ``λ̃`` then means the same *selection pressure* in
+    every strain of a batch — which is what makes the cross-model comparison (§1.1) mean anything.
+    Both ``λ̃`` and the resolved raw λ are written to the manifest; nothing is scaled in secret.
+    """
     exclude_biomass_from_penalty: bool = True
     """Penalizing biomass would have the objective fight its own reward term."""
     reweighting_enabled: bool = False
@@ -52,8 +65,10 @@ class ObjectiveConfig:
     weight_clip_max: float = 1e3
 
     def __post_init__(self) -> None:
-        if self.l1_penalty < 0.0:
-            raise ConfigError(f"objective.l1_penalty must be >= 0, got {self.l1_penalty}")
+        if self.l1_penalty_scaled < 0.0:
+            raise ConfigError(
+                f"objective.l1_penalty_scaled must be >= 0, got {self.l1_penalty_scaled}"
+            )
         if not 0.0 < self.weight_clip_min < self.weight_clip_max:
             raise ConfigError(
                 "objective weight clips must satisfy 0 < min < max, got "

@@ -21,15 +21,20 @@ from gsmm_compiler.flux_polytope import FluxPolytope
 from gsmm_compiler.highs_backend import SolverFrozenError, total_solve_count
 from gsmm_compiler.model_input import CanonicalModel
 from gsmm_compiler.sparse_objective import (
+    ObjectiveError,
     SparseFluxObjective,
     build_flux_lp,
     build_sparse_objective_lp,
+    critical_l1_penalty,
+    origin_is_feasible,
+    resolve_objective,
     solve_sparse_objective,
 )
 
 
 def _objective(polytope: FluxPolytope, l1_penalty: float) -> SparseFluxObjective:
-    return SparseFluxObjective.from_polytope(polytope, ObjectiveConfig(l1_penalty=l1_penalty))
+    """A *raw*-λ objective — these tests pin the mathematics of J directly."""
+    return SparseFluxObjective.from_polytope(polytope, l1_penalty=l1_penalty)
 
 
 class TestTheGateEquation:
@@ -225,6 +230,131 @@ class TestTheLambdaCliff:
         assert np.all(np.diff(j_stars) <= 1e-9), j_stars
         assert j_stars[0] == pytest.approx(41.633, rel=1e-3)  # λ = 0 is plain FBA
         assert j_stars[-1] == pytest.approx(0.0, abs=1e-9)  # λ = 1 is the origin
+
+
+class TestScaleReferencedLambda:
+    """The resolution of §1.7: λ is expressed as ``λ̃ · λ*``, with ``λ*`` measured per model.
+
+    This is the class that makes the cross-model comparison mean something. A raw λ of 1.0 is
+    harmless on the toy network and catastrophic here; the same ``λ̃`` puts *every* strain at the
+    same fraction of its own sparsity cliff, which is what "comparable selection pressure" (§1.1)
+    has to mean if it is to mean anything.
+    """
+
+    def test_lambda_star_comes_from_one_lp_and_lands_where_the_search_said(
+        self, example_canonical: CanonicalModel
+    ) -> None:
+        """λ* on this model is 1.89e-3. Computed exactly, by a single Charnes–Cooper LP — the
+        earlier 40-step bisection agreed to 8 figures, but a bisection is not what we ship."""
+        polytope = example_canonical.polytope
+        critical = critical_l1_penalty(polytope.reduce(), _objective(polytope, 0.0))
+
+        assert critical == pytest.approx(1.88987572e-3, rel=1e-6)
+
+    def test_lambda_star_is_exactly_where_this_model_stops_growing(
+        self, example_canonical: CanonicalModel
+    ) -> None:
+        """Not near the cliff — *at* it. A hair below, the cell grows; a hair above, it shuts down.
+        This is the property that earns λ* the right to be the unit λ is measured in."""
+        polytope = example_canonical.polytope
+        reduced = polytope.reduce()
+        critical = critical_l1_penalty(reduced, _objective(polytope, 0.0))
+
+        below = solve_sparse_objective(reduced, _objective(polytope, 0.999 * critical))
+        above = solve_sparse_objective(reduced, _objective(polytope, 1.001 * critical))
+
+        assert below.optimum.value.mu > 0.0
+        assert not below.is_sparsity_dominated
+        assert above.optimum.value.mu == pytest.approx(0.0, abs=1e-9)
+        assert above.is_sparsity_dominated
+
+    def test_lambda_tilde_is_a_selection_pressure_dial(
+        self, example_canonical: CanonicalModel
+    ) -> None:
+        """What the study actually needs from λ: turning λ̃ up must trade growth for sparsity,
+        smoothly and monotonically, and never fall off the cliff.
+
+        Measured on this model: λ̃ = 0 keeps 100% of μ_max (plain FBA), 0.25 keeps 95%, 0.5 keeps
+        60%, 0.9 keeps 30%. A dial, not a trapdoor.
+        """
+        polytope = example_canonical.polytope
+        reduced = polytope.reduce()
+
+        retentions = []
+        for scaled in (0.0, 0.25, 0.5, 0.9):
+            resolved = resolve_objective(
+                polytope, reduced, ObjectiveConfig(l1_penalty_scaled=scaled)
+            )
+            solution = solve_sparse_objective(reduced, resolved.objective)
+
+            assert not solution.is_sparsity_dominated, f"λ̃ = {scaled} collapsed"
+            retentions.append(solution.biomass_retention)
+
+        assert retentions[0] == pytest.approx(1.0)
+        assert np.all(np.diff(retentions) < 0.0), retentions
+        assert retentions[-1] < 0.5  # λ̃ = 0.9 really is heavy pressure
+
+    def test_the_default_config_grows(self, example_canonical: CanonicalModel) -> None:
+        """The whole point of the change. The *default* config used to hand this model an objective
+        whose optimum was zero flux; now it hands it one that keeps 60% of achievable growth."""
+        polytope = example_canonical.polytope
+        reduced = polytope.reduce()
+
+        resolved = resolve_objective(polytope, reduced, ObjectiveConfig())
+        solution = solve_sparse_objective(reduced, resolved.objective)
+
+        assert resolved.scale.l1_penalty_scaled == 0.5  # the default λ̃
+        assert resolved.scale.l1_penalty == pytest.approx(9.4494e-4, rel=1e-3)  # the raw λ it means
+        assert not solution.is_sparsity_dominated
+        assert solution.biomass_retention == pytest.approx(0.603, abs=0.01)
+
+    def test_a_lambda_tilde_of_one_is_refused_on_this_model(
+        self, example_canonical: CanonicalModel
+    ) -> None:
+        polytope = example_canonical.polytope
+
+        with pytest.raises(ObjectiveError, match="sparsity cliff"):
+            resolve_objective(
+                polytope, polytope.reduce(), ObjectiveConfig(l1_penalty_scaled=1.0)
+            )
+
+    def test_the_same_lambda_tilde_means_different_raw_lambdas_on_different_models(
+        self, example_canonical: CanonicalModel, toy_canonical: CanonicalModel
+    ) -> None:
+        """The heart of it. λ̃ = 0.5 resolves to λ = 9.4e-4 on the Bifido model and λ = 0.25 on the
+        toy — a factor of **265** — because their μ/C scales differ by that much. Handing both the
+        same *raw* λ would have meant wildly different selection pressures while looking, in the
+        config file, like a controlled comparison.
+        """
+        config = ObjectiveConfig(l1_penalty_scaled=0.5)
+
+        genome = resolve_objective(
+            example_canonical.polytope, example_canonical.polytope.reduce(), config
+        )
+        toy = resolve_objective(toy_canonical.polytope, toy_canonical.polytope.reduce(), config)
+
+        assert genome.scale.l1_penalty == pytest.approx(9.4494e-4, rel=1e-3)
+        assert toy.scale.l1_penalty == pytest.approx(0.25)
+        assert toy.scale.l1_penalty / genome.scale.l1_penalty == pytest.approx(265.0, rel=0.01)
+
+    def test_the_toy_has_no_cliff_because_its_maintenance_flux_is_forced(
+        self, toy_canonical: CanonicalModel
+    ) -> None:
+        """FIX = 2.0 keeps the toy alive: shutting down is not one of its options, so no λ can
+        collapse it and λ̃ ≥ 1 is a legitimate request. The example model, with no forced flux
+        anywhere, has no such protection — which is exactly why it found the bug and the toy could
+        not have."""
+        polytope = toy_canonical.polytope
+
+        assert not origin_is_feasible(polytope)
+
+        resolved = resolve_objective(
+            polytope, polytope.reduce(), ObjectiveConfig(l1_penalty_scaled=2.0)
+        )
+        solution = solve_sparse_objective(polytope.reduce(), resolved.objective)
+
+        assert not resolved.scale.origin_is_feasible
+        assert solution.optimum.value.mu == pytest.approx(2.0)  # still alive, on FIX alone
 
 
 class TestGeometryPremises:

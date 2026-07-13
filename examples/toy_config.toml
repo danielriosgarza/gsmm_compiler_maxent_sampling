@@ -6,7 +6,10 @@ path = "examples/toy_network.json"
 biomass_id = "BIO"
 
 [objective]
-l1_penalty = 1.0
+# λ̃, dimensionless: the raw λ is λ̃ · λ*, where λ* is this model's own sparsity cliff
+# (max_v μ(v)/C(v)). 0 is plain FBA; → 1 is the most sparsity pressure the model can
+# carry while still growing. See BUILD_PLAN §1.7.
+l1_penalty_scaled = 0.5
 exclude_biomass_from_penalty = true
 
 [geometry]
