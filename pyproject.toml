@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gsmm-compiler"
+version = "0.1.0.dev0"
+description = "Sparse-objective maximum-entropy flux sampler for genome-scale metabolic models"
+readme = "README.md"
+requires-python = "==3.11.*"
+license = { text = "MIT" }
+authors = [{ name = "Daniel Rios Garza", email = "danielriosgarza@gmail.com" }]
+dependencies = [
+    "numpy>=1.26",
+    "highspy>=1.7",
+    "cobra>=0.29",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+gsmm-compiler = "gsmm_compiler.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gsmm_compiler"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: long-running benchmark/statistical tests (deselect with -m 'not slow')",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "NPY"]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["gsmm_compiler"]
+strict = true
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["cobra.*", "highspy.*"]
+ignore_missing_imports = true
