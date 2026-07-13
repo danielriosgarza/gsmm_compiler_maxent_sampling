@@ -1,0 +1,79 @@
+{
+  "id": "toy_network",
+  "name": "Toy network for IR and geometry tests",
+  "version": "1",
+  "compartments": {
+    "c": "cytosol"
+  },
+  "metabolites": [
+    {"id": "A", "name": "metabolite A", "compartment": "c"},
+    {"id": "B", "name": "metabolite B", "compartment": "c"},
+    {"id": "C", "name": "metabolite C", "compartment": "c"}
+  ],
+  "genes": [],
+  "reactions": [
+    {
+      "id": "EX_A",
+      "name": "A uptake",
+      "metabolites": {"A": 1.0},
+      "lower_bound": 0.0,
+      "upper_bound": 10.0,
+      "gene_reaction_rule": "",
+      "objective_coefficient": 0.0
+    },
+    {
+      "id": "R1",
+      "name": "A to B",
+      "metabolites": {"A": -1.0, "B": 1.0},
+      "lower_bound": 0.0,
+      "upper_bound": 1000.0,
+      "gene_reaction_rule": "",
+      "objective_coefficient": 0.0
+    },
+    {
+      "id": "R2",
+      "name": "B to C",
+      "metabolites": {"B": -1.0, "C": 1.0},
+      "lower_bound": 0.0,
+      "upper_bound": 1000.0,
+      "gene_reaction_rule": "",
+      "objective_coefficient": 0.0
+    },
+    {
+      "id": "R3",
+      "name": "A to C (bypass)",
+      "metabolites": {"A": -1.0, "C": 1.0},
+      "lower_bound": 0.0,
+      "upper_bound": 1000.0,
+      "gene_reaction_rule": "",
+      "objective_coefficient": 0.0
+    },
+    {
+      "id": "FIX",
+      "name": "forced A to C flux (fixed at a NONZERO value)",
+      "metabolites": {"A": -1.0, "C": 1.0},
+      "lower_bound": 2.0,
+      "upper_bound": 2.0,
+      "gene_reaction_rule": "",
+      "objective_coefficient": 0.0
+    },
+    {
+      "id": "BLK",
+      "name": "blocked B to C (fixed at zero)",
+      "metabolites": {"B": -1.0, "C": 1.0},
+      "lower_bound": 0.0,
+      "upper_bound": 0.0,
+      "gene_reaction_rule": "",
+      "objective_coefficient": 0.0
+    },
+    {
+      "id": "BIO",
+      "name": "biomass",
+      "metabolites": {"C": -1.0},
+      "lower_bound": 0.0,
+      "upper_bound": 1000.0,
+      "gene_reaction_rule": "",
+      "objective_coefficient": 1.0
+    }
+  ]
+}

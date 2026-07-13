@@ -26,11 +26,14 @@
 
 | Field | Value |
 |---|---|
-| **Active milestone** | **M1 — Canonical + reduced model IR** |
-| **Status** | ⬜ NOT STARTED (M0 gate passed 2026-07-13; 25 tests green) |
-| **Next action** | `config.py` — TOML load/resolve + CLI overrides + resolved-config echo |
+| **Active milestone** | **M2 — One-dimensional kernel (math oracle)** |
+| **Status** | ⬜ NOT STARTED (M0 + M1 gates passed 2026-07-13; 164 tests green) |
+| **Next action** | `line_geometry.py` — feasible chord `[t_lo, t_hi]`, keeping **all nonzero** direction components |
 | **Blockers** | none |
 | **Last updated** | 2026-07-13 |
+
+> ⚠️ **M2 is math-critical**: its gate requires a `/collab` adversarial review (exactness of the 1D
+> conditional; `expm1`/`log1p` stability across all κL; no tolerance-merging of distinct breakpoints).
 
 ### Platform facts established by M0 (build on these, don't re-derive)
 
@@ -40,13 +43,21 @@
 - HiGHS accepts native `int32` CSC index/start arrays + `float64` values via `passModel`. The biomass LP matches cobra's own FBA optimum to `rel=1e-6` — the CSC assembly is verified, not merely accepted.
 - ⚠️ **highspy attribute reads return Python `list`, not NumPy views** (the pybind layer copies). M3's LP layer must keep its own float64 arrays and extract solutions in one `np.asarray` shot — never element-wise. Pinned by `test_highspy_returns_python_lists_not_arrays`.
 
+### Facts established by M1
+
+- **CSC index width is `int32`, not the spec's `int64`.** `highspy.kHighsIInf == 2**31 - 1`, i.e. HiGHS is built with a 32-bit `HighsInt`; int64 arrays are *accepted* but silently narrowed on every `passModel`. `native_csc.INDEX_DTYPE = np.int32`, and the 2³¹ nnz ceiling is a construction-time check. Pinned by `test_highs_index_width_is_what_native_csc_stores`.
+- **cobra rejects NaN bounds, inverted bounds and duplicate IDs itself** — but happily accepts **infinite** bounds, which we must reject (an unbounded polytope has nothing to sample). Our own guards still matter for models built/mutated in memory rather than parsed.
+- **New module `provenance.py`** (not in spec §6): L0/L1 content keys were needed long before M8's cache exists, and the core must hash arrays without importing cobra.
+- The toy network (`examples/toy_network.json`) exists to supply the case the example model **cannot**: a reaction fixed at a **nonzero** value (`FIX = 2.0`), making the reduced mass balance genuinely affine. All 513 of the example model's fixed reactions sit at zero, so it would never catch a homogeneous-RHS bug.
+
 ## Verify current state
 
 ```bash
 cd /home/mcpu/GitHub/gsmm_compiler_maxent_sampling
 .venv/bin/python -V                                    # expect 3.11.15
-.venv/bin/python -m pytest -q | tail -3                # expect 25 passed
+.venv/bin/python -m pytest -q | tail -3                # expect 164 passed
 .venv/bin/ruff check . && .venv/bin/mypy               # expect clean
+.venv/bin/gsmm-compiler model inspect examples/toy_network.json     # affine RHS: nonzero
 .venv/bin/gsmm-compiler model inspect models/GCF_000010425_1_ASM1042v1_protein_non_gapfilled_latest_gapfilled_noO2.json
 ```
 
@@ -65,16 +76,17 @@ Gate: wheel-only install on Python 3.11/aarch64 · example model LP solves · co
 - [x] no-scipy scan: assert the numerical core modules import zero scipy (runtime + static AST scan)
 - [x] `gsmm-compiler model inspect models/GCF_000010425_1_..._noO2.json` prints basic report
 
-### 🟨 M1 — Canonical + reduced model IR  *(ACTIVE)*
+### ✅ M1 — Canonical + reduced model IR  *(gate passed 2026-07-13)*
 Gate: hand-checked CSC · exact full-model reconstruction · l==u elimination equivalence on toy.
-- [ ] `config.py` — TOML load/resolve + CLI overrides + resolved-config echo
-- [ ] `model_input.py` — load, freeze reaction/metabolite order, validate (unique IDs, NaN/inf bounds, biomass once, finite bounds), model_report.json
-- [ ] `native_csc.py` — `NativeCSC` dataclass, column-wise CSC builder, validation ops, `matvec`/`rmatvec`, highspy int-width test
-- [ ] `flux_polytope.py` — `FluxPolytope` + **reduced polytope IR**: eliminate l==u, store `v_full = R·v_red + c`, affine RHS `S_F v_F = -S_fixed v_fixed`
-- [ ] L0/L1 content hashing + provenance keys (parser/code/schema versions, dtype/endianness)
-- [ ] unit tests: CSC hand-check + order preservation + missing/dup/NaN/inf detection + elimination & reconstruction round-trip
+- [x] `config.py` — TOML load/resolve + CLI overrides + resolved-config echo (`gsmm-compiler config show`); unknown keys are errors
+- [x] `model_input.py` — load, freeze reaction/metabolite order, validate, `model_report.json`, L0 key
+- [x] `native_csc.py` — `NativeCSC` dataclass, column-wise builder, validation, `matvec`/`rmatvec`, **int32** index width (see facts above)
+- [x] `flux_polytope.py` — `FluxPolytope` + **reduced polytope IR**: eliminate l==u, `v_full = R·v_red + c`, affine RHS `S_F v_F = -S_fixed v_fixed`
+- [x] L0/L1 content hashing + provenance keys (parser/cobra/schema versions, dtype **and byte order**) → `provenance.py`
+- [x] unit tests: CSC hand-check + order preservation + NaN/inf/dup detection + elimination & reconstruction round-trip
+- [x] **gate**: LP optima identical full-vs-reduced under 200 random objectives (toy) and 10 (genome-scale) — feasible-set *and* objective equivalence, incl. the fixed-flux objective constant
 
-### ⬜ M2 — One-dimensional kernel (math oracle, before any genome-scale MCMC)
+### 🟨 M2 — One-dimensional kernel (math oracle, before any genome-scale MCMC)  *(ACTIVE)*
 Gate: analytic + property tests across κL ∈ {0,±1e-16,±1e-12,±1e-8,±1,±100,±1000}; continuity; monotone slopes; edge cases.
 - [ ] `line_geometry.py` — feasible chord `[t_lo,t_hi]`; **keep all nonzero direction components**; `nextafter` inward; redraw on zero-length
 - [ ] `line_distribution.py` — breakpoints `τ_r=-v_r/d_r`; piecewise-linear concave `J(t)` via slope drops `2λw_r|d_r|`; segment log-masses (`expm1`/`log1p` + custom logsumexp); categorical segment choice; stable truncated-exp inverse-CDF
@@ -146,3 +158,4 @@ Only after M0–M9: pilot rerounding + pilot-based `s_J` (bootstrap→pilot→fi
 
 - 2026-07-13 — Design collaboration (Claude×Codex, 2 rounds) → BUILD_PLAN.md. Investigated blocked reactions (513 = FVA-blocked under anaerobic medium; fixed-var elimination provably correct). Locked scope: batch-aware v1, reweighted-L1 in v1 (M7), configurable storage, Python 3.11. Created this tracker + project CLAUDE.md. **No code yet — next session starts M0.**
 - 2026-07-13 — **M0 gate PASSED.** Scaffolded `pyproject.toml` (hatchling, src layout) + all 17 modules of the spec §6 skeleton; `uv` venv on 3.11.15 with a wheel-only install (`uv.lock`, 47 pkgs, zero source builds). Smoke test builds the biomass LP from native int32/float64 CSC arrays, passes it to `highspy.passModel`, solves to `kOptimal`, and **matches cobra's own FBA optimum to rel=1e-6** — so the CSC assembly is verified, not just accepted. 25 tests green; ruff + mypy --strict clean. Findings: (a) **scipy is absent from the venv entirely**, so the no-scipy path is free rather than fought for; (b) **highspy attribute reads return Python lists, not NumPy views** — recorded for M3's one-shot extraction design; (c) BUILD_PLAN §0's "65 exchanges" was 63 `EX_` + 2 `SK_` sinks — corrected in place. **Next: M1** (`config.py` first).
+- 2026-07-13 — **M1 gate PASSED.** Built `native_csc` (int32 CSC + `matvec`/`rmatvec` via `bincount`), `flux_polytope` (canonical + reduced IR with the explicit affine RHS), `model_input` (validation → canonical L0 IR + `model_report.json`), `config` (TOML + overrides, unknown keys rejected), and a new `provenance` module for L0/L1 content keys. Added `examples/toy_network.json` — 7 reactions, with **FIX pinned at 2.0** so the reduced mass balance is genuinely affine, the case the Bifido model cannot exercise (all 513 of its fixed reactions sit at zero). Gate closed by LP-level equivalence: full-vs-reduced optima agree under 200 random objectives on the toy and 10 on the genome-scale model, including the fixed-flux objective constant that §1.5 warns about. 164 tests green; ruff + mypy --strict clean. Findings: (a) **HiGHS uses a 32-bit `HighsInt`** (`kHighsIInf == 2**31-1`), so the spec's `int64` CSC would be silently narrowed on every `passModel` — we store int32 and bound-check nnz; (b) **cobra already rejects NaN/inverted/duplicate-ID models but accepts infinite bounds**, so that is the one malformation our parser layer must catch itself. `.collab/specs/collab-outcome.md` is referenced by three docs but **does not exist** (the directory is empty) — decisions survive in BUILD_PLAN §1. **Next: M2** (math-critical — `/collab` review required at the gate).

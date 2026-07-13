@@ -36,8 +36,13 @@ NUMERICAL_CORE = (
     "output",
     "features",
     "logging_utils",
+    "config",
+    "provenance",
 )
-"""Modules a sampling worker may import. cobra and scipy are banned from all of them."""
+"""Modules a sampling worker may import. cobra and scipy are banned from all of them.
+
+`model_input` and `cli` are deliberately absent: they are the parser layer, and cobra lives there.
+"""
 
 FORBIDDEN_ROOTS = ("scipy", "cobra", "optlang", "sympy", "pandas")
 """``scipy``/``cobra`` are the conventions; the rest come with cobra and would betray a leak."""

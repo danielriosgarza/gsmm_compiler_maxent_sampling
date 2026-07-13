@@ -1,0 +1,29 @@
+# Example configuration for the toy network. Every key here is also a default;
+# `gsmm-compiler config show --config examples/toy_config.toml` echoes the resolved result.
+
+[model]
+path = "examples/toy_network.json"
+biomass_id = "BIO"
+
+[objective]
+l1_penalty = 1.0
+exclude_biomass_from_penalty = true
+
+[geometry]
+feasibility_tol = 1e-9
+seed = 0
+
+[sampler]
+betas = [0.0, 1.0, 4.0]
+n_chains = 4
+n_samples = 2000
+burn_in = 1000
+thin = 1
+
+[output]
+directory = "results/toy"
+store_mode = "full_flux"
+store_flux_dtype = "float64"
+
+[runtime]
+n_workers = 4
