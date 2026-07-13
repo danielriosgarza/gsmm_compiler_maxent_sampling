@@ -193,3 +193,114 @@ opposing bounds and no move along the line repairs it. Round 2's `degenerate_poi
 midpoint and left the state out of bounds while reporting success. `feasible_chord` now raises
 `InfeasibleChordError`. `degenerate_point` is reachable only from a true singleton or a nudge-inverted
 one-ULP interval — both legitimate.
+
+---
+
+## M4 — Affine geometry + span certificate (6 rounds, converged on substance)
+
+Codex reviewed `affine_geometry.py` adversarially. **It found a crash, a silently dropped dimension,
+a dual-side blind spot, an unsound bound formula, and two test bugs** — one of which meant a test
+could not fail. Every counterexample it gave was reproduced before being fixed. Its final position:
+it does not contest `d = 46` or its independent corroboration, and it does not count "float64 numpy is
+not certified interval arithmetic" as a defect. That is where this closes.
+
+### Locked: the certificate is *resolution-bounded*, and the resolution is √k, not max-width
+
+Width is a support-function difference — subadditive and positively homogeneous — so for a unit
+`p = Σ aⱼpⱼ` in the complement (`‖a‖₂ = 1`, hence `‖a‖₁ ≤ √k`):
+
+```
+width(p) ≤ Σ |aⱼ|·width(pⱼ) ≤ √k · √(1+leakage) · maxⱼ width(pⱼ)  +  leakage · diameter
+```
+
+A direction tilted equally across all `k` probes hides a factor of `√k` from every one of them
+individually. `SpanCertificate.resolution` reports this, and it is the number to quote. The
+`√(1+leakage)` factor comes from `‖Qᵀp‖² = 1 − pᵀEp ≤ 1 + ‖E‖`; the `leakage·diameter` term exists
+because float64 Gram–Schmidt does not *exactly* span `range(B)ᗮ`, and a direction hiding in that gap
+would be probed by nothing.
+
+### Locked: a width has two ends, and they need two different instruments
+
+A **lower** bound (the objective difference of two returned endpoints) proves a direction *exists*.
+It cannot certify one *flat* — that is the wrong end of the interval, and a solve that stops short of
+optimality reports the width too **small**, certifying a real dimension as flat. `max_dual_infeasibility`
+cannot catch that either: 1e-10 is dual-feasible anywhere, yet on a variable of range 1e10 it hides a
+whole unit of width.
+
+So flatness rests on **weak duality**, which assumes nothing about the returned point — not
+optimality, not even primal feasibility:
+
+```
+max cᵀv ≤ rhsᵀy + Σⱼ max(dⱼlⱼ, dⱼuⱼ),    d = c − Sᵀy      (any y whatsoever)
+```
+
+A first attempt used complementary slackness (`Σⱼ dinfⱼ·(uⱼ−lⱼ)`); Codex showed it silently drops the
+`yᵀ(rhs − Sv̂)` term and so assumes exact row-feasibility, which no LP delivers. Replaced wholesale.
+`d` is recomputed as `c − Sᵀy` via our own `rmatvec`, so a stationarity residual in HiGHS's arrays
+cannot leak in either. **The same bound is applied to every FVA range**: a range read off the primal
+is a *lower* bound, and a lower bound is precisely the wrong end when the conclusion drawn is "this
+reaction cannot move."
+
+The consequence is worth stating plainly: `U` cancels terms of size ~5e3, so evaluating it in float64
+costs ~1e-9 absolutely. **That is the floor on what this certificate can resolve** — orders coarser
+than the ~1e-13 the arithmetic appears to produce. The measured certified resolution is 2.78e-11
+scaled (5.6e-8 flux units), outward-rounded. The earlier "1.4e-11" was not licensed.
+
+### Locked: what the certificate actually claims
+
+Not "cannot under-count a dimension." A direction thinner than the certified resolution *can* be
+missed, and `blocked_tol` will drop one narrower than itself. The licensed claim is:
+
+> **Every feasible direction of the exact polytope has its component orthogonal to `range(B)` bounded
+> in width by `SpanCertificate.resolution`.**
+
+The asymmetry runs the safe way: the geometry may **over**-count (admit an ε-feasible direction) but
+cannot omit a direction it had the resolving power to see. Over-counting is benign for a sampler — the
+chain explores a slightly larger set and every sample is still checked. Omitting a wide direction
+would silently delete part of the support, and no downstream test would ever see the samples that
+were never drawn.
+
+### Locked: FVA-blocked reactions are structural zeros of the direction space
+
+**61 of the example model's 260 free reactions cannot carry flux at all** — the file leaves `l < u`,
+but mass balance pins them. If `max vᵢ == min vᵢ` over `P`, every feasible direction has `dᵢ = 0`
+identically, so a nonzero `B[i,:]` is numerical error. Left in, it is not harmless: a basis row of
+~1e-15 in a coordinate whose centre sits ~1e-13 *outside* its own bound (both solver noise) divides
+into **a chord limit of order 0.03–0.5**. The measured chord at the centre was `[−0.54, −0.39]` —
+excluding `t = 0`. `line_geometry` rightly refuses to sample it, so **M5 could not have started.**
+
+This is not the forbidden snapping of small fluxes: no flux is rounded, and a pinned reaction keeps
+its value. What is zeroed is a component of the *direction space* that an LP measured as zero. But it
+is *numerically fixed at resolution `blocked_tol`*, **not provably constant** — Codex's counterexample
+(a true 5e-16-wide dimension, dropped, with a separation of 2e15× sailing through the guard) is
+reproduced and pinned as a characterization test.
+
+### Locked: the resolutions must not contradict each other
+
+Three tolerances describe the same polytope and must agree, or the components fight:
+
+- **`scale_floor ≥ blocked_tol / span_tol`** (default 1.0). Below it, a blocked reaction still shows a
+  scaled width above `span_tol`: the sweep reports the very axis the projection removed, and cannot
+  append it — which produced a real crash, with a misleading "already lies in the discovered span".
+- **`‖r_blocked / s_blocked‖₂ ≤ span_tol`**, checked at runtime on the measured ranges. Bounding each
+  blocked range individually lets the *combination* reach `√n_blocked · span_tol` (the same
+  subadditivity as the certificate's `√k`).
+- **SVD rank cutoff = max(machine, `feasibility_tol`)**. An equality the LP will not *enforce* must
+  not be one the projector *insists* on. With `σ_min = 1e-14` — above machine epsilon, below the LP's
+  1e-9 model — the support LPs return moving endpoints while the projector zeroes their difference: a
+  contradiction, not a geometry.
+
+### Locked: the mass-balance bar is relative, not absolute
+
+`S·v` sums terms of size `‖S‖·‖v‖` ≈ 1e5 here, so *evaluating* it costs ~1e-10 of rounding before any
+solver error. An absolute 1e-9 bar charges that to the solver — measured, it failed a perfectly good
+certificate — and on a polytope with 1e10 bounds no basis could ever pass. `NativeCSC.cancellation_scale`
+(`|S|·|x|`) supplies the scale to divide by; note it *cannot* be had from `matvec(abs(x))`, which
+re-applies the signed `S` and cancels all over again.
+
+### What M5 inherits (checked here, so it need not discover them)
+
+Every basis direction's chord through the centre contains `t = 0` with positive length (min 0.018);
+the centre is *exactly* bound-feasible after a clamp bounded by the LP tolerance (3.1e-13); and the
+support points span all `d` directions (rank 46/46) — so M5's covariance ridge cannot conceal a
+singular covariance instead of failing on it.

@@ -26,14 +26,45 @@
 
 | Field | Value |
 |---|---|
-| **Active milestone** | **M4 — Affine geometry + span certificate** |
-| **Status** | ⬜ NOT STARTED (M0–M3 gates passed 2026-07-13; 392 tests green) |
-| **Next action** | `affine_geometry.py` — scaled coords `s_i`, orthonormal basis (2-pass MGS), support-LP discovery with warm starts (M3 fact: warm starts pay off; `build_flux_lp` is the §14 model to re-solve) |
+| **Active milestone** | **M5 — Rounding + β=0 sampler** |
+| **Status** | ⬜ NOT STARTED (M0–M4 gates passed 2026-07-13; 442 tests green) |
+| **Next action** | `rounding.py` — support-point covariance (M4 guarantees they span all `d`), ridge + geometric escalation, Cholesky `L`, `T = diag(s)·B·L`, ‖ST‖ check, per-coordinate precompute |
 | **Blockers** | none |
 | **Last updated** | 2026-07-13 |
 
-> 🤝 **M4 requires a `/collab` adversarial review as a gate step** — completeness of the deterministic
-> span certificate; scaling/tolerance coupling to LP feasibility tolerance. See CLAUDE.md.
+> 🤝 **M5 requires a `/collab` adversarial review as a gate step** — Gibbs/coordinate-hit-and-run
+> **stationarity**; transform frozen during production; uniform-target correctness. See CLAUDE.md.
+
+### ✅ Settled by M4: the sampling dimension is 46, not 55 — and the geometry hands M5 a usable start
+
+**61 of the 260 free reactions cannot carry flux at all.** The model file leaves `l < u`, but mass
+balance pins them, so `n_free − rank(S) = 55` is only an *upper bound* and the true affine dimension
+is **d = 46** (confirmed by an independent FVA+rank oracle sharing no code with the geometry).
+
+That is not bookkeeping. A blocked reaction is an *exact structural zero* of the direction space, and
+a basis row of ~1e-15 there — divided by a centre sitting ~1e-13 outside its own bound, both pure
+solver noise — produces **a chord limit of order 0.03–0.5**, right inside the legitimate chord. The
+measured chord at the centre was `[−0.54, −0.39]`, which **excludes `t = 0`**; `line_geometry` refused
+it, so **M5 could not have started from that centre.** Blocked components are now projected out
+exactly. See BUILD_PLAN §1.4.1.
+
+**What M5 inherits, already checked:** every basis direction's chord through the centre contains
+`t = 0` with positive length (min 0.018); the centre is *exactly* bound-feasible; and the support
+points span all 46 directions (rank 46/46) — so M5's covariance ridge cannot quietly conceal a
+singular covariance instead of failing on it.
+
+### ⚠️ What the span certificate does and does not claim (M4 collab, 6 rounds)
+
+It licenses exactly this: **every feasible direction of the exact polytope has its component
+orthogonal to `range(B)` bounded in width by `SpanCertificate.resolution`** (2.78e-11 scaled = 5.6e-8
+flux units on the example model). It is **not** "cannot under-count a dimension" — a direction thinner
+than the resolution can be missed, and `blocked_tol` drops one narrower than itself.
+
+The asymmetry runs the *safe* way: the geometry may **over**-count (admit an ε-feasible direction) but
+cannot omit a direction it had the resolving power to see. Over-counting is benign for a sampler — the
+chain explores a slightly larger set, and every sample is still checked. Omitting a wide direction
+would silently delete part of the support, and no downstream test would ever see the samples that
+were never drawn.
 
 ### ✅ Settled by M3: λ is scale-referenced (`λ = λ̃ · λ*`)
 
@@ -55,6 +86,28 @@ its base-weight value through the reweighting loop or is re-resolved from the fr
 - **SciPy is absent from the venv entirely** — stronger than the gate required (§4 anticipated cobra might pull it transitively; it does not). The no-scipy gate is enforced by `tests/unit/test_no_scipy.py` at both runtime and source level.
 - HiGHS accepts native `int32` CSC index/start arrays + `float64` values via `passModel`. The biomass LP matches cobra's own FBA optimum to `rel=1e-6` — the CSC assembly is verified, not merely accepted.
 - ⚠️ **highspy attribute reads return Python `list`, not NumPy views** (the pybind layer copies). M3's LP layer must keep its own float64 arrays and extract solutions in one `np.asarray` shot — never element-wise. Pinned by `test_highspy_returns_python_lists_not_arrays`.
+
+### Facts established by M4 (the geometry — build on these, don't re-derive)
+
+- **`d = 46`, and the certificate cost 1089 LPs / 1.2 s.** FVA is 520 of them, discovery 140, the
+  complement sweep 428. Warm-started simplex; ~4800 total pivots. Cheap enough to leave alone.
+- **A width has two ends and needs two instruments.** The *primal* width (objective difference of two
+  returned endpoints) is a **lower** bound: it proves a direction exists. Certifying a direction
+  *flat* needs an **upper** bound, and only weak duality gives one that assumes nothing about the
+  solver — not optimality, not even primal feasibility. Never certify flatness from a primal reading;
+  M5/M6 will face the same temptation with `s_J` and the energy traces.
+- **A mass-balance residual must be judged on a *relative* bar.** `S·v` sums terms of size ~1e5 here,
+  so evaluating it costs ~1e-10 of rounding before any solver error. An absolute 1e-9 bar charges that
+  to the solver and fails a perfectly good geometry (measured). `NativeCSC.cancellation_scale`
+  (`|S|·|x|`) gives the scale to divide by — and it *cannot* be had from `matvec(abs(x))`, which
+  re-applies the signed `S` and cancels all over again.
+- **Never divide by a small number that is noise.** Two of M4's bugs were the same shape: a ~1e-15
+  basis row divided into a ~1e-13 bound violation gave a chord limit of 0.03–0.5, and a Gram-Schmidt
+  residual of ~1e-3 divided into a 1e-12 LP row residual gave a basis error of 8e-10. Both were
+  measured, neither was visible in any test that passed.
+- **`stream_seed(model_id, stage, β_index, chain_index)`** (in `provenance`) is the RNG keying M5's
+  chains must use. It hashes with sha256, **not** Python's `hash()`, which is salted per interpreter —
+  a spawn key built from that would name a different stream in every worker.
 
 ### Facts established by M3 (the LP layer — build on these)
 
@@ -109,7 +162,7 @@ its base-weight value through the reweighting loop or is re-resolved from the fr
 ```bash
 cd /home/mcpu/GitHub/gsmm_compiler_maxent_sampling
 .venv/bin/python -V                                    # expect 3.11.15
-.venv/bin/python -m pytest -q | tail -3                # expect 392 passed
+.venv/bin/python -m pytest -q | tail -3                # expect 442 passed
 .venv/bin/ruff check . && .venv/bin/mypy               # expect clean
 .venv/bin/gsmm-compiler model inspect examples/toy_network.json     # affine RHS: nonzero
 .venv/bin/gsmm-compiler model inspect models/GCF_000010425_1_ASM1042v1_protein_non_gapfilled_latest_gapfilled_noO2.json
@@ -156,15 +209,17 @@ Gate: solver objective == direct J · feasibility on degenerate toys · z=|v| wi
 - [x] **gate**: solver obj == direct J on toy + genome-scale across λ ∈ {0, 1e-4, 1e-3, 0.01, 1}; v* feasible in the *full* 773-reaction polytope; degenerate toys (singleton / infeasible / unique-point / tied optima / λ=0) all classified right; no scipy
 - [x] **addendum (settled by user, 2026-07-13)**: λ is **scale-referenced** — `critical_l1_penalty` (exact λ*, one Charnes–Cooper LP), `origin_is_feasible`, `resolve_objective`; config takes dimensionless `l1_penalty_scaled`. See BUILD_PLAN §1.7
 
-### 🟨 M4 — Affine geometry + span certificate  *(ACTIVE)*
+### ✅ M4 — Affine geometry + span certificate  *(gate passed 2026-07-13)*
 Gate: known toy dims recovered · truncated basis rejected · ‖S·diag(s)·B‖≈0 · singleton path.
-- [ ] `affine_geometry.py` — scaled coords `s_i`; orthonormal basis (2-pass MGS, Fortran-contig, block-allocated); support-LP discovery w/ warm starts; memory guard (8nd bytes vs `max_geometry_memory_gb`)
-- [ ] **deterministic span certificate** — probe orthonormal basis of range(B)ᗮ (pivoted QR), ordered by residual norm; random probes as cheap pre-pass; manifest flag if capped
-- [ ] feasible center from support points (mass-balance/bound checks, no clipping); geometry diagnostics
-- [ ] tests: known dims, orthonormality, mass-balanced directions, **intentionally truncated basis rejected**, dim-0 singleton returns constant sample
-- [ ] 🤝 **`/collab` adversarial review (required gate step)** — completeness of the deterministic span certificate; scaling/tolerance coupling to LP feasibility tolerance
+- [x] `affine_geometry.py` — scaled coords `s_i`; orthonormal basis (2-pass projection, Fortran-contig, block-allocated); support-LP discovery w/ warm starts; memory guard before **every** allocation
+- [x] **deterministic span certificate** — probes an orthonormal basis of range(B)ᗮ (pivoted Gram-Schmidt over the axes, ordered by residual norm); random probes are the pre-pass; a failing sweep *hands back the missing direction*; capped/inconclusive runs are refused unless explicitly downgraded
+- [x] **`blocked_reactions` + `DirectionSpace`** (beyond spec) — FVA finds the 61 free reactions that cannot move; their components, and any non-mass-balanced ones, are projected out of every candidate exactly. Without this, the chord at the centre excluded `t = 0` and M5 could not start
+- [x] feasible center from support points; **exactly** bound-feasible (clamp bounded by the LP tolerance, mass balance re-verified); chords at the centre validated; geometry diagnostics + manifest
+- [x] tests: known toy dims (triangle/narrow/singleton/pinned), orthonormality, mass-balanced directions, **truncated basis rejected (all 46 columns, one at a time)**, dim-0 singleton returns a constant, memory guard, determinism
+- [x] **gate**: `d = 46` on the genome-scale model, matching an **independent FVA+rank oracle** that shares no code with the geometry; certificate exhaustive (214/214 probes, 0 inconclusive); a 500-step hit-and-run walk stays feasible in the *full* 773-reaction polytope with **zero** HiGHS solves
+- [x] 🤝 **`/collab` adversarial review — 6 rounds.** Found a crash, a silently dropped dimension, a dual-side blind spot, an accumulating basis error, an unsound bound formula, and **two test bugs** (one made a test unable to fail). All reproduced before fixing. See `.collab/specs/collab-outcome.md` § M4
 
-### ⬜ M5 — Rounding + β=0 sampler
+### ⬜ M5 — Rounding + β=0 sampler  *(ACTIVE)*
 Gate: uniform analytic targets reproduced · transform-invariance · ‖ST‖≈0 · **zero inner-loop HiGHS solves**.
 - [ ] `rounding.py` — support-point covariance, ridge (rel. to trace/d) + geometric escalation, Cholesky `L`, `T=diag(s)BL`, ‖ST‖ check, per-coordinate precompute
 - [ ] `maxent_sampler.py` (β=0) — coordinate hit-and-run, reduced state `y` + incremental `v`, periodic exact refresh, SeedSequence keyed on `(model_id,stage,β,chain)`
@@ -218,3 +273,4 @@ Only after M0–M9: pilot rerounding + pilot-based `s_J` (bootstrap→pilot→fi
 - 2026-07-13 — **M2 gate PASSED (math-critical).** Built `line_geometry` (feasible chord) and `line_distribution` (breakpoints → piecewise-linear concave `J` → segment log-masses → categorical choice → truncated-exp inverse CDF). 287 tests green; ruff + mypy --strict clean. `log φ = log(expm1(x)/x)` is checked against a **60-digit `decimal` oracle** rather than a restatement of itself, and the statistical tests KS the sampler against exact analytic CDFs *and* against an independent fine-grid quadrature of the **directly evaluated** `J` — a reference that never touches the piecewise machinery, so a misplaced breakpoint cannot cancel out against itself. **The `/collab` review ran 4 rounds and earned its keep: it found two bugs that corrupted the sampled distribution while 264 tests passed.** (a) *The absolute magnitude of `J` reached the probabilities.* `h_a = β(J−J*)/s_J` built from absolute knot values cancels catastrophically; with a biomass flux of 1e16 the true segment probabilities [0.387, 0.613] came back as [0.632, 0.368] — **the favoured segment reversed**, from slopes that were themselves exactly right. Fixed by storing knot heights relative to the **peak** of `J` and anchoring each segment's mass integral at its **higher endpoint**; `J*` left the API entirely (it provably cancels). (b) *Redrawing a coordinate on a degenerate chord breaks stationarity* — spec §19 and BUILD_PLAN §1.6 both prescribed it, but it makes coordinate selection state-dependent and collapses the random-scan Gibbs invariance argument. Now a **self-loop**, and there is no minimum chord width at all. Round 2 is the one to remember: **both of its findings were defects in round 1's fixes**, not in the original code. Also corrected: the opening slope (spec §20.3's midpoint rule reads `sgn(0)=0` on a one-ULP first segment and is 2× off in a measured 10.5% of them); `UNIFORM_LIMIT = eps/4`, not `eps/2`, because float spacing is asymmetric about 1.0; `β/s_J` validated against a *silent* underflow. I rebutted one Codex claim with measurements (the `MIN_NORMAL` "collapse" was ≤1 ULP on a probability-1e-15 set, not distribution corruption) and it conceded. BUILD_PLAN §1.6 gains **deltas 6–9**; `.collab/specs/collab-outcome.md` now exists and records all four rounds. **Next: M3** (`highs_backend.py` — not math-critical, no collab gate).
 - 2026-07-13 — **M3 gate PASSED.** Built `highs_backend` (the only module that touches `highspy`) and `sparse_objective` (the objective, the (v,z) LP, the §14 flux-only LP, the biomass-only diagnostic). 369 tests green; ruff + mypy --strict clean. The gate is one equation — *solver objective == directly recomputed J* — and it is load-bearing: HiGHS optimizes a linearized surrogate over `(v,z)` on a **reduced** polytope with a constant folded into an **offset**, while `evaluate` computes `J` from the full 773-flux vector and knows none of that. They agree only if the linearization, the fixed-variable elimination, the objective lowering *and* the constant are all right. Verified on both models across λ ∈ {0, 1e-4, 1e-3, 0.01, 1}. Design notes: (a) HiGHS adds `lp.offset_` to the reported objective **sign-intact under `kMaximize`** — probed, then pinned by a test — so the fixed reactions' L1 cost reaches `J*` instead of being quietly dropped (only the toy, with `FIX = 2.0`, can catch that; all 513 of the example model's fixed reactions sit at zero); (b) a `z` column is built **only where `λw_r > 0`**, because a zero-cost `z` has nothing pushing it down onto `|v_r|` and would fail its own check on a solution that is perfectly correct in `v`; (c) the solve counter is **process-global** and programs can be `freeze()`d, so M5 can both assert and *prohibit* an inner-loop solve; (d) `highspy` is imported inside the constructor, so a worker can import the objective without loading a solver. **🔴 The milestone's real find is scientific, not structural: at the default λ = 1.0 the genome-scale LP optimum is *the origin* — `v* = 0`, `J* = 0`, zero growth — while `μ_max = 41.6`.** Above `λ* = max_v μ(v)/C(v)` the L1 cost of growing outruns the biomass it returns and the cell's best move is to shut down; on this model `λ* = 1.89e-3`, so our default is **529× past the cliff** and the spec's own suggested `0.01` is **5.3×** past it. Nothing inside the LP can see this — optimal status, zero residual, `z = |v|` exactly — so `solve_sparse_objective` now always solves the biomass-only LP too and flags `is_sparsity_dominated`. The collapse needs a feasible origin: this model has **no forced-flux reaction at all** (no `ATPM` lower bound), which is also why the toy (`FIX = 2.0`) cannot reproduce it and the genome-scale model can. **Decision left OPEN** (raw λ vs scale-referenced λ), recorded in BUILD_PLAN §1.7 — it does not block M4/M5 (geometry is λ-independent; β=0 ignores `J`) but **must be settled before M6 tilts by `J`**. **Next: M4** (math-critical — `/collab` review required at the gate).
 - 2026-07-13 — **M3 addendum: λ is now scale-referenced** (the open decision from the gate, settled by the user). The config takes a **dimensionless `λ̃`** (`objective.l1_penalty_scaled`, default 0.5) and `resolve_objective` computes the raw `λ = λ̃ · λ*` per model. **`λ*` is exact, from a single LP** — `λ* = max_v μ(v)/C(v)` is a linear-fractional program, and the Charnes–Cooper substitution (`y = v·t`, `t = 1/C(v)`) turns it into "maximize `μ(y)` subject to a unit cost budget `C(y) ≤ 1`", with the bounds homogenizing into rows `l·t ≤ y ≤ u·t` and the absolute value linearizing by the same `z ≥ ±y` trick as §12. It reproduces the 40-step bisection to 8 figures and hits the fork toy's hand-derived `λ* = 1/2` to 10 decimals, so it is checked against arithmetic rather than against itself. λ* is **exactly** the cliff, not merely near it: at `0.999·λ*` the model grows, at `1.001·λ*` the optimum is the origin — pinned as a test on the genome-scale model. The λ̃ ladder is now the selection-pressure dial the study wanted: **λ̃ = 0 → 100% of μ_max retained, 0.25 → 95%, 0.5 → 60%, 0.9 → 30%**. `λ̃ ≥ 1` is *refused* when the origin is feasible (a guaranteed collapse, nothing to sample) and *allowed* when it is not — a model with forced maintenance flux, like the toy, cannot answer a large λ by shutting down and so has no cliff at all. Why this matters beyond one model: λ̃ = 0.5 resolves to `λ = 9.4e-4` on Bifido and `λ = 0.25` on the toy — **a factor of 265** — so a shared *raw* λ would have meant wildly different selection pressures across a batch while looking, in the config file, like a controlled comparison. `λ̃`, `λ*`, the raw `λ` and `origin_is_feasible` all go to the manifest (spec §3.6: no hidden scaling). BUILD_PLAN §1.7 records the decision. **Left open for M7**: `λ*` is a function of `w` (doubling every weight halves it), so the reweighting loop must choose — and record — whether λ stays frozen at its base-weight value or is re-resolved from the frozen final weights. 392 tests green; ruff + mypy --strict clean.
+- 2026-07-13 — **M4 gate PASSED (math-critical).** Built `affine_geometry` (scaled coords, orthonormal basis by support LPs, feasible centre, deterministic span certificate) and grew `native_csc`/`highs_backend`/`config`/`provenance` to serve it. 442 tests green; ruff + mypy --strict clean. **The milestone's central finding is scientific: the sampling dimension is 46, not 55.** 61 of the 260 free reactions cannot carry flux at all — the model file leaves `l < u`, but mass balance pins them — so `n_free − rank(S) = 55` is only an upper bound. `d = 46` is confirmed by an **independent FVA+rank oracle that shares no code with the geometry**, which is the gate's load-bearing test. **And those 61 reactions were not bookkeeping: they were a landmine under M5.** A blocked reaction is an *exact* structural zero of the direction space, so a basis row of ~1e-15 there is pure noise; divided by a centre sitting ~1e-13 *outside* its own bound (also noise), it produced **a chord limit of order 0.03–0.5** — inside the legitimate chord. Measured, the chord through the centre came out `[−0.54, −0.39]`, *excluding `t = 0`*, and `line_geometry` rightly refused to sample it: **M5 could not have started.** Now projected out exactly, and the geometry proves its own centre samplable before shipping it. **The `/collab` review ran 6 rounds and was worth every one — it found a crash, a silently dropped dimension, a dual-side blind spot, an accumulating basis error, an unsound bound formula, and two test bugs, one of which made a test unable to fail.** Every counterexample was reproduced before being fixed. Four things it changed that I would have shipped wrong: (a) **the certificate's resolution is `√k`, not its largest width** — width is subadditive, so a direction tilted across all 214 probes hides a factor of 14.6 from each one individually; (b) **flatness cannot be certified from the primal width**, which is a *lower* bound and the wrong end of the interval — a solve that stops short of optimality reports the width too *small* and certifies a real dimension as flat, so flatness now rests on a **weak-duality** upper bound that assumes nothing of the returned point, not even feasibility; (c) **the same bound must be applied to every FVA range**, since a range read off the primal is a lower bound and "this reaction cannot move" is exactly the conclusion a lower bound cannot support; (d) **error was accumulating along the Gram-Schmidt chain** (each column inherits `‖S·diag(s)·B‖·‖BᵀΔx‖` from its predecessors — the worst column hit 8e-10 against a 1e-9 tolerance), and an attempt to fix it by re-probing made it *worse*, so the chain is now cut by projecting every candidate into the mass-balanced subspace before it can pollute the basis. The honest consequence, reported rather than hidden: **the dual bound cancels terms of size ~5e3, so evaluating it in float64 costs ~1e-9 — that is the floor on what the certificate can resolve**, orders coarser than the ~1e-13 the arithmetic appears to produce. Certified resolution: **2.78e-11 scaled = 5.6e-8 flux units**, outward-rounded. What it licenses is stated precisely and narrowly: *every exact-polytope direction has its component orthogonal to `range(B)` bounded in width by that resolution* — **not** "cannot under-count a dimension". Also settled: three tolerances describe the same polytope and must not contradict each other (`scale_floor ≥ blocked_tol/span_tol`; `‖r_blocked/s_blocked‖₂ ≤ span_tol`; SVD rank cutoff ≥ the LP's `feasibility_tol`) — the first of those was a real crash. **Next: M5** (math-critical — `/collab` review required at the gate). M5 inherits a centre that is exactly bound-feasible, chords that all contain `t = 0` (min length 0.018), and support points that span all 46 directions, so its covariance ridge cannot conceal a singular covariance.

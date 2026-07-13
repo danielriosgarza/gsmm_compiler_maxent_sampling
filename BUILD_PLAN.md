@@ -159,6 +159,15 @@ selectable per run:
   gives `p_iᵀw = w_i ≠ 0` for some probe, forcing positive width — impossible to hide. Random probes
   are a cheap pre-pass only. Capped runs on huge models record `span_certificate_exhaustive=false`
   and are called a *randomized partial check*, never an unconditional guarantee.
+  - **Refined by M4 (collab, 6 rounds).** The exact-arithmetic proof is right, but a float64 LP can
+    only say "flatter than this", so the certificate is **resolution-bounded** and reports what it
+    licenses: `resolution = √k·√(1+leakage)·max_j width_upper(p_j) + leakage·diameter`. The `√k` is
+    not optional — width is subadditive, so a direction tilted across all `k` probes hides that
+    factor from each one. Flatness rests on a **weak-duality** upper bound (assumes nothing of the
+    returned point, not even feasibility), never on the primal width, which is a *lower* bound and
+    the wrong end of the interval. The licensed claim is: *every exact-polytope direction has its
+    component orthogonal to `range(B)` bounded in width by `resolution`* — **not** "cannot
+    under-count". See `.collab/specs/collab-outcome.md` § M4.
 - **Exactness of the 1D conditional.** `expm1`/`log1p` inverse-CDF is the primary path across all κ.
   The small-|κL| uniform form is only a below-float64-eps series limit, documented — not a silent
   approximation sold as "exact." Sign-aware log-mass formulas (no `log(expm1(x))` for x<0).
@@ -168,6 +177,27 @@ selectable per run:
 - **Reproducibility, scoped honestly.** Byte-identical traces are promised only within a locked
   binary + hardware environment. Across NumPy/BLAS/HiGHS/CPU changes, require matching *statistical*
   results + recorded provenance.
+
+### 1.4.1 FVA-blocked reactions are structural zeros of the direction space  *(M4 finding; SETTLED)*
+
+The example model has **61 free reactions (of 260) that cannot carry any flux at all** — the file
+leaves `l < u`, but mass balance pins them. So the naive `n_free − rank(S) = 55` is only an *upper
+bound*; the true affine dimension is **d = 46**, confirmed by an independent FVA+rank oracle.
+
+This is a correctness requirement, not bookkeeping. If `max vᵢ == min vᵢ` over `P`, then every
+feasible direction has `dᵢ = 0` **identically**, so a nonzero `B[i,:]` is numerical error. Left in, it
+is not harmless: a basis row of ~1e-15 in a coordinate whose centre sits ~1e-13 *outside* its own
+bound (both solver noise) divides into **a chord limit of order 0.03–0.5**, squarely inside the
+legitimate chord. Measured, the chord at the centre came out `[−0.54, −0.39]` — *excluding `t = 0`* —
+and `line_geometry` correctly refuses to sample it. **M5 could not have started.**
+
+So the blocked components are projected out of every candidate direction, exactly. This is *not* the
+forbidden snapping of small fluxes (§1.6): no flux is rounded, and a pinned reaction keeps its value;
+what is zeroed is a component of the *direction space* that an LP measured as zero. It is
+**numerically fixed at resolution `blocked_tol`**, not provably constant — a true 5e-16-wide dimension
+would be dropped, and the separation guard would not object. The three resolutions must not
+contradict each other: `scale_floor ≥ blocked_tol/span_tol`, `‖r_blocked/s_blocked‖₂ ≤ span_tol`, and
+the SVD rank cutoff ≥ the LP's `feasibility_tol`.
 
 ### 1.5 Fixed-variable elimination (correctness + speed)
 

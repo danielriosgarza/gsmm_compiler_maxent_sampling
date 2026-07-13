@@ -130,6 +130,36 @@ class NativeCSC:
 
     # ---- products -----------------------------------------------------------------------------
 
+    def cancellation_scale(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
+        """``|S|·|x|`` — the magnitude of the terms that ``matvec(x)`` cancels, row by row.
+
+        A steady-state residual is a *difference of large numbers*: on the example model
+        ``S·v`` sums terms of size ~1e5, so evaluating it in float64 costs ~1e-11 of
+        rounding before any solver error is involved, and a polytope with 1e10 bounds
+        costs ~1e-6. Callers that want to know whether a residual is a **defect** rather
+        than arithmetic need this scale to divide by.
+
+        Note it cannot be had from ``matvec(np.abs(x))``: that still applies the *signed* entries of
+        ``S``, so the very cancellation being measured happens all over again.
+        """
+        vector = np.asarray(x, dtype=VALUE_DTYPE)
+        if vector.shape != (self.n_cols,):
+            raise ValueError(f"x has shape {vector.shape}, expected ({self.n_cols},)")
+        contributions = np.abs(self.values) * np.abs(vector[self._column_of_entry])
+        return np.bincount(self.indices, weights=contributions, minlength=self.n_rows).astype(
+            VALUE_DTYPE, copy=False
+        )
+
+    def cancellation_scale_transpose(self, y: NDArray[np.float64]) -> NDArray[np.float64]:
+        """``|A|ᵀ·|y|`` — the column-wise companion of `cancellation_scale`."""
+        vector = np.asarray(y, dtype=VALUE_DTYPE)
+        if vector.shape != (self.n_rows,):
+            raise ValueError(f"y has shape {vector.shape}, expected ({self.n_rows},)")
+        contributions = np.abs(self.values) * np.abs(vector[self.indices])
+        return np.bincount(
+            self._column_of_entry, weights=contributions, minlength=self.n_cols
+        ).astype(VALUE_DTYPE, copy=False)
+
     def matvec(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
         """Return ``A @ x`` (length ``n_rows``).
 

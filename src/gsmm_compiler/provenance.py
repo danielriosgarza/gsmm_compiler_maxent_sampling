@@ -88,6 +88,40 @@ def content_key(**components: Any) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def _stable_hash(text: str) -> int:
+    """A 32-bit hash that is stable *across processes*.
+
+    Deliberately not `hash()`: Python salts string hashing per interpreter (``PYTHONHASHSEED``), so
+    a spawn key built from it would name a different RNG stream in every worker — the exact
+    reproducibility failure `stream_seed` exists to prevent.
+    """
+    return int.from_bytes(hashlib.sha256(text.encode()).digest()[:4], "big")
+
+
+def stream_seed(
+    *,
+    model_id: str,
+    stage: str,
+    seed: int = 0,
+    beta_index: int | None = None,
+    chain_index: int | None = None,
+) -> np.random.SeedSequence:
+    """The RNG stream for one unit of work, keyed on its **semantic coordinates** (CLAUDE.md).
+
+    A flat ``SeedSequence.spawn()`` sequence renumbers every downstream stream as soon as the task
+    count changes — add one chain and every other chain draws different numbers. Keying the spawn
+    key on ``(model_id, stage, β_index, chain_index)`` instead means a stream is named by *what it
+    is*, so it survives a change of batch composition or task ordering. The key is stored in the
+    manifest (it is readable back off the returned object as ``.spawn_key``).
+    """
+    spawn_key: tuple[int, ...] = (_stable_hash(model_id), _stable_hash(stage))
+    if beta_index is not None:
+        spawn_key += (int(beta_index),)
+    if chain_index is not None:
+        spawn_key += (int(chain_index),)
+    return np.random.SeedSequence(entropy=int(seed), spawn_key=spawn_key)
+
+
 @dataclass(frozen=True)
 class Provenance:
     """The environment an artifact was produced in — written into every run manifest (spec §7)."""

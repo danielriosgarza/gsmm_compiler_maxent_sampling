@@ -108,7 +108,37 @@ class LPSolution:
     """Column values, length ``n_cols``. Extracted in one conversion."""
     row_activity: NDArray[np.float64]
     """Row values, length ``n_rows`` — the solver's own view of ``A x``."""
+    reduced_costs: NDArray[np.float64]
+    """Column duals, length ``n_cols`` — HiGHS's own reduced costs."""
+    row_duals: NDArray[np.float64]
+    """Row duals, length ``n_rows``. The raw material of a *rigorous* optimality bound.
+
+    A caller measuring a quantity as a **difference of two optima** — a support width, say — must
+    know how much the solver may have left on the table, and no primal quantity can tell it. What
+    can is **weak duality**: for the box-constrained ``max cᵀv s.t. Av = b, l ≤ v ≤ u`` and *any*
+    ``y`` whatsoever,
+
+        ``max cᵀv  ≤  bᵀy + Σⱼ max(dⱼlⱼ, dⱼuⱼ)``,   ``d = c − Aᵀy``
+
+    — an upper bound that assumes nothing about ``y`` being optimal, or even good. That
+    is the point:
+    a bound built instead from complementary slackness would inherit every assumption about how the
+    solver chose to stop, including that its returned point is exactly row-feasible,
+    which it is not.
+    """
     max_primal_infeasibility: float
+    max_dual_infeasibility: float
+    """The optimality side of the story, and the one it is tempting to omit.
+
+    ``kOptimal`` means "optimal to the configured tolerances", not "optimal". A returned point
+    can be
+    perfectly primal-feasible and still leave an improving reduced cost on the table, if that
+    cost is
+    below the dual tolerance — and a caller that measures a *width* by optimizing in two opposite
+    directions would then read that width as **too small**, silently. Primal infeasibility cannot
+    see
+    this; only this number can. `affine_geometry` gates its span certificate on it.
+    """
     simplex_iterations: int
     elapsed_seconds: float
 
@@ -313,6 +343,8 @@ class HighsLinearProgram:
         # One conversion each, per the M0 finding: these attributes are Python lists.
         primal = np.asarray(solution.col_value, dtype=VALUE_DTYPE)
         row_activity = np.asarray(solution.row_value, dtype=VALUE_DTYPE)
+        reduced_costs = np.asarray(solution.col_dual, dtype=VALUE_DTYPE)
+        row_duals = np.asarray(solution.row_dual, dtype=VALUE_DTYPE)
         if primal.shape != (self._n_cols,):
             raise HighsBackendError(
                 f"HiGHS returned {primal.size} column values, expected {self._n_cols}"
@@ -324,7 +356,10 @@ class HighsLinearProgram:
             objective_value=float(info.objective_function_value),
             primal=primal,
             row_activity=row_activity,
+            reduced_costs=reduced_costs,
+            row_duals=row_duals,
             max_primal_infeasibility=float(info.max_primal_infeasibility),
+            max_dual_infeasibility=float(info.max_dual_infeasibility),
             simplex_iterations=int(info.simplex_iteration_count),
             elapsed_seconds=elapsed,
         )

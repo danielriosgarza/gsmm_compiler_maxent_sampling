@@ -86,6 +86,52 @@ class GeometryConfig:
 
     feasibility_tol: float = 1e-9
     span_tol: float = 1e-9
+    """Width tolerance: an LP width below this is a *flat* direction, not a sampling dimension."""
+    rank_tol: float = 1e-9
+    """Residual-norm tolerance for admitting a direction into the basis (spec §15.3 step 10).
+
+    Not tighter than `span_tol`, and deliberately not tighter than what the LP can deliver: HiGHS is
+    *allowed* to return a point that misses feasibility by its own primal tolerance (1e-9), and a
+    rank tolerance below the noise that licenses would call a perfectly good geometry inconclusive.
+    `affine_geometry` checks that coupling explicitly rather than leaving it to luck.
+    """
+    dual_tol: float = 1e-7
+    """Dual infeasibility above which a support LP's *width* is not to be believed.
+
+    A width is a difference of two optima, so a solve that stopped short of optimality reports it
+    too
+    **small** — and a real dimension gets certified flat. Primal feasibility says nothing about
+    this.
+    `affine_geometry` sup-normalizes each support objective precisely so that this absolute bar is
+    meaningful, and a probe that breaches it is inconclusive.
+    """
+    scale_floor: float = 1.0
+    """Floor on the reaction scale ``s_i = u_i − l_i`` (spec §15.2).
+
+    The scaled coordinates divide by ``s_i``, so they also divide the solver's feasibility error by
+    ``s_i``: an unfloored range of 1e-12 would amplify a 1e-12 LP residual into a scaled coordinate
+    of order 1. The floor bounds that amplification.
+
+    It is not a free parameter. ``__post_init__`` requires ``scale_floor ≥ blocked_tol / span_tol``,
+    which keeps the two resolutions the geometry uses from contradicting each other: a reaction
+    blocked for spanning less than `blocked_tol` in **flux** has a scaled axis width of at most
+    ``blocked_tol / scale_floor``, and unless that is ≤ `span_tol` the certificate sweep will turn
+    around and report the very axis the blocked projection just removed — a direction it then cannot
+    append, because the projection zeroed it. With the defaults the bound is exactly 1.0.
+    """
+    stall_probes: int = 24
+    """Consecutive random probes that must find nothing before discovery hands off to the sweep."""
+    blocked_tol: float = 1e-9
+    """FVA range below which a *free* reaction is judged unable to carry flux at all.
+
+    Such a reaction is an exact zero of the direction space, and `affine_geometry` projects it out
+    of the basis — see that module on why a noise-valued basis row there corrupts the chord. The
+    example model has 61 of them among its 260 free reactions. This is not a knob to tune: the
+    widest blocked range there is 8e-10 and the narrowest moving one is 0.30, and geometry refuses
+    to proceed when that separation is not wide enough to make the split unambiguous. The ranges are
+    *upper* bounds from weak duality, never primal readings — a lower bound would be the wrong end
+    entirely, since an LP that stopped short would report zero for a reaction that is wide open.
+    """
     seed: int = 0
     max_geometry_memory_gb: float = 2.0
     exhaustive_span_certificate: bool = True
@@ -94,8 +140,30 @@ class GeometryConfig:
     """Cap on certificate probes. Any cap forces ``span_certificate_exhaustive = false``."""
 
     def __post_init__(self) -> None:
-        if self.feasibility_tol <= 0.0 or self.span_tol <= 0.0:
+        if self.feasibility_tol <= 0.0 or self.span_tol <= 0.0 or self.rank_tol <= 0.0:
             raise ConfigError("geometry tolerances must be > 0")
+        if self.blocked_tol <= 0.0 or self.dual_tol <= 0.0:
+            raise ConfigError("geometry.blocked_tol and geometry.dual_tol must be > 0")
+        if self.scale_floor <= 0.0:
+            raise ConfigError("geometry.scale_floor must be > 0")
+        required_floor = self.blocked_tol / self.span_tol
+        if self.scale_floor < required_floor:
+            raise ConfigError(
+                f"geometry.scale_floor ({self.scale_floor:g}) must be >= blocked_tol/span_tol "
+                f"({required_floor:g}), or the two resolutions contradict each other: a reaction "
+                "blocked below blocked_tol would still show a scaled width above span_tol, and the "
+                "span sweep would report a direction the blocked projection has already removed"
+            )
+        if self.rank_tol > self.span_tol:
+            # width = pᵀ·Δx with ‖p‖ = 1 and p ⊥ B, so width ≤ ‖residual‖ always. A rank tolerance
+            # above the width tolerance would therefore reject residuals the width test just
+            # accepted — the two tests would disagree about a direction the LP proved is real.
+            raise ConfigError(
+                f"geometry.rank_tol ({self.rank_tol}) must be <= geometry.span_tol "
+                f"({self.span_tol}): a width always lower-bounds its residual norm"
+            )
+        if self.stall_probes < 1:
+            raise ConfigError("geometry.stall_probes must be >= 1")
         if self.max_geometry_memory_gb <= 0.0:
             raise ConfigError("geometry.max_geometry_memory_gb must be > 0")
         if self.max_span_probes is not None and self.max_span_probes < 1:
