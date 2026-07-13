@@ -214,6 +214,42 @@ triggers are in `.collab/specs/collab-outcome.md`.
    overflows *or underflows to zero* (which would silently flatten the tilt). Computing it once also
    guarantees the mass stage and the sampling stage use the same `κ`.
 
+### 1.7 λ is not a dimensionless knob — the sparsity cliff  *(M3 finding; decision OPEN)*
+
+`J(v) = μ(v) − λ·C(v)` compares a **biomass flux** with a **sum of hundreds of absolute fluxes**.
+Those two quantities are not on the same scale, and their ratio is a property of each model:
+
+| | example model (Bifido) | toy network |
+|---|---|---|
+| `μ_max` | 41.63 | 10.0 |
+| `C(v)` at the growth optimum | ≈ 4.5 × 10⁴ | 4.0 |
+| **critical λ\*** | **1.89 × 10⁻³** | ∞ (cannot collapse) |
+
+Above `λ* = max_v μ(v)/C(v)` the LP optimum is **exactly the origin**: `v = 0` is feasible
+(`S·0 = 0`), it costs nothing and earns nothing, and that beats any growth whose L1 cost outruns its
+biomass. On the example model this means:
+
+- our default `l1_penalty = 1.0` is **529× past the cliff**;
+- the spec's own suggested `l1_penalty = 0.01` (§8) is **5.3× past it**.
+
+At those values `J* = 0`, `v* = 0`, and every downstream stage — `s_J`, the β-ladder, the reweighting
+loop — would tilt toward a distribution concentrated on *no metabolism at all*. **The LP is not wrong
+when this happens; `J` is.** Nothing inside the LP can tell: status optimal, residual zero, `z = |v|`
+exactly. Only `μ_max` standing next to `μ(v*)` gives it away, so `solve_sparse_objective` always
+computes both and `SparseObjectiveSolution.is_sparsity_dominated` flags it.
+
+The collapse needs a feasible origin. This model has **no forced-flux reaction at all** (no `ATPM`
+lower bound), so it retreats to zero; a model with a maintenance demand pinned above zero cannot.
+That is also why the toy network cannot reproduce the failure — `FIX = 2.0` keeps it alive — and why
+it took the genome-scale model to find it.
+
+**Open decision (blocks M6, not M4/M5).** β=0 ignores `J` entirely and geometry is λ-independent, so
+M4 and M5 are unaffected. Before M6 tilts by `J`, we must settle whether λ stays **raw** (user picks
+per model, guarded by the diagnostic) or becomes **scale-referenced** (e.g. `λ = λ̃ · μ_max/C_ref`,
+recorded explicitly — no hidden scaling, spec §3.6). The batch/cross-model goal (§1.1: *"comparable
+selection pressure"* across strains) argues hard for the second: a single raw λ means a different
+selection pressure in every strain, which would make the cross-model comparison meaningless.
+
 ---
 
 ## 2. Milestones and acceptance gates
