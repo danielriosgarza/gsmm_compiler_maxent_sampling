@@ -26,14 +26,14 @@
 
 | Field | Value |
 |---|---|
-| **Active milestone** | **M2 — One-dimensional kernel (math oracle)** |
-| **Status** | ⬜ NOT STARTED (M0 + M1 gates passed 2026-07-13; 164 tests green) |
-| **Next action** | `line_geometry.py` — feasible chord `[t_lo, t_hi]`, keeping **all nonzero** direction components |
+| **Active milestone** | **M3 — Native HiGHS LP layer** |
+| **Status** | ⬜ NOT STARTED (M0 + M1 + M2 gates passed 2026-07-13; 287 tests green) |
+| **Next action** | `highs_backend.py` — `HighsLinearProgram` adapter with a **solve counter**; one-shot solution extraction (M0 fact: highspy returns Python lists, not NumPy views) |
 | **Blockers** | none |
 | **Last updated** | 2026-07-13 |
 
-> ⚠️ **M2 is math-critical**: its gate requires a `/collab` adversarial review (exactness of the 1D
-> conditional; `expm1`/`log1p` stability across all κL; no tolerance-merging of distinct breakpoints).
+> M3 is **not** math-critical — no `/collab` gate required. The next required collab review is **M4**
+> (completeness of the deterministic span certificate).
 
 ### Platform facts established by M0 (build on these, don't re-derive)
 
@@ -42,6 +42,22 @@
 - **SciPy is absent from the venv entirely** — stronger than the gate required (§4 anticipated cobra might pull it transitively; it does not). The no-scipy gate is enforced by `tests/unit/test_no_scipy.py` at both runtime and source level.
 - HiGHS accepts native `int32` CSC index/start arrays + `float64` values via `passModel`. The biomass LP matches cobra's own FBA optimum to `rel=1e-6` — the CSC assembly is verified, not merely accepted.
 - ⚠️ **highspy attribute reads return Python `list`, not NumPy views** (the pybind layer copies). M3's LP layer must keep its own float64 arrays and extract solutions in one `np.asarray` shot — never element-wise. Pinned by `test_highspy_returns_python_lists_not_arrays`.
+
+### Facts established by M2 (the line kernel is now a trusted oracle — build on it)
+
+- **The line kernel takes no `J*`.** It cancels out of `p(t)`, and carrying it invites catastrophic
+  cancellation. M6 will still need `s_J` and `J*` for *diagnostics* (energy traces), but must not feed
+  `J*` into the draw.
+- **M5 must NOT redraw a coordinate when a chord is degenerate** — that makes coordinate selection
+  state-dependent and breaks stationarity. `sample_line` already returns the correct self-loop; just
+  apply it (`y_k += 0`). See BUILD_PLAN §1.6 delta 6.
+- **M5 builds the per-coordinate precompute itself.** An unvalidated caller-supplied `support` array was
+  removed from `feasible_chord`: a truncated one silently reintroduces the §1.6.1 tolerance bug. The
+  precompute must be *derived* from `T`, so the invariant holds by construction.
+- **`PiecewiseLinearJ.values`/`evaluate()` return absolute `J` and are for reporting only.** Never form a
+  probability from them; the mass path uses `heights` (peak-relative) exclusively.
+- Weights, `λ`, `β` and `s_J` are frozen inputs to the kernel. M7's reweighting must complete *before*
+  sampling starts — a weight that moves mid-chain retargets every conditional and destroys stationarity.
 
 ### Facts established by M1
 
@@ -55,7 +71,7 @@
 ```bash
 cd /home/mcpu/GitHub/gsmm_compiler_maxent_sampling
 .venv/bin/python -V                                    # expect 3.11.15
-.venv/bin/python -m pytest -q | tail -3                # expect 164 passed
+.venv/bin/python -m pytest -q | tail -3                # expect 287 passed
 .venv/bin/ruff check . && .venv/bin/mypy               # expect clean
 .venv/bin/gsmm-compiler model inspect examples/toy_network.json     # affine RHS: nonzero
 .venv/bin/gsmm-compiler model inspect models/GCF_000010425_1_ASM1042v1_protein_non_gapfilled_latest_gapfilled_noO2.json
@@ -86,15 +102,15 @@ Gate: hand-checked CSC · exact full-model reconstruction · l==u elimination eq
 - [x] unit tests: CSC hand-check + order preservation + NaN/inf/dup detection + elimination & reconstruction round-trip
 - [x] **gate**: LP optima identical full-vs-reduced under 200 random objectives (toy) and 10 (genome-scale) — feasible-set *and* objective equivalence, incl. the fixed-flux objective constant
 
-### 🟨 M2 — One-dimensional kernel (math oracle, before any genome-scale MCMC)  *(ACTIVE)*
+### ✅ M2 — One-dimensional kernel (math oracle)  *(gate passed 2026-07-13)*
 Gate: analytic + property tests across κL ∈ {0,±1e-16,±1e-12,±1e-8,±1,±100,±1000}; continuity; monotone slopes; edge cases.
-- [ ] `line_geometry.py` — feasible chord `[t_lo,t_hi]`; **keep all nonzero direction components**; `nextafter` inward; redraw on zero-length
-- [ ] `line_distribution.py` — breakpoints `τ_r=-v_r/d_r`; piecewise-linear concave `J(t)` via slope drops `2λw_r|d_r|`; segment log-masses (`expm1`/`log1p` + custom logsumexp); categorical segment choice; stable truncated-exp inverse-CDF
-- [ ] unit tests: chord (±/zero comps, t=0, zero-length); piecewise J vs direct grid eval, continuity, nonincreasing slopes, duplicate/no breakpoints
-- [ ] statistical tests: uniform (β=0), `e^{κt}`, `e^{-α|t|}` moments/quantiles (fixed seeds, non-flaky CIs)
-- [ ] 🤝 **`/collab` adversarial review (required gate step)** — exactness of the conditional; expm1/log1p stability across all κL; no tolerance-merging of distinct breakpoints; chord keeps every nonzero component
+- [x] `line_geometry.py` — feasible chord `[t_lo,t_hi]`; **keep all nonzero direction components**; `nextafter` inward; **self-loop (not redraw) on a degenerate chord**; raises on an empty or non-finite chord
+- [x] `line_distribution.py` — breakpoints `τ_r=-v_r/d_r`; piecewise-linear concave `J(t)` via slope drops `2λw_r|d_r|`; **peak-anchored heights + higher-endpoint mass anchoring**; segment log-masses (`expm1`/`log1p` + custom logsumexp); categorical segment choice; stable truncated-exp inverse-CDF
+- [x] unit tests: chord (±/zero comps, tiny-but-binding comps, t=0, degenerate); piecewise J vs direct grid eval, continuity, nonincreasing slopes, duplicate/near-duplicate/no breakpoints; `log φ` vs a **60-digit `decimal` oracle** across every regime
+- [x] statistical tests: uniform (β=0), `e^{κt}`, `e^{-α|t|}` — KS vs exact analytic CDFs + an independent fine-grid quadrature of the *directly evaluated* `J`; fixed seeds, p-floor 1e-3
+- [x] 🤝 **`/collab` adversarial review — 4 rounds, converged (AGREE, contested: none).** Found **two distribution-corrupting bugs that passed 264 tests**. See `.collab/specs/collab-outcome.md`; BUILD_PLAN §1.6 deltas 6–9 are new.
 
-### ⬜ M3 — Native HiGHS LP layer
+### 🟨 M3 — Native HiGHS LP layer  *(ACTIVE)*
 Gate: solver objective == direct J · feasibility on degenerate toys · z=|v| within tol · no scipy.
 - [ ] `highs_backend.py` — `HighsLinearProgram` adapter: build `HighsLp`, `passModel`, `set_objective`/`set_maximize`, `solve` w/ status+model-status checks, one-shot solution extraction, basis get/set, **solve counter**
 - [ ] `sparse_objective.py` — `SparseFluxObjective`; (v,z) LP by **direct CSC assembly** (no scipy blocks); z=|v| checks; biomass-only diagnostic LP; recompute + compare J
@@ -159,3 +175,4 @@ Only after M0–M9: pilot rerounding + pilot-based `s_J` (bootstrap→pilot→fi
 - 2026-07-13 — Design collaboration (Claude×Codex, 2 rounds) → BUILD_PLAN.md. Investigated blocked reactions (513 = FVA-blocked under anaerobic medium; fixed-var elimination provably correct). Locked scope: batch-aware v1, reweighted-L1 in v1 (M7), configurable storage, Python 3.11. Created this tracker + project CLAUDE.md. **No code yet — next session starts M0.**
 - 2026-07-13 — **M0 gate PASSED.** Scaffolded `pyproject.toml` (hatchling, src layout) + all 17 modules of the spec §6 skeleton; `uv` venv on 3.11.15 with a wheel-only install (`uv.lock`, 47 pkgs, zero source builds). Smoke test builds the biomass LP from native int32/float64 CSC arrays, passes it to `highspy.passModel`, solves to `kOptimal`, and **matches cobra's own FBA optimum to rel=1e-6** — so the CSC assembly is verified, not just accepted. 25 tests green; ruff + mypy --strict clean. Findings: (a) **scipy is absent from the venv entirely**, so the no-scipy path is free rather than fought for; (b) **highspy attribute reads return Python lists, not NumPy views** — recorded for M3's one-shot extraction design; (c) BUILD_PLAN §0's "65 exchanges" was 63 `EX_` + 2 `SK_` sinks — corrected in place. **Next: M1** (`config.py` first).
 - 2026-07-13 — **M1 gate PASSED.** Built `native_csc` (int32 CSC + `matvec`/`rmatvec` via `bincount`), `flux_polytope` (canonical + reduced IR with the explicit affine RHS), `model_input` (validation → canonical L0 IR + `model_report.json`), `config` (TOML + overrides, unknown keys rejected), and a new `provenance` module for L0/L1 content keys. Added `examples/toy_network.json` — 7 reactions, with **FIX pinned at 2.0** so the reduced mass balance is genuinely affine, the case the Bifido model cannot exercise (all 513 of its fixed reactions sit at zero). Gate closed by LP-level equivalence: full-vs-reduced optima agree under 200 random objectives on the toy and 10 on the genome-scale model, including the fixed-flux objective constant that §1.5 warns about. 164 tests green; ruff + mypy --strict clean. Findings: (a) **HiGHS uses a 32-bit `HighsInt`** (`kHighsIInf == 2**31-1`), so the spec's `int64` CSC would be silently narrowed on every `passModel` — we store int32 and bound-check nnz; (b) **cobra already rejects NaN/inverted/duplicate-ID models but accepts infinite bounds**, so that is the one malformation our parser layer must catch itself. `.collab/specs/collab-outcome.md` is referenced by three docs but **does not exist** (the directory is empty) — decisions survive in BUILD_PLAN §1. **Next: M2** (math-critical — `/collab` review required at the gate).
+- 2026-07-13 — **M2 gate PASSED (math-critical).** Built `line_geometry` (feasible chord) and `line_distribution` (breakpoints → piecewise-linear concave `J` → segment log-masses → categorical choice → truncated-exp inverse CDF). 287 tests green; ruff + mypy --strict clean. `log φ = log(expm1(x)/x)` is checked against a **60-digit `decimal` oracle** rather than a restatement of itself, and the statistical tests KS the sampler against exact analytic CDFs *and* against an independent fine-grid quadrature of the **directly evaluated** `J` — a reference that never touches the piecewise machinery, so a misplaced breakpoint cannot cancel out against itself. **The `/collab` review ran 4 rounds and earned its keep: it found two bugs that corrupted the sampled distribution while 264 tests passed.** (a) *The absolute magnitude of `J` reached the probabilities.* `h_a = β(J−J*)/s_J` built from absolute knot values cancels catastrophically; with a biomass flux of 1e16 the true segment probabilities [0.387, 0.613] came back as [0.632, 0.368] — **the favoured segment reversed**, from slopes that were themselves exactly right. Fixed by storing knot heights relative to the **peak** of `J` and anchoring each segment's mass integral at its **higher endpoint**; `J*` left the API entirely (it provably cancels). (b) *Redrawing a coordinate on a degenerate chord breaks stationarity* — spec §19 and BUILD_PLAN §1.6 both prescribed it, but it makes coordinate selection state-dependent and collapses the random-scan Gibbs invariance argument. Now a **self-loop**, and there is no minimum chord width at all. Round 2 is the one to remember: **both of its findings were defects in round 1's fixes**, not in the original code. Also corrected: the opening slope (spec §20.3's midpoint rule reads `sgn(0)=0` on a one-ULP first segment and is 2× off in a measured 10.5% of them); `UNIFORM_LIMIT = eps/4`, not `eps/2`, because float spacing is asymmetric about 1.0; `β/s_J` validated against a *silent* underflow. I rebutted one Codex claim with measurements (the `MIN_NORMAL` "collapse" was ≤1 ULP on a probability-1e-15 set, not distribution corruption) and it conceded. BUILD_PLAN §1.6 gains **deltas 6–9**; `.collab/specs/collab-outcome.md` now exists and records all four rounds. **Next: M3** (`highs_backend.py` — not math-critical, no collab gate).

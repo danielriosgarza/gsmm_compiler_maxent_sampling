@@ -181,15 +181,38 @@ the full-`n` path on small models, plus round-trip reconstruction (full-space bo
 
 ### 1.6 Correctness deltas vs the spec (call these out in code comments + tests)
 
+Deltas 1–5 came from the design collaboration; **6–9 were added by the M2 collab review**, which found
+two distribution-corrupting bugs in code that already passed 264 tests. Full reasoning and the measured
+triggers are in `.collab/specs/collab-outcome.md`.
+
 1. **Chord must keep every nonzero component.** The spec's "ignore |dᵢ|<tol" in the chord is a
    feasibility bug: a tiny `dᵢ` with `vᵢ` near its bound still binds a short, finite limit. Dropping it
-   samples outside bounds. Tolerance only decides *redraw on zero-length chord*.
+   samples outside bounds. **No tolerance enters the chord at all** — see delta 6.
 2. **Breakpoints: keep distinct cuts.** Merging unequal-but-close breakpoints changes `J(t)` and thus
-   the target. Remove only zero-length segments / exactly-coincident cuts.
+   the target. Group only *exactly* coincident cuts (summing their slope drops).
 3. **s_J belongs to the objective layer**, not geometry (it is evaluated through `J`).
 4. **J\* is not a strict numeric upper bound.** Solver tolerance can make `(J(v)−J*)/s_J` slightly
-   positive; the log-density code must not assume ≤ 0.
+   positive; the log-density code must not assume ≤ 0. (In the line kernel `J*` is now absent
+   entirely — see delta 7.)
 5. **Span validation is deterministic** (§1.4), stronger than the spec's random probes.
+6. **A degenerate chord is a SELF-LOOP, never a redraw** *(overrides spec §19)*. Redrawing a different
+   coordinate makes coordinate selection **state-dependent** and breaks the random-scan Gibbs
+   stationarity argument: the kernel is the uniform mixture `(1/d)·Σₖ Pₖ` only because `k` is chosen
+   independently of the state. When the feasible set on the line is a single point, its exact
+   conditional is the point mass there, so the chain moves to it (`t = 0` for an on-bounds state).
+   Consequently there is **no minimum chord width** — a 1e-13-wide chord is simply sampled. A *raw
+   crossed* chord is different: the feasible set is empty, so `v` is infeasible and it raises.
+7. **The absolute magnitude of `J` must never reach a probability.** `J*` and any constant offset cancel
+   out of `p(t)` algebraically but *not* numerically. Store knot heights **relative to the peak of `J`**
+   (accumulated from the slopes, never through the absolute value) and anchor each segment's mass
+   integral at its **higher endpoint**. The line kernel takes no `J*`. Getting this wrong reversed which
+   segment the sampler favoured, from slopes that were themselves exactly right.
+8. **The opening slope is fixed by side, never by midpoint** *(overrides spec §20.3 step 6)*. On a
+   one-ULP first segment the midpoint rounds onto the cut, where `sgn(0) = 0` yields a subgradient —
+   measured 2× off in 10.5% of such configurations.
+9. **Scaling parameters are validated, not trusted.** `β/s_J` is computed once and rejected if it
+   overflows *or underflows to zero* (which would silently flatten the tilt). Computing it once also
+   guarantees the mass stage and the sampling stage use the same `κ`.
 
 ---
 
