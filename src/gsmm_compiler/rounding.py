@@ -382,6 +382,18 @@ def build_transform(
     """
     config = config or GeometryConfig()
 
+    # The geometry and the polytope must be the same polytope. `T` is built from the geometry's
+    # basis and scaling, but the *bounds* the chain is held to — and the `CoordinatePrecompute` it
+    # steps with — come from `reduced`. Mixing them produces a **hybrid**: it records the geometry's
+    # `polytope_key`, so it sails through `run_ladder`'s binding check, and then walks bounds and a
+    # mass balance belonging to another model entirely. (Codex, M6 review round 6.)
+    if geometry.polytope_key != reduced.content_key():
+        raise RoundingError(
+            "the geometry was not built from this polytope. The transform would carry the "
+            "geometry's directions and the polytope's bounds — a hybrid of two models that "
+            "passes every downstream key check, because the key it reports is the geometry's."
+        )
+
     if geometry.is_singleton:
         return _singleton_transform(geometry, reduced)
 

@@ -28,6 +28,29 @@ class ConfigError(ValueError):
     """The configuration is malformed, has unknown keys, or violates a stated constraint."""
 
 
+DEFAULT_NEAR_ZERO_THRESHOLDS: tuple[float, ...] = (1e-9, 1e-6, 1e-3, 1e-1, 1.0)
+"""Declared thresholds for *analysing* near-zero fluxes (spec §3.7). Never used by the chain.
+
+Five, spanning nine orders of magnitude, because **one absolute threshold cannot serve two models**
+and the conventional FBA values cannot serve this one. Measured on the example model at β = 0: the
+median ``|v_r|`` over the 199 reactions that can move is **53**, the 1st percentile is 0.18, and the
+maximum is 1000. So ``1e-9``, ``1e-6`` and ``1e-3`` — the thresholds an FBA paper would reach for —
+each report a count of **exactly zero**, at every β. They are not wrong; they are five to eleven
+orders of magnitude below the fluxes they are asked about, and the honest reading of a zero count is
+"your threshold cannot see this model", not "this cell is dense".
+
+At ``1e-1`` the count is 0.2 reactions and at ``1.0`` it is 7.3, so the ladder brackets the scale
+rather than sitting under it. The tight three are kept because they are the ones the literature uses
+and a run must be able to report them.
+
+⚠️ **An absolute threshold is not comparable across strains** — it is the λ problem again (§1.7): two
+organisms whose fluxes differ by 100× would get activity counts that say more about their units than
+their biology. The cross-model activity tables are **M8**'s (§1.1), and this decision is recorded
+there as open: they will need a *relative* scale (a quantile of the movable flux, most likely), and
+this constant is what a per-model run reports in the meantime.
+"""
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     """Which model to sample, and what counts as its biomass reaction."""
@@ -58,6 +81,19 @@ class ObjectiveConfig:
     """
     exclude_biomass_from_penalty: bool = True
     """Penalizing biomass would have the objective fight its own reward term."""
+    near_zero_thresholds: tuple[float, ...] = DEFAULT_NEAR_ZERO_THRESHOLDS
+    """Declared thresholds for counting near-zero fluxes in the objective traces (spec §3.7, §24.2).
+
+    **Analysis only.** At finite β the sampled law is continuous, so *no* reaction is exactly zero
+    unless the polytope itself pins it there — the L1 term promotes small fluxes, it does not
+    produce zeros. Reporting "how many reactions are off" therefore requires a threshold to be
+    *declared* — and several of them, because the answer depends on which one you pick, and a single
+    number would hide that dependence.
+
+    The sampler never sees these. Snapping a chain's flux to zero would alter the stationary
+    distribution and can break mass balance (spec §3.7, CLAUDE.md) — the thresholds apply to the
+    stored samples, downstream, and to nothing else.
+    """
     reweighting_enabled: bool = False
     """M7. Weights are frozen before sampling begins — never updated from chain state."""
     reweighting_epsilon: float = 1e-6
@@ -69,6 +105,16 @@ class ObjectiveConfig:
         if self.l1_penalty_scaled < 0.0:
             raise ConfigError(
                 f"objective.l1_penalty_scaled must be >= 0, got {self.l1_penalty_scaled}"
+            )
+        if not self.near_zero_thresholds:
+            raise ConfigError("objective.near_zero_thresholds must list at least one threshold")
+        if any(
+            not isfinite(threshold) or threshold <= 0.0
+            for threshold in self.near_zero_thresholds
+        ):
+            raise ConfigError(
+                "objective.near_zero_thresholds must all be finite and > 0, got "
+                f"{list(self.near_zero_thresholds)}"
             )
         if not 0.0 < self.weight_clip_min < self.weight_clip_max:
             raise ConfigError(
@@ -224,12 +270,39 @@ class SamplerConfig:
     """
 
     betas: tuple[float, ...] = (0.0,)
+    """The ladder. ``maxent_sampler.SUGGESTED_BETA_LADDER`` holds spec §22.1's starting suggestion —
+    which that section is careful *not* to call scientifically correct, and neither is this default.
+    """
     n_chains: int = 4
     n_samples: int = 1000
     burn_in: int = 1000
     thin: int = 1
     refresh_interval: int = 1000
     """Sweeps between exact rebuilds of ``v`` from ``y`` — bounds incremental drift (§1.3)."""
+    energy_scale: str | float = "warmup_range"
+    """``s_J`` (spec §3.6). ``"warmup_range"`` sets it from the observed objective range of the
+    support points; a positive number declares it, putting ``β`` in reciprocal raw-objective units.
+
+    Only ``warmup_range`` makes ``β`` comparable across strains — see
+    `sparse_objective.EnergyScale`.
+    """
+    energy_scale_quantile: float = 0.05
+    """``q`` in ``s_J = J* − Q_q(J(W))`` (spec §22.2). Ignored when `energy_scale` is a number."""
+    energy_scale_fallback: float | None = None
+    """The scale to use if the warm-up range turns out unresolvable — ``None`` means **raise**.
+
+    Spec §22.2 says to fall back on a "**declared** positive scale", and a library default is not a
+    declaration. A degenerate range means every support vertex has essentially the LP-optimal
+    objective, i.e. ``J`` barely varies over this polytope and *no* β would mean much. Silently
+    substituting ``s_J = 1`` there would rescale every rung of this strain's ladder — so its β = 2
+    would name a different selection pressure from every other strain's β = 2, which is the one
+    thing
+    ``s_J`` exists to prevent (BUILD_PLAN §1.1's cross-model comparison). It would arrive as a
+    warning in a log nobody reads.
+
+    So the default is to stop. A caller who wants to proceed anyway says so here, and the manifest
+    records `energy_scale_fell_back = true` next to the number that was used.
+    """
     seed: int = 0
     """Base entropy. Each chain's stream is keyed on ``(model_id, stage, β_index, chain_index)``
     on top of it (`provenance.stream_seed`) — never on a position in a `spawn()` sequence."""
@@ -250,6 +323,33 @@ class SamplerConfig:
         ):
             if value < minimum:
                 raise ConfigError(f"sampler.{name} must be >= {minimum}, got {value}")
+
+        if isinstance(self.energy_scale, str):
+            if self.energy_scale != "warmup_range":
+                raise ConfigError(
+                    "sampler.energy_scale must be \"warmup_range\" or a positive number, got "
+                    f"{self.energy_scale!r}"
+                )
+        elif not isfinite(self.energy_scale) or self.energy_scale <= 0.0:
+            # A zero or negative s_J does not merely rescale β — it flips or annihilates the tilt,
+            # so the chain would sample exp(−βJ/|s_J|) or a flat law while reporting the β it was
+            # asked for. `line_distribution` refuses it too; refusing it *here* means the run
+            # dies at config time rather than several thousand sweeps in.
+            raise ConfigError(
+                f"sampler.energy_scale must be finite and > 0, got {self.energy_scale}"
+            )
+        if not 0.0 < self.energy_scale_quantile < 1.0:
+            raise ConfigError(
+                "sampler.energy_scale_quantile must lie strictly in (0, 1), got "
+                f"{self.energy_scale_quantile}"
+            )
+        if self.energy_scale_fallback is not None and (
+            not isfinite(self.energy_scale_fallback) or self.energy_scale_fallback <= 0.0
+        ):
+            raise ConfigError(
+                "sampler.energy_scale_fallback must be finite and > 0 when set (or None to refuse "
+                f"a degenerate warm-up range), got {self.energy_scale_fallback}"
+            )
 
 
 @dataclass(frozen=True)

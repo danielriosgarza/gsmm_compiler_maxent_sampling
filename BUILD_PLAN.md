@@ -277,6 +277,74 @@ reactions divides a noise value by itself and reports a relative residual of exa
 blocked rows are exactly `0.0`), so the transform's own check is **unfloored**. Correct where the
 noise exists, absent where it cannot be.
 
+### 1.6.2 (M6) The tilt adds inputs, not machinery — and three places the spec invites an error
+
+M6 changes **nothing** in the transition kernel. At `β > 0` the only difference is that `sample_line`
+builds M2's piecewise-exponential conditional instead of drawing uniformly, and every word of the
+§1.6.1 invariance argument survives verbatim — it never mentioned the conditional's *shape*, only
+that it is **exact**. What M6 supplies is four inputs: the objective in **reduced** coordinates, the
+energy scale `s_J`, the β-ladder, and the traces.
+
+Three deviations from the spec, each one a place a subtle error is invited:
+
+1. **`J` is *not* maintained incrementally**, though spec §1.3 step 4 suggests it. Nothing needs it:
+   `build_piecewise_j` derives every slope from `v` and the direction on the spot, and the conditional
+   depends on `J` only through peak-relative *heights*. A running `J` would be a second cache to
+   drift, reconcile and mistrust — M5 paid that price for `v`, which is genuinely needed for the
+   chord, and there is no reason to pay it twice for a quantity that is only *reported*. Traces are
+   computed **exactly**, after the fact, from the stored fluxes.
+2. **The objective is lowered onto the reduced polytope, and is therefore `J` up to an additive
+   constant.** That is not a defect: the constant (the fixed reactions' `μ` and L1 cost) provably
+   cancels from `p(t)`, and it must never reach a probability — the same fact that keeps `J*` out of
+   the kernel. `ReducedObjective` carries the constant *separately*, for reporting, because a trace of
+   `J` has to be comparable with the LP's `J*` and a probability must not be.
+3. **Mean-`J` monotonicity is a theorem, not a hope.** With `κ = β/s_J` and `π_κ ∝ e^{κJ}`,
+   `dE_κ[J]/dκ = Var_κ(J) ≥ 0`. So a *violation* is never physics — it is noise or a bug, and the
+   check exists to tell those apart. It measures each drop in **Monte-Carlo standard errors**
+   computed from the ESS **of the `J` trace itself** (not the coordinates, not `√N`), and reports
+   **R̂(`J`)** alongside, because an ESS says nothing about retained initialization.
+
+### 1.6.3 (M6) Three artifacts meet in the sampler, and they must be *bound*, not merely passed
+
+*(M6 collab finding — the nastiest failure mode in the package so far.)*
+
+`run_ladder` takes the L1 polytope, the L3 transform and the L2 objective. They are all just arrays,
+and until M6 nothing checked that they had ever been computed against each other.
+
+Hand it an objective lowered from a **different model of the same size** and the chain tilts by the
+reactions *that* objective names — while `ReducedObjective.evaluate_many` reports *those same
+reactions* as `μ` and `C`. So the trace of `J` **rises monotonically with β, exactly as the theorem
+demands**, because the chain really is maximizing the thing the trace is measuring. Every diagnostic
+agrees and every one describes the wrong model. Feasibility, mass balance, the chords and R̂ cannot
+help: **none of them knows which reaction `J` is supposed to be about.**
+
+Not hypothetical once M8 exists: L2 and L3 are *separate cache artifacts*, and a stale key is all it
+takes to load two that never met. So `ReducedPolytope.content_key()` is the public L1 key, every
+downstream artifact carries it, and `run_ladder` refuses a mismatched pair. One string comparison.
+
+### 1.6.4 (M6) `s_J` is a *range*, so its floor must be a **resolution** and not a magnitude
+
+*(M6 collab finding.)* `s_J = J* − Q₀.₀₅(J(W))` (spec §22.2) is invariant when a constant is added to
+`J`. Any floor it is compared against must be too — or a constant that provably cannot change a
+probability changes `s_J`, and with it **every rung of the ladder**.
+
+The original floor was `1e-9·max(1, |J*|)`. Shift `J` by `+1e16` and a healthy `s_J = 12` fell below a
+floor of `1e7` and was silently replaced by 1.0, making every positive rung **12× hotter**. This is
+M2's delta 7 (*the absolute magnitude of `J` must never reach a probability*) wearing the calibration
+layer's hat, and it is the fourth time in this project a **magnitude** has been used where a
+**resolution** was needed.
+
+The floor is now the float64 **resolution of the subtraction itself** — 64 ULPs of `max(|J*|, |Q|)` —
+which asks the question that has an answer: *does this difference have any significant digits left?*
+It cuts both ways, which is how you know it is right: at `|J*| = 1e5` the old floor was `1e-4` and the
+new one `9.3e-10`, so a real range of `1e-6` is now **kept**.
+
+**And a degenerate range now raises.** Spec §22.2 says to fall back on a "**declared** positive
+scale", and *a library default is not a declaration*. A silent `s_J = 1` would make this strain's
+`β = 2` name a different selection pressure from every other strain's — the exact failure `s_J` exists
+to prevent — as a log line nobody reads. `sampler.energy_scale_fallback` defaults to `None`, and
+`None` means stop.
+
 ### 1.7 λ is scale-referenced: `λ = λ̃ · λ*`  *(M3 finding; decision SETTLED)*
 
 `J(v) = μ(v) − λ·C(v)` compares a **biomass flux** with a **sum of hundreds of absolute fluxes**.
@@ -357,6 +425,35 @@ reweighting loop, or is re-resolved from the final frozen weights. Either is def
 | **M8** | Cache, restart, batch orchestration & production | 4-layer cache, per-chain markers + writer-claim locking, atomic rename + fsync, **batch runner over a models manifest**, one global process pool over `(model, β, chain)`, worker thread-limit env, per-model run dirs + **cross-model aggregation**, manifests + diagnostics + `COMPLETE` | kill-and-resume resumes only missing `(model,chain)` units; partial batch yields valid cross-model tables; concurrent-writer safe; corrupted-artifact rejected; same-env deterministic traces; full batch runs on ≥2 strains with documented resources |
 | **M9** | Performance & GSMM hardening | benchmark suite (parse→CSC→passModel→first LP→warm-start LPs→sparse LP→geometry→rounding→β=0 sps→β>0 sps→breakpoint dist→output), worker-count sweep {1,2,4,7,14} across the batch, allocation + sort profiling, `reduced` storage-mode validation | benchmark report produced; all performance assertions hold (no per-step HiGHS, no scipy, no Python loop in chord, no element-wise highspy extraction, no full reconstruction every step) |
 | **M10** | Deferred extensions | pilot rerounding + **pilot-based s_J** (split bootstrap-geometry → β=0 pilot → {final T, s_J} DAG); β→performance calibration; parallel tempering; slice line kernel; downstream mode-feature extraction | each behind its own tests; none alters the validated v1 target distribution |
+
+### 2.1 What M6 ships, and what it does not  *(M6 finding; SETTLED — and it constrains M10)*
+
+**M6 ships a validated maximum-entropy *engine* with an *uncalibrated* β scale.** The distinction is
+not pedantry; it was forced by measurement.
+
+The tilt is exact — analytic targets: a truncated exponential, an asymmetric truncated Laplace with an
+interior bend, a coupled `(1−x)·e^{γx}` marginal, and a reduced-coordinate quadrature cross-check that
+evaluates `J` straight from its definition. Its **magnitude** is pinned against the linear-response
+identity `dE_β[J]/dβ = Var_β(J)/s_J`. Mean-`J` rises monotonically along the ladder, with R̂(`J`)
+confirming the rise is not retained initialization. All of that is about the *sampler*, and it holds.
+
+But on the example model `s_J = 31.3` while the β=0 chain explores only `sd(J) = 2.6`. The warm-up
+range is taken over the geometry's **support-LP vertices** — extreme points, where the L1 cost is
+enormous and `J` runs down to −28 — while the chain lives in the interior at `J ≈ −12`. So `s_J` is
+calibrated to a range **12× wider** than the one actually sampled, the linear response is only 0.22
+per unit β, and **the top rung of spec §22.1's own ladder (β = 16) closes just 13% of the gap to
+`J*`.** The ladder is a fine-tuning knob, not a switch.
+
+That is a fact about the **calibration**, not the sampler, and the remedy is one spec §22.2 already
+gestures at when it says to set `s_J` from "support **or pilot** points": **M10's pilot-based `s_J`**,
+which reads the scale off a β=0 pilot chain's own `J` spread (2.6) and would tilt ~12× harder for the
+identical ladder. It changes *what β names*, not the target at any given β — the distribution M6
+validates is untouched either way.
+
+**Consequently: M10's pilot-based `s_J` is a prerequisite for presenting the β-ladder as spanning
+neutral-to-strongly-selected regimes.** Until it lands, a run reports what it measured and does not
+pretend the β axis means more than itself. Recorded here rather than left as folklore, because it is
+exactly the kind of claim a downstream paper would make by accident.
 
 ---
 

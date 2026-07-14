@@ -86,7 +86,7 @@ def simpson(y: np.ndarray, dx: float) -> float:
 
 
 def objective(
-    biomass_index: int = 0,
+    biomass_index: int | None = 0,
     penalized: list[int] | None = None,
     weights: list[float] | None = None,
     lam: float = 1.0,
@@ -891,3 +891,88 @@ def test_an_underflowing_inverse_temperature_is_loud_not_silent() -> None:
 
     with pytest.raises(InvalidObjectiveError, match="overflow"):
         log_segment_masses(piecewise, beta=1e308, energy_scale=1e-100)
+
+
+# --- M6: a FIXED biomass reaction, which the reduced polytope cannot hold as a variable -----------
+
+
+class TestBiomassCanBeFixed:
+    """``biomass_index = None`` — biomass is an ``l == u`` reaction, so ``μ(v)`` is a constant.
+
+    This is not a hypothetical shape. `ReducedPolytope.biomass_index` has always been ``int |
+    None``,
+    and `sparse_objective.biomass_maximum` has always had a branch for it: a model whose biomass is
+    pinned (a chemostat at a fixed growth rate, say) eliminates it along with every other fixed
+    reaction, and the sampler's ``v`` then has no biomass component at all.
+
+    The dangerous non-fix is to point `biomass_index` at *some* in-range reaction instead. ``J``
+    would then reward that reaction's flux as though it were growth, the chain would tilt toward it,
+    and nothing — not feasibility, not mass balance, not R̂ — would say a word. So the ``None`` is
+    load-bearing, and these tests pin what it must mean: a constant contributes **zero slope**, and
+    a
+    constant cancels out of ``p(t)``.
+    """
+
+    def test_a_fixed_biomass_contributes_no_slope(self) -> None:
+        v = np.array([0.5, 0.25])
+        direction = np.array([1.0, 1.0])
+        chord = Chord(t_lo=-0.2, t_hi=0.2)
+
+        fixed = objective(biomass_index=None, penalized=[1], weights=[1.0], lam=0.5)
+        free = objective(biomass_index=0, penalized=[1], weights=[1.0], lam=0.5)
+
+        # The only difference is d_b = direction[0] = 1.0, so every slope must differ by exactly 1.
+        assert np.allclose(
+            build_piecewise_j(v, direction, chord, free).slopes
+            - build_piecewise_j(v, direction, chord, fixed).slopes,
+            1.0,
+        )
+
+    def test_it_evaluates_to_the_penalty_alone(self) -> None:
+        v = np.array([7.0, -2.0])
+        fixed = objective(biomass_index=None, penalized=[1], weights=[3.0], lam=0.5)
+
+        assert fixed.evaluate(v) == pytest.approx(-0.5 * 3.0 * 2.0)
+        assert fixed.biomass_slope(np.array([1.0, 1.0])) == 0.0
+
+    def test_evaluate_on_line_agrees_with_the_piecewise_reconstruction(self) -> None:
+        """The same reference the M2 gate uses, re-run on the branch M2 never had.
+
+        `evaluate_on_line` computes ``J`` straight from the definition; `build_piecewise_j` rebuilds
+        it from breakpoints and slope drops. A ``None`` handled in one and forgotten in the other
+        would show up here as a constant offset — which is exactly the failure that *cannot* be seen
+        in the sampled distribution, because a constant cancels.
+        """
+        v = np.array([1.0, -0.4, 0.3])
+        direction = np.array([0.5, 1.0, -1.0])
+        chord = Chord(t_lo=-0.9, t_hi=0.9)
+        fixed = objective(biomass_index=None, penalized=[1, 2], weights=[1.0, 2.0], lam=0.75)
+
+        piecewise = build_piecewise_j(v, direction, chord, fixed)
+        grid = np.linspace(chord.t_lo, chord.t_hi, 401)
+
+        assert np.allclose(piecewise.evaluate(grid), fixed.evaluate_on_line(v, direction, grid))
+
+    def test_the_draw_is_a_valid_sample_of_the_penalty_only_target(self) -> None:
+        """``J = −λw|v₁|`` on the line: a symmetric Laplace about the crossing, sampled exactly."""
+        v = np.array([9.0, 0.0])
+        direction = np.array([0.0, 1.0])
+        chord = Chord(t_lo=-1.0, t_hi=1.0)
+        fixed = objective(biomass_index=None, penalized=[1], weights=[1.0], lam=1.0)
+        rng = np.random.default_rng(11)
+
+        draws = np.array(
+            [sample_line(v, direction, chord, fixed, 2.0, 1.0, rng) for _ in range(20000)]
+        )
+
+        assert np.all(np.abs(draws) <= 1.0)
+        assert abs(float(draws.mean())) < 0.02  # symmetric about the bend
+        # E|t| for density ∝ e^{−2|t|} on [−1,1]: ∫₀¹ t e^{−2t}dt / ∫₀¹ e^{−2t}dt
+        grid = np.linspace(0.0, 1.0, 200001)
+        density = np.exp(-2.0 * grid)
+        expected = float(np.trapezoid(grid * density, grid) / np.trapezoid(density, grid))
+        assert abs(float(np.abs(draws).mean()) - expected) < 0.01
+
+    def test_a_negative_biomass_index_is_still_refused(self) -> None:
+        with pytest.raises(InvalidObjectiveError, match="nonnegative or None"):
+            objective(biomass_index=-1)

@@ -1663,15 +1663,10 @@ def _min_chord_at_center(
 
 
 def _polytope_key(reduced: ReducedPolytope) -> str:
-    """The L1 key: which polytope this geometry is the geometry *of*."""
-    return content_key(
-        reaction_ids=list(reduced.reaction_ids),
-        free_indices=reduced.free_indices,
-        fixed_values=reduced.fixed_values,
-        lower_bounds=reduced.lower_bounds,
-        upper_bounds=reduced.upper_bounds,
-        starts=reduced.stoichiometry.starts,
-        indices=reduced.stoichiometry.indices,
-        values=reduced.stoichiometry.values,
-        rhs=reduced.rhs,
-    )
+    """The L1 key: which polytope this geometry is the geometry *of*.
+
+    Now `ReducedPolytope.content_key`, so the geometry, the rounded transform and M6's lowered
+    objective all name the polytope the **same way** — which is the only thing that lets a consumer
+    check that two artifacts were computed against each other rather than merely assume it.
+    """
+    return reduced.content_key()

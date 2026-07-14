@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 
-from gsmm_compiler.flux_polytope import ReducedPolytope
+from gsmm_compiler.flux_polytope import FluxPolytope, ReducedPolytope
 
 if TYPE_CHECKING:
     from gsmm_compiler.model_input import CanonicalModel
@@ -96,6 +96,7 @@ def dense_polytope(
         lower_bounds=np.asarray(lower, dtype=np.float64),
         upper_bounds=np.asarray(upper, dtype=np.float64),
         biomass_index=biomass_index,
+        biomass_full_index=biomass_index,  # nothing is fixed here, so the two coincide
         n_full=n_reactions,
     )
 
@@ -158,4 +159,142 @@ def singleton_polytope() -> ReducedPolytope:
         stoichiometry=[[1.0, 1.0], [1.0, -1.0]],
         lower=[-1.0, -1.0],
         upper=[1.0, 1.0],
+    )
+
+
+# ---- synthetic polytopes whose TILTED law is known on paper (M6) --------------------------------
+#
+# The M5 fixtures above give a ReducedPolytope directly. M6's need a `FluxPolytope` as well, because
+# the objective is built by `SparseFluxObjective.from_polytope` and lowered by `lower_objective` —
+# the production path — so the statistical gate exercises the real lowering rather than an
+# `L1Objective` the test wrote out by hand with the indices it expected.
+
+
+def dense_flux_polytope(
+    stoichiometry: list[list[float]],
+    lower: list[float],
+    upper: list[float],
+    biomass_index: int = 0,
+) -> FluxPolytope:
+    """A `FluxPolytope` from a dense ``S``. ``.reduce()`` yields the matching `ReducedPolytope`."""
+    from gsmm_compiler.native_csc import NativeCSC
+
+    matrix = np.asarray(stoichiometry, dtype=np.float64)
+    n_metabolites, n_reactions = matrix.shape
+
+    return FluxPolytope(
+        reaction_ids=tuple(f"r{i}" for i in range(n_reactions)),
+        metabolite_ids=tuple(f"m{i}" for i in range(n_metabolites)),
+        stoichiometry=NativeCSC.from_dense(matrix),
+        lower_bounds=np.asarray(lower, dtype=np.float64),
+        upper_bounds=np.asarray(upper, dtype=np.float64),
+        biomass_index=biomass_index,
+    )
+
+
+@pytest.fixture(scope="session")
+def line_flux_polytope() -> FluxPolytope:
+    """``{v0 = v1 ∈ [0, 1]}`` — ``d = 1``, biomass ``v0``, and ``J = v0`` when ``λ = 0``.
+
+    The simplest possible tilted target: ``π ∝ e^{κ v0}`` on ``[0, 1]``, a **truncated exponential**
+    whose CDF is ``expm1(κx)/expm1(κ)``. No breakpoints at all, so it isolates the exponential draw
+    from the piecewise machinery — and it stays exact at ``κ = 1000``, which is the large-β stress.
+
+    It is also the one polytope where ``λ = 0`` diverges the two penalty sets: ``C(v) = |v1|`` is a
+    real number the run must report, while *nothing* bends ``J``. A `ReducedObjective` that reused
+    one index set for both would report ``C = 0`` here.
+    """
+    return dense_flux_polytope(
+        stoichiometry=[[1.0, -1.0]],
+        lower=[0.0, 0.0],
+        upper=[1.0, 1.0],
+        biomass_index=0,
+    )
+
+
+@pytest.fixture(scope="session")
+def laplace_box_flux_polytope() -> FluxPolytope:
+    """``{v2 = v0 + v1, v0,v1 ∈ [−1,1]}`` — ``d = 2``, biomass ``v2``, penalty on ``v0, v1``.
+
+    ``J(v) = v2 − λ(|v0| + |v1|) = Σᵢ (vᵢ − λ|vᵢ|)`` over ``i ∈ {0, 1}``, so at ``λ = 2`` the target
+    factorizes into two identical **asymmetric truncated Laplaces** on ``[−1, 1]``:
+
+        g(x) = 3x   for x < 0        (slope +3κ)
+        g(x) = −x   for x ≥ 0        (slope −1κ)
+
+    This is the M6 gate's load-bearing target. Its bend at ``x = 0`` is *strictly interior* to
+    almost
+    every chord, so unlike the simplex it genuinely exercises `build_piecewise_j`, the segment
+    log-masses and the categorical choice — and the two slopes differ by 3×, so a sampler that
+    symmetrized the Laplace, or picked the segment by the wrong mass, lands somewhere the KS test
+    can
+    see. Being a product law, it also makes the two coordinates' independence checkable.
+    """
+    return dense_flux_polytope(
+        stoichiometry=[[1.0, 1.0, -1.0]],
+        lower=[-1.0, -1.0, -2.0],
+        upper=[1.0, 1.0, 2.0],
+        biomass_index=2,
+    )
+
+
+@pytest.fixture(scope="session")
+def simplex_flux_polytope() -> FluxPolytope:
+    """The 2-simplex again, now with biomass ``v0`` and a penalty on the rest — a *coupled* tilt.
+
+    A `FluxPolytope`'s mass balance is homogeneous (``S·v = 0``), so the simplex's ``x + y + z = 1``
+    can only arrive the way a real model would produce it: through a **fixed reaction**. ``SRC`` is
+    pinned at 1.0 and the row reads ``x + y + z − SRC = 0``, which `reduce()` turns into the affine
+    ``rhs = 1`` over the three free reactions. That is not a workaround — it is the case worth
+    testing, because ``SRC`` is *penalized* too, so ``cost_offset = 1.0`` and `lower_objective` has
+    a
+    nonzero fixed-flux constant to get right. Every fixed reaction of the example model sits at
+    zero,
+    so it is the only polytope here that can catch dropping it.
+
+    On the simplex every flux is nonnegative and biomass is out of the penalty set, so
+    ``C = (y + z) + |SRC| = (1 − x) + 1 = 2 − x`` and
+
+        J = x − λ(2 − x) = (1 + λ)x − 2λ,
+
+    a linear function of ``x`` alone (the constant cancels out of the target, as constants must).
+    The
+    tilted law is therefore ``uniform-on-simplex × e^{γx}`` with ``γ = κ(1 + λ)``, whose marginal is
+
+        f(x) ∝ (1 − x)·e^{γx}        on [0, 1],
+
+    the ``(1 − x)`` coming from the *geometry* (the length of the slice ``{y + z = 1 − x}``) and the
+    exponential from the *objective*. Neither factor alone is the answer, so this catches a sampler
+    that gets the tilt right on a shape it gets wrong, or the reverse — M5's simplex test and M6's
+    line test each check only one of those halves.
+    """
+    return dense_flux_polytope(
+        stoichiometry=[[1.0, 1.0, 1.0, -1.0]],
+        lower=[0.0, 0.0, 0.0, 1.0],
+        upper=[1.0, 1.0, 1.0, 1.0],
+        biomass_index=0,
+    )
+
+
+@pytest.fixture(scope="session")
+def pinned_nonzero_polytope() -> ReducedPolytope:
+    """``{v0 = 1 (0 ≤ v0 ≤ 2), v1 = v2 ∈ [0, 1]}`` — an **immovable reaction at a nonzero value**.
+
+    The minimal counterexample to "immovable ⇒ near zero", and it took Codex two rounds to find it.
+
+    ``v0``'s bounds are ``[0, 2]``, so `FluxPolytope.reduce` leaves it *free* — but the mass balance
+    row ``v0 = 1`` pins it anyway. FVA therefore gives it zero range, M4 projects it out of the
+    basis (BUILD_PLAN §1.4.1), its row of ``T`` is exactly zero, and `movable_reactions` correctly
+    reports that the chain cannot move it.
+
+    **But its flux is 1.0, not 0.** Every one of the example model's 61 immovable reactions happens
+    to sit at ~1e-13, so *cannot move* and *is at zero* are indistinguishable there, and an M6
+    assertion quietly conflated them. Here they come apart.
+    """
+    return dense_polytope(
+        stoichiometry=[[1.0, 0.0, 0.0], [0.0, 1.0, -1.0]],
+        lower=[0.0, 0.0, 0.0],
+        upper=[2.0, 1.0, 1.0],
+        rhs=[1.0, 0.0],
+        biomass_index=1,
     )

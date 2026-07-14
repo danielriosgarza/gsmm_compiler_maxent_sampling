@@ -293,6 +293,57 @@ def _ess_one(chains: NDArray[np.float64], n_chains: int, n_draws: int) -> float:
     return total / tau
 
 
+def posterior_variance(draws: NDArray[np.float64]) -> NDArray[np.float64]:
+    """``var⁺`` per parameter — the **overdispersed** variance estimate R̂ and ESS are both built on.
+
+    ``var⁺ = ((n−1)·W + B)/n``: the within-chain variance, plus the between-chain variance the
+    chains' *disagreement* contributes. It is not the same thing as the variance of the pooled
+    draws,
+    and the difference is exactly the point. Two chains stuck at ``−a`` and ``+a`` have a pooled
+    variance of ``a²`` and a ``var⁺`` of ``2a²`` — so ``var⁺`` says the spread is larger *because
+    the
+    chains do not agree*, which is the honest thing for an estimate that has not converged to say.
+    """
+    array = _as_draws(draws)
+    _, n_draws, n_parameters = array.shape
+
+    within = array.var(axis=1, ddof=1).mean(axis=0)  # (p,)
+    between = (
+        n_draws * array.mean(axis=1).var(axis=0, ddof=1)
+        if array.shape[0] > 1
+        else np.zeros(n_parameters, dtype=VALUE_DTYPE)
+    )
+    return np.asarray(((n_draws - 1) * within + between) / n_draws, dtype=VALUE_DTYPE)
+
+
+def mcse(draws: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Monte-Carlo standard error of the mean, per parameter: ``√(var⁺ / ESS)``.
+
+    **The variance must be the one ESS was built from.** `effective_sample_size` estimates the
+    autocorrelation against ``var⁺`` precisely so that a chain trapped in one mode cannot claim a
+    large ESS; pairing that ESS with the *pooled sample* variance in the numerator throws half of
+    that conservatism away. Measured on two chains trapped at ``±a``: ``var⁺ = 2a²`` while the
+    pooled
+    variance is ``a²``, so the naive ``sd/√ESS`` under-reports the error by ``√2`` — and it does so
+    **exactly when the chains disagree**, which is when an honest error bar matters most.
+
+    ESS = 0 (every chain constant, but at different values) means the sample carries no information
+    about the target's spread; the error is then reported as infinite rather than as zero, because
+    "we cannot tell" is not the same claim as "we know it exactly".
+    """
+    array = _as_draws(draws)
+    variance = posterior_variance(array)
+    ess = effective_sample_size(array)
+
+    error = np.full(variance.size, np.inf, dtype=VALUE_DTYPE)
+    exact = variance <= 0.0  # a genuinely constant statistic: the mean has no MC error at all
+    error[exact] = 0.0
+
+    usable = ~exact & (ess > 0.0)
+    error[usable] = np.sqrt(variance[usable] / ess[usable])
+    return error
+
+
 def convergence_report(draws: NDArray[np.float64]) -> ConvergenceReport:
     """Split-R̂ and ESS for every parameter of a ``(n_chains, n_draws, n_parameters)`` array."""
     array = _as_draws(draws)

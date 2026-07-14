@@ -265,3 +265,148 @@ class TestEdgeCases:
         )
         assert polytope.n_fixed == 0
         assert polytope.n_free == 1
+
+
+class TestTheContentKeyIsAnIdentity:
+    """**Codex, M6 review round 2.** The key must distinguish everything a consumer binds against.
+
+    `sparse_objective.ReducedObjective` carries this key so `maxent_sampler.run_ladder` can refuse
+    an objective lowered from a *different* polytope — a pairing that would tilt the chain by the
+    wrong reactions while its own traces confirmed them, every other diagnostic green.
+
+    The first version of the key omitted `biomass_index`, because the *geometry* does not use it
+    (the affine hull is the same whichever reaction you call biomass) and it looked like a spurious
+    dependency. But that let two polytopes differing **only** in their biomass reaction share a key,
+    so an objective lowered from one would happily bind to the other — the exact failure the key
+    exists to prevent, walked back in through the front door.
+    """
+
+    def test_two_polytopes_differing_only_in_biomass_have_different_keys(self) -> None:
+        matrix = NativeCSC.from_dense(np.array([[1.0, -1.0, 0.0]], dtype=np.float64))
+        common = dict(
+            reaction_ids=("a", "b", "c"),
+            metabolite_ids=("m",),
+            stoichiometry=matrix,
+            lower_bounds=np.zeros(3),
+            upper_bounds=np.ones(3),
+        )
+
+        first = FluxPolytope(**common, biomass_index=0).reduce()  # type: ignore[arg-type]
+        second = FluxPolytope(**common, biomass_index=2).reduce()  # type: ignore[arg-type]
+
+        assert first.biomass_index != second.biomass_index
+        assert first.content_key() != second.content_key()
+
+    def test_the_key_is_stable_for_an_identical_polytope(self) -> None:
+        matrix = NativeCSC.from_dense(np.array([[1.0, -1.0]], dtype=np.float64))
+        build = lambda: FluxPolytope(  # noqa: E731
+            reaction_ids=("a", "b"),
+            metabolite_ids=("m",),
+            stoichiometry=matrix,
+            lower_bounds=np.zeros(2),
+            upper_bounds=np.ones(2),
+            biomass_index=0,
+        ).reduce()
+
+        assert build().content_key() == build().content_key()
+
+    def test_it_moves_with_the_bounds_and_with_the_rhs(self) -> None:
+        matrix = NativeCSC.from_dense(np.array([[1.0, -1.0]], dtype=np.float64))
+        common = dict(
+            reaction_ids=("a", "b"),
+            metabolite_ids=("m",),
+            stoichiometry=matrix,
+            lower_bounds=np.zeros(2),
+            biomass_index=0,
+        )
+
+        base = FluxPolytope(**common, upper_bounds=np.ones(2)).reduce()  # type: ignore[arg-type]
+        wider = FluxPolytope(  # type: ignore[arg-type]
+            **common, upper_bounds=np.array([2.0, 1.0])
+        ).reduce()
+
+        assert base.content_key() != wider.content_key()
+
+    def test_two_polytopes_whose_biomass_is_a_DIFFERENT_FIXED_reaction_differ_too(self) -> None:
+        """**Codex, M6 review round 3** — the hole left by round 2's fix.
+
+        Round 2 put the biomass into the key, but as its **reduced coordinate**. Every model whose
+        biomass is a *fixed* reaction reduces to ``biomass_index = None``, so hashing the
+        coordinate collapses all of them onto one value: two models differing only in *which* fixed
+        reaction is biomass still shared a key, still cross-bound, and — because ``μ`` on such a
+        model **is** that fixed constant — would have reported one strain's growth as the other's.
+
+        Here ``a`` is pinned at 1.0 and ``b`` at 2.0. Choose either as biomass and the reduced
+        polytopes are byte-identical *except* for an identity that the reduced IR was not even
+        storing. So the fix was not to the key but to the IR: `biomass_full_index` is now carried,
+        and hashed.
+        """
+        matrix = NativeCSC.from_dense(np.array([[1.0, 1.0, -1.0]], dtype=np.float64))
+        common = dict(
+            reaction_ids=("a", "b", "c"),
+            metabolite_ids=("m",),
+            stoichiometry=matrix,
+            lower_bounds=np.array([1.0, 2.0, 0.0]),
+            upper_bounds=np.array([1.0, 2.0, 10.0]),  # a and b are FIXED; c is free
+        )
+
+        biomass_a = FluxPolytope(**common, biomass_index=0).reduce()  # type: ignore[arg-type]
+        biomass_b = FluxPolytope(**common, biomass_index=1).reduce()  # type: ignore[arg-type]
+
+        # Both lose their reduced biomass coordinate — which is exactly why the coordinate is not
+        # an identity and cannot be the thing that is hashed.
+        assert biomass_a.biomass_index is None
+        assert biomass_b.biomass_index is None
+        assert biomass_a.biomass_is_fixed and biomass_b.biomass_is_fixed
+
+        assert biomass_a.biomass_id == "a"
+        assert biomass_b.biomass_id == "b"
+        assert biomass_a.content_key() != biomass_b.content_key()
+
+    def test_the_two_biomass_fields_must_agree(self) -> None:
+        """A reduced index that does not point at `biomass_full_index` is a ``J`` that rewards the
+        wrong reaction, and nothing downstream could see it."""
+        matrix = NativeCSC.from_dense(np.array([[1.0, -1.0]], dtype=np.float64))
+        fields = dict(
+            reaction_ids=("a", "b"),
+            metabolite_ids=("m",),
+            free_indices=np.array([0, 1], dtype=np.intp),
+            fixed_indices=np.empty(0, dtype=np.intp),
+            fixed_values=np.empty(0),
+            stoichiometry=matrix,
+            rhs=np.zeros(1),
+            lower_bounds=np.zeros(2),
+            upper_bounds=np.ones(2),
+            n_full=2,
+        )
+
+        with pytest.raises(InvalidPolytopeError, match="points at full reaction"):
+            ReducedPolytope(**fields, biomass_index=1, biomass_full_index=0)  # type: ignore[arg-type]
+
+    def test_unsorted_free_indices_are_refused(self) -> None:
+        """**Codex, M6 review round 4.** The biomass consistency check used `searchsorted`, which
+        silently agrees with itself on an unsorted array: ``free_indices = [1, 0]`` with
+        ``biomass_index = 0`` and ``biomass_full_index = 0`` validated cleanly, although reduced
+        coordinate 0 actually addresses full reaction **1**.
+
+        The check now *dereferences* (``free_indices[biomass_index] == biomass_full_index``), right
+        whatever the order — and sortedness is enforced besides, because `reduce`'s own
+        `searchsorted` and half this class assume it.
+        """
+        matrix = NativeCSC.from_dense(np.array([[1.0, -1.0]], dtype=np.float64))
+
+        with pytest.raises(InvalidPolytopeError, match="strictly increasing"):
+            ReducedPolytope(
+                reaction_ids=("a", "b"),
+                metabolite_ids=("m",),
+                free_indices=np.array([1, 0], dtype=np.intp),  # unsorted
+                fixed_indices=np.empty(0, dtype=np.intp),
+                fixed_values=np.empty(0),
+                stoichiometry=matrix,
+                rhs=np.zeros(1),
+                lower_bounds=np.zeros(2),
+                upper_bounds=np.ones(2),
+                biomass_index=0,
+                biomass_full_index=0,
+                n_full=2,
+            )

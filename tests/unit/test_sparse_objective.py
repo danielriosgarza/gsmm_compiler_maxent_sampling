@@ -18,6 +18,8 @@ which makes ``λ* = 1/2`` the exact point where growth stops being worth its cos
 
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import pytest
 
@@ -26,15 +28,22 @@ from gsmm_compiler.flux_polytope import FluxPolytope, ReducedPolytope
 from gsmm_compiler.highs_backend import LPNotOptimalError
 from gsmm_compiler.native_csc import NativeCSC
 from gsmm_compiler.sparse_objective import (
+    DegenerateEnergyScaleError,
+    IncompatibleObjectiveError,
     LPCheckError,
     ObjectiveError,
+    ReducedObjective,
     SparseFluxObjective,
     SparseObjectiveLP,
     _assemble_expanded_csc,
     biomass_maximum,
     build_flux_lp,
     build_sparse_objective_lp,
+    check_compatible,
+    choose_energy_scale,
     critical_l1_penalty,
+    energy_scale_resolution,
+    lower_objective,
     origin_is_feasible,
     resolve_objective,
     solve_sparse_objective,
@@ -675,3 +684,448 @@ class TestLPChecks:
         assert optimum.v_full.shape == (len(REACTIONS),)
         assert optimum.z.shape == (lp.n_z_columns,)
         assert lp.program.n_cols == reduced.n_free + lp.n_z_columns
+
+
+# --- M6: lowering J onto the reduced polytope, and the energy scale s_J ---------------------------
+
+
+class TestLoweringOntoTheReducedPolytope:
+    """`lower_objective` — and the one equation the whole of M6 rests on.
+
+    The sampler tilts by an objective indexed in **reduced** coordinates, while ``J*``, the LP
+    optimum it is compared against, was computed from a **full** 5-reaction flux vector. Those two
+    agree only if the re-indexing, the fixed-flux constant and the penalty set are all right. It is
+    the same shape of check as M3's gate ("solver objective == directly recomputed J") and it is
+    load-bearing for the same reason: nothing downstream can see it fail.
+    """
+
+    def test_the_reduced_objective_equals_the_full_objective_on_the_lift(
+        self, fork: FluxPolytope, reduced: ReducedPolytope
+    ) -> None:
+        objective = _objective(fork, 0.25)
+        lowered = lower_objective(reduced, objective)
+        rng = np.random.default_rng(0)
+
+        for _ in range(200):
+            v_reduced = rng.uniform(0.0, 10.0, size=reduced.n_free)
+            expected = objective.evaluate(reduced.to_full(v_reduced))
+            actual = lowered.evaluate(v_reduced)
+
+            assert actual.mu == pytest.approx(expected.mu)
+            assert actual.cost == pytest.approx(expected.cost)
+            assert actual.total == pytest.approx(expected.total)
+
+    def test_the_fixed_reactions_l1_cost_is_carried_as_a_constant(self) -> None:
+        """``EX_A`` pinned at 2.0 still costs L1 — it is just no longer a variable.
+
+        The whole point of `cost_offset`. Drop it and every reported ``J`` sits ``λ·2`` away from
+        the
+        ``J*`` it is compared with, so ``s_J = J* − Q(J(W))`` is wrong by nothing (both shift) while
+        ``(J − J*)/s_J`` is wrong by ``λ·2/s_J`` on every single sample.
+        """
+        polytope = _fork(lower=[2.0, 0.0, 0.0, 0.0, 0.0], upper=[2.0, 10.0, 10.0, 10.0, 10.0])
+        reduced = polytope.reduce()
+        objective = _objective(polytope, 0.25)
+
+        lowered = lower_objective(reduced, objective)
+
+        assert reduced.n_free == 4  # EX_A is gone
+        assert lowered.cost_offset == pytest.approx(2.0)  # w = 1, |c| = 2
+        assert lowered.mu_offset == 0.0  # biomass is still free
+        assert lowered.j_offset == pytest.approx(-0.25 * 2.0)
+
+        v_reduced = np.array([3.0, 1.0, 1.0, 3.0])
+        assert lowered.evaluate(v_reduced).total == pytest.approx(
+            objective.evaluate(reduced.to_full(v_reduced)).total
+        )
+
+    def test_a_fixed_biomass_becomes_a_constant_and_the_line_objective_says_so(self) -> None:
+        """``BIO`` pinned at 3.0: the reduced polytope has no biomass column, so ``μ`` is a
+        constant.
+
+        `L1Objective.biomass_index` must then be ``None``. Pointing it at any other reduced index
+        would tilt the chain by that reaction's flux while every check in the package stayed green.
+        """
+        polytope = _fork(lower=[0.0, 0.0, 0.0, 0.0, 3.0], upper=[10.0, 10.0, 10.0, 10.0, 3.0])
+        reduced = polytope.reduce()
+        objective = _objective(polytope, 0.25)
+
+        lowered = lower_objective(reduced, objective)
+
+        assert reduced.biomass_index is None
+        assert lowered.line.biomass_index is None
+        assert lowered.mu_offset == pytest.approx(3.0)
+        assert lowered.cost_offset == 0.0  # BIO is excluded from the penalty set
+
+        v_reduced = np.array([4.0, 2.0, 1.0, 1.0])
+        assert lowered.evaluate(v_reduced).mu == pytest.approx(3.0)
+        assert lowered.evaluate(v_reduced).total == pytest.approx(
+            objective.evaluate(reduced.to_full(v_reduced)).total
+        )
+
+    def test_lambda_zero_bends_nothing_but_still_reports_the_cost(
+        self, fork: FluxPolytope, reduced: ReducedPolytope
+    ) -> None:
+        """The one case where the two penalty sets genuinely differ, and why there are two.
+
+        At ``λ = 0`` no reaction has ``λw > 0``, so nothing bends ``J`` and `line` has no
+        breakpoints — correct, and worth the saved work. But ``C(v) = Σ w_r|v_r|`` is defined
+        *without* λ and is still a number every run must report. One shared index set would report
+        ``C = 0`` for a cell that is plainly metabolizing.
+        """
+        lowered = lower_objective(reduced, _objective(fork, 0.0))
+
+        assert lowered.line.penalized_indices.size == 0  # nothing bends J
+        assert np.count_nonzero(lowered.weights) == 4  # …but four reactions still cost
+
+        v_reduced = np.full(reduced.n_free, 2.0)
+        value = lowered.evaluate(v_reduced)
+
+        assert value.cost == pytest.approx(8.0)  # 4 penalized reactions × |2|
+        assert value.total == pytest.approx(value.mu)  # J = μ − 0·C
+
+    def test_the_bending_set_is_exactly_the_lps_z_columns(
+        self, fork: FluxPolytope, reduced: ReducedPolytope
+    ) -> None:
+        """The LP that finds ``J*`` and the kernel that samples around it must agree on which
+        reactions are penalized. They do so by construction — both test ``λw > 0`` — and this pins
+        it, because a divergence would put the chain's peak somewhere other than at ``v*``."""
+        objective = _objective(fork, 0.25)
+
+        lowered = lower_objective(reduced, objective)
+        lp = build_sparse_objective_lp(reduced, objective)
+
+        assert lowered.line.penalized_indices.tolist() == lp.z_columns.tolist()
+
+    def test_a_batch_evaluates_to_the_same_thing_as_one_at_a_time(
+        self, fork: FluxPolytope, reduced: ReducedPolytope
+    ) -> None:
+        lowered = lower_objective(reduced, _objective(fork, 0.25))
+        rng = np.random.default_rng(3)
+        batch = rng.uniform(-5.0, 10.0, size=(64, reduced.n_free))
+
+        mu, cost, total = lowered.evaluate_many(batch)
+
+        for i, v in enumerate(batch):
+            one = lowered.evaluate(v)
+            assert mu[i] == pytest.approx(one.mu)
+            assert cost[i] == pytest.approx(one.cost)
+            assert total[i] == pytest.approx(one.total)
+
+    def test_a_wrongly_shaped_batch_is_refused(
+        self, fork: FluxPolytope, reduced: ReducedPolytope
+    ) -> None:
+        lowered = lower_objective(reduced, _objective(fork, 0.25))
+
+        with pytest.raises(ObjectiveError, match="expected"):
+            lowered.evaluate_many(np.zeros((4, reduced.n_free + 1)))
+
+
+class TestTheEnergyScale:
+    """``s_J`` (spec §3.6, §22.2) — the units ``β`` is measured in."""
+
+    @pytest.fixture
+    def lowered(self, fork: FluxPolytope, reduced: ReducedPolytope) -> ReducedObjective:
+        return lower_objective(reduced, _objective(fork, 0.25))
+
+    @pytest.fixture
+    def warmup(self, reduced: ReducedPolytope) -> np.ndarray:
+        rng = np.random.default_rng(7)
+        return rng.uniform(0.0, 10.0, size=(40, reduced.n_free))
+
+    def test_warmup_range_is_j_star_minus_the_low_quantile(
+        self, lowered: ReducedObjective, warmup: np.ndarray
+    ) -> None:
+        """``s_J = J* − Q_{0.05}(J(W))``, recomputed here from the definition."""
+        j_star = 5.0
+        _, _, j_warmup = lowered.evaluate_many(warmup)
+        expected = j_star - float(np.quantile(j_warmup, 0.05))
+
+        scale = choose_energy_scale(lowered, warmup, j_star=j_star, mode="warmup_range")
+
+        assert scale.value == pytest.approx(expected)
+        assert scale.mode == "warmup_range"
+        assert scale.quantile == 0.05
+        assert scale.n_warmup_points == 40
+        assert not scale.fell_back
+
+    def test_it_measures_the_FULL_j_not_the_reduced_one(self, warmup: np.ndarray) -> None:
+        """The trap `choose_energy_scale` takes a `ReducedObjective` to avoid.
+
+        ``J*`` comes from the LP over the *full* flux vector. If ``J(W)`` were computed from
+        `L1Objective` — which is ``J`` minus the fixed reactions' contribution — then ``s_J`` would
+        absorb that constant and silently rescale **every β on the ladder**. Here the constant is
+        ``λ·|c| = 0.25 × 2 = 0.5``, so the wrong ``s_J`` is off by exactly that.
+        """
+        polytope = _fork(lower=[2.0, 0.0, 0.0, 0.0, 0.0], upper=[2.0, 10.0, 10.0, 10.0, 10.0])
+        reduced = polytope.reduce()
+        lowered = lower_objective(reduced, _objective(polytope, 0.25))
+        points = warmup[:, : reduced.n_free]
+
+        scale = choose_energy_scale(lowered, points, j_star=5.0, mode="warmup_range")
+
+        full = np.array([lowered.evaluate(v).total for v in points])
+        reduced_only = np.array([lowered.line.evaluate(v) for v in points])
+        assert scale.value == pytest.approx(5.0 - float(np.quantile(full, 0.05)))
+
+        wrong = 5.0 - float(np.quantile(reduced_only, 0.05))
+        assert abs(wrong - scale.value) == pytest.approx(0.5), "the constant must actually bite"
+
+    def test_a_declared_scale_is_used_verbatim(
+        self, lowered: ReducedObjective, warmup: np.ndarray
+    ) -> None:
+        scale = choose_energy_scale(lowered, warmup, j_star=5.0, mode=2.5)
+
+        assert scale.value == 2.5
+        assert scale.mode == "declared"
+        assert scale.quantile is None
+        assert not scale.fell_back
+
+    def test_a_degenerate_range_raises_unless_a_fallback_is_declared(
+        self, lowered: ReducedObjective, reduced: ReducedPolytope
+    ) -> None:
+        """Spec §22.2 says to fall back to a "**declared** positive scale" — and a library default
+        is
+        not a declaration.
+
+        A degenerate range means every support vertex has essentially the LP-optimal ``J``: the
+        objective barely varies over this polytope and *no* β means much. Silently substituting
+        ``s_J = 1`` there rescales every rung of this strain's ladder, so its β = 2 names a
+        different
+        selection pressure from every other strain's β = 2 — the one thing ``s_J`` exists to
+        prevent.
+        And it would arrive as a warning in a log nobody reads. So: no declaration, no run.
+        """
+        point = np.zeros((3, reduced.n_free))
+        j_at_point = lowered.evaluate(point[0]).total
+
+        with pytest.raises(DegenerateEnergyScaleError, match="not resolvable"):
+            choose_energy_scale(lowered, point, j_star=j_at_point, mode="warmup_range")
+
+        declared = choose_energy_scale(
+            lowered, point, j_star=j_at_point, mode="warmup_range", fallback=2.5
+        )
+        assert declared.fell_back
+        assert declared.value == 2.5
+        assert declared.warmup_quantile_j == pytest.approx(j_at_point)
+
+    def test_the_floor_is_a_cancellation_floor_not_a_magnitude_floor(
+        self, lowered: ReducedObjective, reduced: ReducedPolytope
+    ) -> None:
+        """**Codex, M6 review.** The range ``J* − Q(J(W))`` is invariant when a constant is added to
+        ``J``. The floor it is compared against must therefore not depend on ``|J*|`` in a way that
+        is *not* — or a constant that provably cannot change any probability changes ``s_J``, and
+        every β on the ladder with it.
+
+        The old floor was ``1e-9·max(1, |J*|)``. Shift ``J`` by a large enough constant and a
+        perfectly healthy ``s_J`` drops below it and is replaced by 1.0, rescaling every rung of the
+        ladder. It is the M2 bug (*the absolute magnitude of J must never reach a probability*)
+        wearing the calibration layer's hat.
+
+        The floor is now the float64 **resolution of the subtraction itself** — ~64 ULPs of the
+        operands — so it refuses only a range the arithmetic genuinely cannot support.
+
+        **The shift has to be big enough that the OLD code actually fails.** The first version of
+        this test used ``+1e6``, where the old floor is ``1e-3`` — a thousand times *below* a range
+        of 12 — so the buggy code would have sailed straight through it. Codex caught that in round
+        2, and it is the M4 lesson again: *a regression test the bug passes is not a regression
+        test*. The assertion on `old_floor` below pins the premise, so this one cannot quietly go
+        toothless a second time.
+        """
+        shift = 1e12
+        warmup = np.array([[0.0] * reduced.n_free, [6.0] + [0.0] * (reduced.n_free - 1)])
+        j_star = 12.0
+
+        plain = choose_energy_scale(lowered, warmup, j_star=j_star, mode="warmup_range")
+
+        shifted_objective = dataclasses.replace(lowered, mu_offset=shift)
+        shifted = choose_energy_scale(
+            shifted_objective, warmup, j_star=j_star + shift, mode="warmup_range"
+        )
+
+        # The premise. Without it this test proves nothing, which is exactly how it was wrong.
+        old_floor = 1e-9 * max(1.0, abs(j_star + shift))
+        assert plain.value <= old_floor, (
+            f"the old magnitude floor ({old_floor:.3e}) does not reject a range of "
+            f"{plain.value:.4g}, so this test cannot fail on the bug it exists to catch"
+        )
+
+        assert not plain.fell_back
+        assert not shifted.fell_back, "an additive constant must not trigger the fallback"
+
+        # The range survives the shift **to within the resolution of the arithmetic that computed
+        # it** — which is the strongest claim available, and exactly the one the ULP floor licenses.
+        # At a 1e12 baseline one ULP is 1.2e-4, so the shifted range differs in its low bits (by
+        # 4.9e-5 here); demanding bit-equality would be demanding precision float64 does not have.
+        # What must hold is that the discrepancy stays *below the floor*, or the floor would be
+        # rejecting ranges it cannot itself resolve.
+        assert shifted.resolution is not None
+        assert abs(shifted.value - plain.value) < shifted.resolution
+        assert shifted.resolution < plain.value  # …and the range clears that floor comfortably
+
+    def test_the_resolution_it_used_is_recorded(
+        self, lowered: ReducedObjective, warmup: np.ndarray
+    ) -> None:
+        """A range one ULP above the floor is technically resolvable and scientifically worthless.
+        Only this number says which one you got."""
+        scale = choose_energy_scale(lowered, warmup, j_star=5.0, mode="warmup_range")
+
+        assert scale.resolution is not None
+        assert scale.resolution == pytest.approx(
+            energy_scale_resolution(5.0, scale.warmup_quantile_j)
+        )
+        assert scale.value > scale.resolution
+
+    def test_a_nonpositive_or_unknown_mode_is_refused(
+        self, lowered: ReducedObjective, warmup: np.ndarray
+    ) -> None:
+        for bad in (0.0, -1.0, float("inf")):
+            with pytest.raises(ObjectiveError, match="finite and > 0"):
+                choose_energy_scale(lowered, warmup, j_star=5.0, mode=bad)
+
+        with pytest.raises(ObjectiveError, match="warmup_range"):
+            choose_energy_scale(lowered, warmup, j_star=5.0, mode="pilot_range")
+
+        with pytest.raises(ObjectiveError, match="quantile"):
+            choose_energy_scale(lowered, warmup, j_star=5.0, quantile=1.0)
+
+    def test_the_manifest_records_everything_needed_to_reproduce_beta(
+        self, lowered: ReducedObjective, warmup: np.ndarray
+    ) -> None:
+        """Spec §3.6: no hidden scaling. ``β`` is meaningless without the ``s_J`` it was divided by,
+        so the manifest must carry both, and the ``J*`` they are relative to."""
+        manifest = choose_energy_scale(
+            lowered, warmup, j_star=5.0, mode="warmup_range"
+        ).manifest()
+
+        assert set(manifest) >= {
+            "energy_scale",
+            "energy_scale_mode",
+            "j_star",
+            "energy_scale_quantile",
+            "warmup_quantile_j",
+            "energy_scale_fell_back",
+        }
+
+
+class TestTheObjectiveAndThePolytopeMustDescribeTheSameModel:
+    """**Codex, M6 review rounds 3–4.** `check_compatible` — one guard, called at every join.
+
+    An objective is a biomass index, a mask and a weight vector; a polytope is a matrix and some
+    bounds. Neither knows the other exists, and an index is just an integer — so a mismatched pair
+    is not *detectable* downstream, it is **computable**, and it computes confidently.
+
+    The bugs were found one join at a time (M6 review rounds 3 and 4) until it became clear that
+    patching joins is not the same as having an invariant. Now there is one function, and every
+    public entry point calls it.
+    """
+
+    def _model(self, ids: tuple[str, ...], biomass: int) -> FluxPolytope:
+        matrix = NativeCSC.from_dense(np.array([[1.0, 1.0, -1.0]], dtype=np.float64))
+        return FluxPolytope(
+            reaction_ids=ids,
+            metabolite_ids=("m",),
+            stoichiometry=matrix,
+            lower_bounds=np.array([1.0, 2.0, 0.0]),
+            upper_bounds=np.array([1.0, 2.0, 10.0]),  # a and b are FIXED, c is free
+            biomass_index=biomass,
+        )
+
+    def test_a_different_reaction_set_is_refused_even_when_the_indices_agree(self) -> None:
+        """Comparing biomass *indices* is not enough. Objective biomass ``"a"`` at index 0 and
+        polytope biomass ``"x"`` at index 0 agree numerically while naming different reactions of
+        different models — and every index in the objective then addresses the wrong reaction."""
+        objective = _objective(self._model(("a", "b", "c"), 0), 0.0)
+        other = self._model(("x", "b", "c"), 0).reduce()
+
+        with pytest.raises(IncompatibleObjectiveError, match="same reaction set"):
+            lower_objective(other, objective)
+
+    def test_a_different_biomass_reaction_is_refused(self) -> None:
+        """The round-3 case. ``a`` is fixed at 1.0 and ``b`` at 2.0, so ``μ`` **is** that constant —
+        the entire objective is wrong, and every LP check still passes."""
+        objective = _objective(self._model(("a", "b", "c"), 0), 0.0)  # biomass = a
+        polytope = self._model(("a", "b", "c"), 1).reduce()  # biomass = b
+
+        with pytest.raises(IncompatibleObjectiveError, match="biomass"):
+            lower_objective(polytope, objective)
+
+    @pytest.mark.parametrize("entry_point", ["lp", "solve", "biomass_max", "critical"])
+    def test_every_public_join_refuses_it_not_merely_the_one_that_was_patched(
+        self, entry_point: str
+    ) -> None:
+        """The point of a shared guard. Each of these was, at some stage of the review, the *only*
+        one that checked — and each of the others let the same mismatch straight through."""
+        objective = _objective(self._model(("a", "b", "c"), 0), 0.25)  # biomass = a
+        polytope = self._model(("a", "b", "c"), 1).reduce()  # biomass = b
+
+        call = {
+            "lp": lambda: build_sparse_objective_lp(polytope, objective),
+            "solve": lambda: solve_sparse_objective(polytope, objective),
+            "biomass_max": lambda: biomass_maximum(polytope, objective),
+            "critical": lambda: critical_l1_penalty(polytope, objective),
+        }[entry_point]
+
+        with pytest.raises(IncompatibleObjectiveError):
+            call()
+
+    def test_the_matching_pair_is_accepted(self) -> None:
+        polytope = self._model(("a", "b", "c"), 0)
+        reduced = polytope.reduce()
+        objective = _objective(polytope, 0.25)
+
+        check_compatible(reduced, objective)  # does not raise
+        lowered = lower_objective(reduced, objective)
+
+        assert lowered.binds_to(reduced)
+        assert reduced.biomass_id == "a"
+        assert lowered.mu_offset == pytest.approx(1.0)  # biomass 'a' is fixed at 1.0
+
+    def test_a_reduced_polytope_from_a_different_canonical_one_is_refused(self) -> None:
+        """**Codex, M6 review round 5.** `resolve_objective` reads `origin_is_feasible` off the
+        **canonical** bounds and computes ``λ*`` off the **reduced** LP. Hand it a mismatched pair
+        and BUILD_PLAN §1.7's sparsity-cliff guard *inverts*.
+
+        Both polytopes here have the same reactions and the same biomass — they differ only in
+        ``EX``'s lower bound. The forced-flux one (``l = 1``) has **no** feasible origin, so the
+        guard permits ``λ̃ ≥ 1``. The relaxed one (``l = 0``) does, so the guard must **refuse** it.
+        Pass the forced canonical with the relaxed reduction and ``λ̃ = 1.5`` sails through, as
+        ``origin_is_feasible = False`` — while the polytope that actually gets sampled collapses to
+        ``v* = 0``, the exact failure §1.7 exists to prevent (and which no LP check can see: optimal
+        status, zero residual, ``z = |v|`` exactly).
+        """
+        matrix = NativeCSC.from_dense(np.array([[1.0, -1.0]], dtype=np.float64))
+        common = dict(
+            reaction_ids=("EX", "BIO"),
+            metabolite_ids=("m",),
+            stoichiometry=matrix,
+            upper_bounds=np.array([10.0, 10.0]),
+            biomass_index=1,
+        )
+        forced = FluxPolytope(**common, lower_bounds=np.array([1.0, 0.0]))  # type: ignore[arg-type]
+        relaxed = FluxPolytope(**common, lower_bounds=np.array([0.0, 0.0]))  # type: ignore[arg-type]
+
+        assert not origin_is_feasible(forced)  # a forced flux: the cell cannot shut down
+        assert origin_is_feasible(relaxed)  # …but this one can, so the cliff is real
+
+        with pytest.raises(IncompatibleObjectiveError, match="not the reduction"):
+            resolve_objective(forced, relaxed.reduce(), ObjectiveConfig(l1_penalty_scaled=1.5))
+
+    def test_omitting_the_reduced_polytope_derives_it_safely(self) -> None:
+        """The safe default: derive it, so the two cannot disagree — §1.7's guard still bites."""
+        matrix = NativeCSC.from_dense(np.array([[1.0, -1.0]], dtype=np.float64))
+        relaxed = FluxPolytope(
+            reaction_ids=("EX", "BIO"),
+            metabolite_ids=("m",),
+            stoichiometry=matrix,
+            lower_bounds=np.zeros(2),
+            upper_bounds=np.array([10.0, 10.0]),
+            biomass_index=1,
+        )
+
+        resolved = resolve_objective(relaxed, config=ObjectiveConfig(l1_penalty_scaled=0.5))
+        assert resolved.scale.origin_is_feasible
+        assert resolved.scale.l1_penalty < resolved.scale.critical_l1_penalty
+
+        with pytest.raises(ObjectiveError, match="sparsity cliff"):
+            resolve_objective(relaxed, config=ObjectiveConfig(l1_penalty_scaled=1.5))

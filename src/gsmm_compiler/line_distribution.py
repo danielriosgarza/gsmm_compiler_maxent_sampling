@@ -143,9 +143,26 @@ class L1Objective:
     sampling starts and never depend on chain state (BUILD_PLAN M7): were they to move mid-chain,
     the conditionals below would target a different distribution on every step, and stationarity
     would be lost.
+
+    **Lowered onto the reduced polytope, this is ``J`` up to an additive constant, and that is not a
+    defect.** M6 hands the sampler one of these indexed in *reduced* coordinates, where the
+    eliminated ``l == u`` reactions have vanished — but their L1 cost has not, and neither has a
+    fixed biomass flux. What is missing is a **constant**, and a constant cancels out of ``p(t)``
+    exactly: it is the same fact that lets ``J*`` be absent from this module entirely (delta 4).
+    `sparse_objective.ReducedObjective` carries the constant alongside, for reporting — the one
+    place it belongs, since a trace of ``J`` must be comparable with ``J*`` and a probability must
+    not be.
     """
 
-    biomass_index: int
+    biomass_index: int | None
+    """``None`` means biomass is one of the **fixed** reactions and so is not a variable here.
+
+    Not "there is no biomass". ``μ(v)`` is then a genuine constant on the reduced polytope — it
+    contributes ``0`` to every slope and cancels out of every probability — and its value is kept by
+    `sparse_objective.ReducedObjective.mu_offset`. Getting this wrong by pointing `biomass_index` at
+    some other reaction would add *that reaction's* flux to ``J`` as a varying quantity, which no
+    feasibility check anywhere could see.
+    """
     penalized_indices: NDArray[np.intp]
     weights: NDArray[np.float64]
     lam: float
@@ -167,15 +184,25 @@ class L1Objective:
             raise InvalidObjectiveError("weights must be nonnegative (J must stay concave)")
         if not np.isfinite(self.lam) or self.lam < 0.0:
             raise InvalidObjectiveError(f"lam must be finite and nonnegative, got {self.lam}")
-        if self.biomass_index < 0:
+        if self.biomass_index is not None and self.biomass_index < 0:
             raise InvalidObjectiveError(
-                f"biomass_index must be nonnegative, got {self.biomass_index}"
+                f"biomass_index must be nonnegative or None, got {self.biomass_index}"
             )
 
     def evaluate(self, v: NDArray[np.float64]) -> float:
-        """``J(v)`` at a single flux vector."""
+        """``J(v)`` at one flux vector, up to the additive constant (see the class docstring)."""
         penalty = float(np.sum(self.weights * np.abs(v[self.penalized_indices])))
-        return float(v[self.biomass_index]) - self.lam * penalty
+        biomass = 0.0 if self.biomass_index is None else float(v[self.biomass_index])
+        return biomass - self.lam * penalty
+
+    def biomass_slope(self, direction: NDArray[np.float64]) -> float:
+        """``d_b`` — what biomass contributes to the slope of ``J`` along ``direction``.
+
+        Exactly ``0.0`` when biomass is fixed: a constant has no slope.
+        """
+        if self.biomass_index is None:
+            return 0.0
+        return float(direction[self.biomass_index])
 
     def evaluate_on_line(
         self,
@@ -189,7 +216,10 @@ class L1Objective:
         slope drops instead, and the M2 gate holds the two against each other on a dense grid.
         """
         steps = np.asarray(t, dtype=np.float64)
-        biomass = v[self.biomass_index] + steps * direction[self.biomass_index]
+        if self.biomass_index is None:
+            biomass = np.zeros_like(steps)
+        else:
+            biomass = v[self.biomass_index] + steps * direction[self.biomass_index]
         if self.penalized_indices.size == 0:
             return np.asarray(biomass, dtype=np.float64)
 
@@ -325,7 +355,7 @@ def build_piecewise_j(
     # w_r·sgn(v_r)·0 = 0, so they are absent from the sum entirely.
     opens_after_cut = tau <= t_lo
     sign_on_first = np.where(opens_after_cut, np.sign(d_crossing), -np.sign(d_crossing))
-    first_slope = float(direction[objective.biomass_index]) - objective.lam * float(
+    first_slope = objective.biomass_slope(direction) - objective.lam * float(
         np.sum(w_crossing * sign_on_first * d_crossing)
     )
 

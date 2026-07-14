@@ -185,6 +185,7 @@ class FluxPolytope:
             lower_bounds=self.lower_bounds[free].copy(),
             upper_bounds=self.upper_bounds[free].copy(),
             biomass_index=biomass_reduced,
+            biomass_full_index=self.biomass_index,
             n_full=self.n_reactions,
         )
 
@@ -210,7 +211,27 @@ class ReducedPolytope:
     lower_bounds: NDArray[np.float64]
     upper_bounds: NDArray[np.float64]
     biomass_index: int | None
-    """Biomass in *reduced* coordinates, or ``None`` if biomass itself is fixed."""
+    """Biomass in *reduced* coordinates, or ``None`` if biomass itself is fixed.
+
+    A **coordinate**, not an identity. When biomass is fixed it has no reduced coordinate, and this
+    is ``None`` for *every* such model — so it cannot say **which** reaction the biomass is.
+    `biomass_full_index` can, and must.
+    """
+    biomass_full_index: int
+    """Which reaction *is* the biomass, in full-model coordinates. **Always** known.
+
+    Added because `biomass_index` alone cannot answer the question, and the difference is not
+    academic. Two models identical except that biomass is a *different fixed reaction* both reduce
+    to ``biomass_index = None``; they used to hash to the same `content_key`, so an objective
+    lowered from one would **bind** to the other — and their `mu_offset` (the fixed biomass's own
+    flux, which is the entire ``μ`` on such a model) differs. The chain would report one strain's
+    growth as another's, with every diagnostic green. (Codex, M6 review round 3.)
+
+    The reduced IR simply *did not retain* this: `reduce()` computed the reduced coordinate and
+    threw the identity away. `sparse_objective.biomass_maximum` had to borrow the index from the
+    *objective* to work around it — the polytope trusting the objective to tell it what it is,
+    exactly backwards.
+    """
     n_full: int
 
     def __post_init__(self) -> None:
@@ -242,6 +263,73 @@ class ReducedPolytope:
             raise InvalidPolytopeError(
                 f"reduced biomass_index {self.biomass_index} outside [0, {n_free})"
             )
+        if not 0 <= self.biomass_full_index < self.n_full:
+            raise InvalidPolytopeError(
+                f"biomass_full_index {self.biomass_full_index} outside [0, {self.n_full})"
+            )
+
+        # `free_indices` must be **strictly increasing**. `reduce()` builds it with
+        # `np.flatnonzero`, which always is — but a `ReducedPolytope` can be constructed directly,
+        # and half this class (plus `reduce`'s own `searchsorted`) silently assumes the order. Left
+        # unchecked, an unsorted `free_indices` makes the reduced coordinates mean something other
+        # than what every consumer believes they mean. (Codex, M6 review round 4.)
+        if np.any(np.diff(self.free_indices) <= 0):
+            raise InvalidPolytopeError(
+                "free_indices must be strictly increasing: the reduced coordinates are positions "
+                "in this array, and every consumer assumes they are in full-model order"
+            )
+
+        # The two biomass fields describe the same reaction in two coordinate systems, and they must
+        # agree — a reduced index that does not point at `biomass_full_index` is a `J` that rewards
+        # the wrong reaction, and nothing downstream can see it.
+        #
+        # Checked by **dereferencing**, not by `searchsorted`: the direct lookup is correct whatever
+        # the order of `free_indices`, where a `searchsorted` silently agrees with itself on an
+        # unsorted array. (Codex, M6 review round 4 — this was the actual bypass.)
+        is_free = bool(np.isin(self.biomass_full_index, self.free_indices))
+        if is_free:
+            if self.biomass_index is None:
+                raise InvalidPolytopeError(
+                    f"biomass (full index {self.biomass_full_index}) is a free reaction, so it "
+                    "has a reduced coordinate; biomass_index must not be None"
+                )
+            if int(self.free_indices[self.biomass_index]) != self.biomass_full_index:
+                raise InvalidPolytopeError(
+                    f"biomass_index {self.biomass_index} points at full reaction "
+                    f"{int(self.free_indices[self.biomass_index])}, but biomass_full_index says "
+                    f"the biomass is {self.biomass_full_index}"
+                )
+        elif self.biomass_index is not None:
+            raise InvalidPolytopeError(
+                f"biomass (full index {self.biomass_full_index}) is a FIXED reaction, so it has no "
+                f"reduced coordinate; biomass_index must be None, not {self.biomass_index}"
+            )
+
+    def is_reduction_of(self, polytope: FluxPolytope) -> bool:
+        """Was this produced by ``polytope.reduce()``? Compared by **content**, not identity.
+
+        Any function taking *both* a canonical and a reduced polytope is implicitly claiming they
+        are the same model, and until M6 nothing checked it. `sparse_objective.resolve_objective` is
+        the case that bit: it reads `origin_is_feasible` off the **canonical** bounds and computes
+        ``λ*`` off the **reduced** LP. Hand it a forced-flux canonical polytope together with the
+        reduction of an origin-feasible variant sharing the same reaction IDs, and BUILD_PLAN §1.7's
+        guard inverts — ``λ̃ ≥ 1`` is accepted and *recorded as safe*, because the origin is
+        infeasible in the polytope that was asked, while the polytope actually sampled collapses to
+        the origin. (Codex, M6 review round 5.)
+
+        Costs one `reduce()` — an O(nnz) pass, once per model, at config-resolution time. Nowhere
+        near a loop, and the alternative is a run that documents the opposite of what it did.
+        """
+        return self.content_key() == polytope.reduce().content_key()
+
+    @property
+    def biomass_id(self) -> str:
+        """Which reaction the biomass *is* — answerable whether or not it was eliminated."""
+        return self.reaction_ids[self.biomass_full_index]
+
+    @property
+    def biomass_is_fixed(self) -> bool:
+        return self.biomass_index is None
 
     @property
     def n_free(self) -> int:
@@ -262,6 +350,56 @@ class ReducedPolytope:
         c = np.zeros(self.n_full, dtype=VALUE_DTYPE)
         c[self.fixed_indices] = self.fixed_values
         return c
+
+    def content_key(self) -> str:
+        """The **L1 key** (BUILD_PLAN §1.1): *which polytope this is*, by content, not by identity.
+
+        Everything downstream — the geometry, the rounded transform, the lowered objective, the
+        energy scale — is computed *against a particular reduced polytope*, and is meaningless
+        against any other. This key is what lets each of them say so, and what lets the consumer
+        check rather than assume.
+
+        The check is not academic. A `sparse_objective.ReducedObjective` is just indices and
+        weights: hand the sampler one lowered from a *different* model of the same size and the
+        chain tilts by the wrong reactions, the traces report those same wrong reactions as
+        biomass — so the diagnostics **confirm the wrong target** — and feasibility, mass balance,
+        chords and R̂ all stay green, because nothing else in this package knows which reaction
+        ``J`` is supposed to be about. M8's cache makes exactly that pairing possible: two
+        artifacts,
+        loaded from disk, that were never computed against each other.
+        """
+        return content_key(
+            impl_version=IR_SCHEMA_VERSION,
+            reaction_ids=list(self.reaction_ids),
+            free_indices=self.free_indices,
+            fixed_values=self.fixed_values,
+            lower_bounds=self.lower_bounds,
+            upper_bounds=self.upper_bounds,
+            starts=self.stoichiometry.starts,
+            indices=self.stoichiometry.indices,
+            values=self.stoichiometry.values,
+            rhs=self.rhs,
+            # **The biomass reaction's IDENTITY, not its reduced coordinate.** Both halves of that
+            # sentence were learned the hard way, in successive rounds of the M6 review.
+            #
+            # It has to be *in* the key at all (round 2): the geometry does not depend on which
+            # reaction is biomass — the affine hull is the same either way — so it looks like a
+            # spurious dependency and was omitted for exactly that reason. But the key's whole *job*
+            # is to stop a `ReducedObjective` binding to a polytope it was not lowered from, and
+            # two polytopes differing **only** in their biomass reaction would otherwise share a
+            # key: the objective binds, tilts the wrong reaction, and its traces confirm it.
+            #
+            # And it has to be the **full-model** index (round 3): every model whose biomass is a
+            # *fixed* reaction reduces to `biomass_index = None`, so hashing the reduced coordinate
+            # collapses all of them onto the same value. Two such models — biomass fixed at 1.0 in
+            # one, at 2.0 in the other — then share a key, cross-bind, and report one strain's
+            # growth as the other's. `μ` *is* that constant on such a model, so the whole objective
+            # is wrong.
+            #
+            # The cost is a false cache miss in M8 whenever `biomass_id` changes and the geometry
+            # could in principle have been reused. A false miss recomputes; a false *hit* corrupts.
+            biomass_full_index=self.biomass_full_index,
+        )
 
     def reconstruction_matrix(self) -> NativeCSC:
         """``R``, the ``n_full × n_free`` scatter matrix, materialized.

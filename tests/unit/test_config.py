@@ -8,7 +8,15 @@ from pathlib import Path
 import pytest
 
 from gsmm_compiler import config as config_module
-from gsmm_compiler.config import Config, ConfigError, apply_overrides, from_dict, load
+from gsmm_compiler.config import (
+    Config,
+    ConfigError,
+    ObjectiveConfig,
+    SamplerConfig,
+    apply_overrides,
+    from_dict,
+    load,
+)
 
 
 def test_defaults_are_usable_with_no_file() -> None:
@@ -149,3 +157,69 @@ class TestEcho:
 def test_config_module_imports_no_cobra() -> None:
     """A worker reads its config without the parser stack."""
     assert not hasattr(config_module, "cobra")
+
+
+class TestTheEnergyScaleSetting:
+    """``sampler.energy_scale`` (spec §3.6) — ``"warmup_range"`` or a declared positive number."""
+
+    def test_the_default_is_the_warmup_range(self) -> None:
+        """Because only ``warmup_range`` makes ``β`` mean the same thing in two different strains,
+        which is what the batch comparison this package exists for depends on."""
+        assert SamplerConfig().energy_scale == "warmup_range"
+
+    def test_a_declared_positive_number_is_accepted(self) -> None:
+        assert SamplerConfig(energy_scale=2.5).energy_scale == 2.5
+
+    @pytest.mark.parametrize("bad", [0.0, -1.0, float("inf"), float("nan")])
+    def test_a_nonpositive_or_nonfinite_scale_is_refused(self, bad: float) -> None:
+        """A zero or negative ``s_J`` does not rescale the tilt — it annihilates or **flips** it, so
+        the chain would sample ``exp(−βJ/|s_J|)`` while faithfully reporting the β it was asked for.
+        The failure is caught here rather than several thousand sweeps in."""
+        with pytest.raises(ConfigError, match="energy_scale"):
+            SamplerConfig(energy_scale=bad)
+
+    def test_an_unknown_mode_string_is_refused(self) -> None:
+        with pytest.raises(ConfigError, match="warmup_range"):
+            SamplerConfig(energy_scale="pilot_range")  # M10's, not v1's
+
+    @pytest.mark.parametrize("bad", [0.0, 1.0, -0.1, 1.5])
+    def test_the_quantile_must_lie_strictly_inside_the_unit_interval(self, bad: float) -> None:
+        with pytest.raises(ConfigError, match="quantile"):
+            SamplerConfig(energy_scale_quantile=bad)
+
+    def test_the_fallback_must_be_a_positive_scale(self) -> None:
+        with pytest.raises(ConfigError, match="fallback"):
+            SamplerConfig(energy_scale_fallback=0.0)
+
+    @pytest.mark.parametrize("value", ["warmup_range", 3.5])
+    def test_it_round_trips_through_the_echo(self, value: str | float) -> None:
+        """`Config.echo` must reload to the same config, or the manifest does not describe the run.
+
+        The string and the float take different TOML representations (quoted vs bare), so both forms
+        have to survive — an ``energy_scale`` echoed as ``3.5`` and read back as the *string*
+        ``"3.5"`` would reach `choose_energy_scale` as an unknown mode and kill the run at the far
+        end of a geometry build.
+        """
+        echoed = from_dict({"sampler": {"energy_scale": value}}).echo()
+
+        assert from_dict(tomllib.loads(echoed)).sampler.energy_scale == value
+
+
+class TestTheNearZeroThresholds:
+    """``objective.near_zero_thresholds`` (spec §3.7) — *analysis* only; the chain never sees
+    them."""
+
+    def test_several_are_declared_by_default(self) -> None:
+        """One threshold would hide the fact that the answer depends on which one you pick. At
+        finite β the law is continuous, so "how many reactions are off" has no threshold-free
+        answer — the L1 term promotes small fluxes, it does not produce exact zeros."""
+        assert len(ObjectiveConfig().near_zero_thresholds) >= 2
+
+    def test_they_must_be_positive_and_finite(self) -> None:
+        for bad in ((0.0,), (-1e-9,), (1e-9, float("inf"))):
+            with pytest.raises(ConfigError, match="near_zero_thresholds"):
+                ObjectiveConfig(near_zero_thresholds=bad)
+
+    def test_an_empty_list_is_refused(self) -> None:
+        with pytest.raises(ConfigError, match="at least one"):
+            ObjectiveConfig(near_zero_thresholds=())
