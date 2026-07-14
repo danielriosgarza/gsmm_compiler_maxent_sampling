@@ -241,3 +241,78 @@ class TestValidation:
     def test_rejects_a_row_reference_outside_the_matrix_at_build_time(self) -> None:
         with pytest.raises(InvalidCSCError, match="outside"):
             NativeCSC.from_columns(2, [{5: 1.0}])
+
+
+class TestEmptyColumns:
+    """A reaction appearing in **no** metabolite. Unusual in a curated model, entirely legal as a
+    matrix — and it walked off the end of the canonical-form check until M5's synthetic polytopes
+    built one. The boundary that exempts a column join from the "row indices ascend" rule sits at
+    entry ``j``; a *trailing* empty column puts ``j == nnz``, one past the last comparable pair."""
+
+    def test_a_trailing_empty_column_validates(self) -> None:
+        matrix = NativeCSC.from_dense(np.array([[1.0, -1.0, 0.0]]))
+
+        assert matrix.shape == (1, 3)
+        assert matrix.nnz == 2
+        assert np.array_equal(matrix.starts, np.array([0, 1, 2, 2], dtype=INDEX_DTYPE))
+
+    def test_several_trailing_empty_columns_validate(self) -> None:
+        matrix = NativeCSC.from_dense(np.array([[1.0, 0.0, 0.0, 0.0]]))
+
+        assert matrix.nnz == 1
+        assert np.array_equal(matrix.starts, np.array([0, 1, 1, 1, 1], dtype=INDEX_DTYPE))
+
+    def test_an_interior_empty_column_validates(self) -> None:
+        matrix = NativeCSC.from_dense(np.array([[1.0, 0.0, 2.0], [3.0, 0.0, 4.0]]))
+
+        assert matrix.nnz == 4
+        assert np.array_equal(matrix.starts, np.array([0, 2, 2, 4], dtype=INDEX_DTYPE))
+
+    def test_products_ignore_an_empty_column(self) -> None:
+        matrix = NativeCSC.from_dense(np.array([[1.0, -1.0, 0.0]]))
+
+        # v2 has no coefficient anywhere, so no value of it can change S·v.
+        assert matrix.matvec(np.array([2.0, 2.0, 999.0]))[0] == pytest.approx(0.0)
+        assert matrix.cancellation_scale(np.array([2.0, 2.0, 999.0]))[0] == pytest.approx(4.0)
+
+    def test_an_unsorted_column_is_still_caught_when_empty_columns_are_present(self) -> None:
+        """The exemption must not become a blanket amnesty: the check still has to fail on a column
+        whose row indices genuinely descend."""
+        with pytest.raises(InvalidCSCError, match="strictly increasing"):
+            NativeCSC(
+                n_rows=3,
+                n_cols=3,
+                starts=np.array([0, 2, 2, 2], dtype=INDEX_DTYPE),
+                indices=np.array([2, 0], dtype=INDEX_DTYPE),  # descending inside column 0
+                values=np.array([1.0, 1.0], dtype=np.float64),
+            )
+
+
+class TestRelativeResidual:
+    """The floored relative bar (M5). See `NativeCSC.relative_residual` for the measured case."""
+
+    def test_it_divides_by_the_cancellation_scale_when_that_scale_is_real(self) -> None:
+        matrix = NativeCSC.from_dense(np.array([[1.0, 1.0]]))
+        # Terms of size 1e5 that all but cancel: the sum is 1.0, so the *relative* residual is
+        # 1/199999 — which is the point. An absolute bar would call a residual of 1.0 enormous,
+        # when float64 cannot even evaluate this row to better than ~1e-11.
+        x = np.array([1e5, -1e5 + 1.0])
+
+        scale = 1e5 + abs(-1e5 + 1.0)  # 199999
+        assert matrix.relative_residual(x)[0] == pytest.approx(1.0 / scale, rel=1e-12)
+
+    def test_the_floor_stops_it_dividing_by_noise(self) -> None:
+        """One nonzero term means residual == scale, so an unfloored ratio is *identically 1* for
+        any flux, however tiny. This is the M5 defect, in miniature."""
+        matrix = NativeCSC.from_dense(np.array([[1.0]]))
+        x = np.array([3.4e-14])
+
+        assert matrix.cancellation_scale(x)[0] == pytest.approx(3.4e-14)  # == the residual
+        assert matrix.relative_residual(x)[0] == pytest.approx(3.4e-14)  # not 1.0
+
+    def test_it_subtracts_the_right_hand_side(self) -> None:
+        matrix = NativeCSC.from_dense(np.array([[1.0, 1.0]]))
+        x = np.array([0.5, 0.5])
+
+        assert matrix.relative_residual(x, np.array([1.0]))[0] == pytest.approx(0.0)
+        assert matrix.relative_residual(x, np.array([0.0]))[0] == pytest.approx(1.0)

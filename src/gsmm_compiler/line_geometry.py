@@ -140,19 +140,56 @@ def feasible_chord(
     Raises `ZeroDirectionError` on a zero direction and `InfeasibleChordError` when ``v`` sits
     further outside its bounds than ``feasibility_tol``. A narrow or empty chord is **not** an
     error: it comes back with ``is_samplable`` false, and the caller stays put.
+
+    This is the *oracle* form: it finds the support itself, so it cannot be handed a wrong one. The
+    sampler's hot path calls `chord_on_support` with a support precomputed from a frozen transform —
+    the two run the identical arithmetic on the identical values, and a test holds them to
+    bit-for-bit agreement.
     """
     nonzero = np.flatnonzero(direction)
     if nonzero.size == 0:
         raise ZeroDirectionError("direction has no nonzero component; the chord is unbounded")
 
-    d = direction[nonzero]
+    return chord_on_support(
+        v[nonzero],
+        direction[nonzero],
+        lower[nonzero],
+        upper[nonzero],
+        feasibility_tol=feasibility_tol,
+        nudge=nudge,
+    )
+
+
+def chord_on_support(
+    v_support: NDArray[np.float64],
+    direction_support: NDArray[np.float64],
+    lower_support: NDArray[np.float64],
+    upper_support: NDArray[np.float64],
+    *,
+    feasibility_tol: float = DEFAULT_FEASIBILITY_TOL,
+    nudge: bool = True,
+) -> Chord:
+    """`feasible_chord`, with the structural support of the direction supplied already sliced.
+
+    The inner loop needs this: at each step only ``v`` has changed, so re-deriving the support of a
+    frozen ``T[:, k]`` and re-slicing its bounds is pure waste. **The support is not a tolerance.**
+    It is the set of *exactly* nonzero components of the direction (BUILD_PLAN §1.6.1), and M5's
+    `rounding.CoordinatePrecompute` derives it from ``T`` with `np.flatnonzero` and validates it
+    against the column on construction — so a truncated support cannot reach here.
+
+    Every argument is the direction's support slice of a full-length vector, and they must all come
+    from the *same* index set, or the chord silently intersects the wrong reactions' bounds.
+    """
+    if direction_support.size == 0:
+        raise ZeroDirectionError("direction has no nonzero component; the chord is unbounded")
+
     # Both ratios per reaction. For d > 0 the lower bound gives the left limit; for d < 0 the
     # division flips their order, so take the elementwise min/max rather than branching on sign.
     # A component small enough to overflow its ratio yields ±inf here, which is the honest answer —
     # it constrains nothing that float64 can express — and is caught below if every one does so.
     with np.errstate(over="ignore"):
-        to_lower = (lower[nonzero] - v[nonzero]) / d
-        to_upper = (upper[nonzero] - v[nonzero]) / d
+        to_lower = (lower_support - v_support) / direction_support
+        to_upper = (upper_support - v_support) / direction_support
 
     t_lo = float(np.minimum(to_lower, to_upper).max())
     t_hi = float(np.maximum(to_lower, to_upper).min())

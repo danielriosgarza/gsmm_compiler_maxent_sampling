@@ -20,9 +20,12 @@ from decimal import Decimal, getcontext
 
 import numpy as np
 import pytest
+from tests.statistical.ks import kolmogorov_sf, ks_pvalue
 
 from gsmm_compiler.line_distribution import L1Objective, sample_line
 from gsmm_compiler.line_geometry import Chord
+
+__all__ = ["kolmogorov_sf", "ks_pvalue"]
 
 getcontext().prec = 60
 
@@ -30,25 +33,6 @@ KS_ALPHA = 1e-3
 """With fixed seeds a pass is deterministic; this floor leaves no room for flakiness."""
 
 N_DRAWS = 20_000
-
-
-def kolmogorov_sf(c: float) -> float:
-    """``P(√n·D > c)`` — the Kolmogorov survival function (this repo has no scipy)."""
-    k = np.arange(1, 101)
-    return float(2.0 * np.sum((-1.0) ** (k - 1) * np.exp(-2.0 * k**2 * c**2)))
-
-
-def ks_pvalue(sample: np.ndarray, cdf_at_sample: np.ndarray) -> float:
-    """Two-sided one-sample KS p-value. ``cdf_at_sample[i]`` is ``F(sample[i])``, unsorted."""
-    n = sample.size
-    theoretical = np.sort(cdf_at_sample)
-    d = float(
-        max(
-            np.max(np.arange(1, n + 1) / n - theoretical),
-            np.max(theoretical - np.arange(0, n) / n),
-        )
-    )
-    return kolmogorov_sf(np.sqrt(n) * d)
 
 
 def draw(

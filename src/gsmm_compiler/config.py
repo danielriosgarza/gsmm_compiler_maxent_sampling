@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import tomllib
 from dataclasses import asdict, dataclass, field, fields
+from math import isfinite
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -139,6 +140,37 @@ class GeometryConfig:
     max_span_probes: int | None = None
     """Cap on certificate probes. Any cap forces ``span_certificate_exhaustive = false``."""
 
+    # ---- rounding (M5, spec §17) ---------------------------------------------------------------
+
+    ridge_relative: float = 1e-6
+    """Ridge ``ε`` on the support covariance, as a fraction of ``trace(C_q)/d`` (spec §17.2).
+
+    Relative, never absolute: coordinate variances span orders of magnitude between models, and an
+    absolute ridge would be a rounding error on one and the dominant term on another.
+
+    **It cannot change the sampled distribution.** ``C_q + εI`` is positive definite for any
+    ``ε > 0``, so ``L`` is invertible and ``range(T) = range(diag(s)·B)`` regardless — see
+    `rounding`. What it sets is the *step scale along the thinnest measured direction*, which is
+    ``√ε`` against a mean of 1. Too small and a near-flat direction gets a needle-thin axis the
+    chain crawls along; too large and every genuinely thin direction is over-inflated, so the
+    chord truncates the proposal and the step is wasted.
+
+    Measured on the example model: the ridge at 1e-6 moves ``cond(C_ε)`` from 1.5659e4 to 1.5615e4
+    — 0.3%. It is numerically inert there while still providing a floor, which is what a ridge is
+    supposed to be.
+    """
+    ridge_growth: float = 10.0
+    """Geometric escalation factor when Cholesky fails (spec §17.2)."""
+    max_ridge_escalations: int = 12
+    """Escalations before the covariance is called corrupt rather than merely ill-conditioned."""
+    covariance_rank_tol: float = 1e-12
+    """Eigenvalue cutoff for the rank of ``C_q``, relative to ``trace(C_q)/d``.
+
+    Diagnostic only. The ridge makes Cholesky succeed either way, and a rank-deficient covariance
+    is a *mixing* defect rather than a correctness one (`rounding` explains why). It is reported so
+    that a chain crawling along a ridge-held direction is legible in the manifest, not invisible.
+    """
+
     def __post_init__(self) -> None:
         if self.feasibility_tol <= 0.0 or self.span_tol <= 0.0 or self.rank_tol <= 0.0:
             raise ConfigError("geometry tolerances must be > 0")
@@ -168,11 +200,28 @@ class GeometryConfig:
             raise ConfigError("geometry.max_geometry_memory_gb must be > 0")
         if self.max_span_probes is not None and self.max_span_probes < 1:
             raise ConfigError("geometry.max_span_probes must be >= 1 when set")
+        if self.ridge_relative <= 0.0:
+            # Zero is not "no ridge". It is a Cholesky that fails on a rank-deficient covariance
+            # and then escalates from zero — which multiplies back to zero, forever.
+            raise ConfigError("geometry.ridge_relative must be > 0")
+        if self.ridge_growth <= 1.0:
+            raise ConfigError("geometry.ridge_growth must be > 1 (it escalates the ridge)")
+        if self.max_ridge_escalations < 1:
+            raise ConfigError("geometry.max_ridge_escalations must be >= 1")
+        if self.covariance_rank_tol <= 0.0:
+            raise ConfigError("geometry.covariance_rank_tol must be > 0")
 
 
 @dataclass(frozen=True)
 class SamplerConfig:
-    """The β-ladder and the MCMC schedule (M5/M6)."""
+    """The β-ladder and the MCMC schedule (M5/M6).
+
+    **Every count here is in *sweeps*, and one sweep is ``d`` random-scan coordinate updates.** The
+    scan is still random — each update draws its own coordinate — but counting single updates would
+    make ``burn_in = 1000`` mean 21 passes over a 46-dimensional model and 1000 passes over a
+    1-dimensional one. A schedule has to mean the same thing across a batch, or the cross-model
+    comparison this package exists for is comparing chains of different lengths.
+    """
 
     betas: tuple[float, ...] = (0.0,)
     n_chains: int = 4
@@ -180,13 +229,18 @@ class SamplerConfig:
     burn_in: int = 1000
     thin: int = 1
     refresh_interval: int = 1000
-    """Steps between exact rebuilds of ``v`` from ``y`` — bounds incremental-update drift (§1.3)."""
+    """Sweeps between exact rebuilds of ``v`` from ``y`` — bounds incremental drift (§1.3)."""
+    seed: int = 0
+    """Base entropy. Each chain's stream is keyed on ``(model_id, stage, β_index, chain_index)``
+    on top of it (`provenance.stream_seed`) — never on a position in a `spawn()` sequence."""
 
     def __post_init__(self) -> None:
         if not self.betas:
             raise ConfigError("sampler.betas must list at least one β")
         if any(beta < 0.0 for beta in self.betas):
             raise ConfigError(f"sampler.betas must all be >= 0, got {list(self.betas)}")
+        if any(not isfinite(beta) for beta in self.betas):
+            raise ConfigError(f"sampler.betas must all be finite, got {list(self.betas)}")
         for name, value, minimum in (
             ("n_chains", self.n_chains, 1),
             ("n_samples", self.n_samples, 1),

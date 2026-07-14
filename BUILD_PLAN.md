@@ -244,6 +244,39 @@ triggers are in `.collab/specs/collab-outcome.md`.
    overflows *or underflows to zero* (which would silently flatten the tilt). Computing it once also
    guarantees the mass stage and the sampling stage use the same `κ`.
 
+### 1.6.1 (M5) Rounding cannot move the target, and the sampler's honest float64 claim
+
+Two things the M5 collab review forced into precise language.
+
+**The transform is a preconditioner and provably nothing more.** `L` is `d × d` and invertible, so
+`range(T) = range(diag(s)·B·L) = range(diag(s)·B)` *exactly*, and `y ↦ v = centre + T·y` is affine
+and injective with a constant Jacobian. So uniform-in-`y` is uniform-on-the-polytope and `π_β` in `y`
+is `π_β` in flux, for **every** invertible `L`. The ridge is therefore free to be an engineering
+parameter. But the identity is an *assumption* until something checks it: `rounding` now takes an SVD
+of the computed `T` and refuses a rank below `d`. **A `T` that quietly lost a column produces no bad
+numbers, only absent ones** — every sample feasible, every chord positive, mass balance exact, and
+part of the support never visited.
+
+**In float64 the chain is not Markov in `y` alone.** Its state is `(y, cache error, refresh phase)`,
+because `v` is maintained incrementally. Exact Gibbs invariance is claimed **only in exact
+arithmetic**; a measured drift is *not* a bound on the error induced in the stationary law (that needs
+a spectral-gap argument we do not have). What is claimed is that the perturbation is small, corrigible
+and *observed*: `v` is rebuilt exactly from `y` on a fixed schedule, the stored flux is the exact
+`centre + T·y` of the stored state, and the discrepancy is measured at every refresh **and every
+sample** (max 2.1e-11 on the example model, against fluxes of ~1e3).
+
+**Scaling and rounding do different jobs.** `diag(s)` fixes the axes' *units* — an axis-aligned
+1000:1 stretch is absorbed before rounding is reached. `L` fixes their *correlations*, which no
+diagonal matrix can see. On the genome-scale model rounding takes the shortest chord at the centre
+from 0.018 to 0.744 (41×) and the spread across axes from 77× to 3.8×.
+
+**The relative mass-balance floor belongs to fluxes and must not touch directions.** A sampled *flux*
+carries solver noise at the FVA-blocked reactions, so a metabolite row touched only by blocked
+reactions divides a noise value by itself and reports a relative residual of exactly 1.0 — hence the
+`scale_floor = 1.0` in `NativeCSC.relative_residual`. A *direction* carries no such noise (`T`'s
+blocked rows are exactly `0.0`), so the transform's own check is **unfloored**. Correct where the
+noise exists, absent where it cannot be.
+
 ### 1.7 λ is scale-referenced: `λ = λ̃ · λ*`  *(M3 finding; decision SETTLED)*
 
 `J(v) = μ(v) − λ·C(v)` compares a **biomass flux** with a **sum of hundreds of absolute fluxes**.

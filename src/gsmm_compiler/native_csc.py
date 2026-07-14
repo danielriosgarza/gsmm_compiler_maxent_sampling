@@ -25,6 +25,18 @@ INDEX_DTYPE = np.int32
 VALUE_DTYPE = np.float64
 """float64 everywhere in computation (CLAUDE.md conventions)."""
 
+MASS_BALANCE_SCALE_FLOOR = 1.0
+"""Floor on the denominator of `NativeCSC.relative_residual`, in flux units.
+
+Below one flux unit a row's cancellation scale is not a scale, it is noise — and dividing by it is
+the M4 error, not a defence against it. See `NativeCSC.relative_residual` for the measured case that
+forced this: a metabolite whose only two free reactions are both FVA-blocked reports an *unfloored*
+relative residual of exactly 1.0, from an absolute residual of 3.4e-14.
+
+One flux unit is also `GeometryConfig.scale_floor`, and for the same reason: it is the magnitude
+below which this model's numbers stop carrying information.
+"""
+
 _HIGHS_INT_MAX = 2**31 - 1
 
 
@@ -97,9 +109,17 @@ class NativeCSC:
         # unsorted column *and* a duplicated (row, col) entry — the latter would otherwise be
         # summed implicitly by HiGHS, silently changing the model.
         if self.indices.size > 1:
-            ascending = np.diff(self.indices) > 0
+            nnz = self.indices.size
+            ascending = np.diff(self.indices) > 0  # ascending[i] compares entries i and i+1
+            # A column boundary at entry j exempts the pair (j−1, j) from ascending: crossing into a
+            # new column, the row index is *allowed* to descend. Only j strictly inside (0, nnz)
+            # names such a pair. `j == nnz` is a boundary past the last entry — what a **trailing
+            # empty column** produces — and indexing `ascending[nnz−1]` for it walks off the end of
+            # an array of length nnz−1. A reaction appearing in no metabolite is unusual but legal,
+            # and it made this raise IndexError instead of validating.
             joins = self.starts[1:-1]
-            ascending[joins[joins > 0] - 1] = True  # a column boundary may descend
+            boundaries = joins[(joins > 0) & (joins < nnz)]
+            ascending[boundaries - 1] = True
             if not np.all(ascending):
                 raise InvalidCSCError(
                     "row indices within a column must be strictly increasing "
@@ -129,6 +149,42 @@ class NativeCSC:
         return np.repeat(np.arange(self.n_cols, dtype=np.intp), np.diff(self.starts))
 
     # ---- products -----------------------------------------------------------------------------
+
+    def relative_residual(
+        self,
+        x: NDArray[np.float64],
+        rhs: NDArray[np.float64] | None = None,
+        *,
+        scale_floor: float = MASS_BALANCE_SCALE_FLOOR,
+    ) -> NDArray[np.float64]:
+        """``|A·x − b|`` per row, divided by that row's cancellation scale — **with a floor**.
+
+        The division is the M4 lesson: ``A·x`` sums terms of size ``|A|·|x|``, so evaluating it in
+        float64 already costs ``~eps`` of that before any solver or sampler error enters. An
+        absolute bar charges that arithmetic to whoever produced ``x``.
+
+        **The floor is the same lesson applied to the instrument itself.** A relative bar exists to
+        forgive *cancellation*: when a sum of large terms collapses to near zero, the result cannot
+        be demanded small in absolute terms. Where there is no cancellation, there is nothing to
+        forgive — and dividing by the row's own scale then divides by noise, which is the error M4
+        catalogued rather than a defence against it.
+
+        Measured on the example model: metabolite ``cpd02375_c0`` is touched by exactly two free
+        reactions, and **both are FVA-blocked**, so their fluxes are the centre's residual noise
+        (−3.4e-14 and exactly 0). Its residual is ``|S·v| = 3.4e-14`` and its cancellation scale is
+        ``|S|·|v| = 3.4e-14`` — *the same number*, because there is one nonzero term and nothing
+        cancels. Unfloored, the row reports a relative residual of exactly **1.0** and drowns out
+        every real row. With the floor it reports 3.4e-14, which is the truth. 24 rows of this model
+        touch a single free reaction, and for every one of them the unfloored ratio is identically 1
+        whenever the flux is not exactly zero.
+
+        So the denominator is ``max(|A|·|x|, scale_floor)``: a residual is judged against its row's
+        own term magnitudes, but never against a scale below one flux unit, where relative and
+        absolute coincide anyway.
+        """
+        residual = np.abs(self.matvec(x) if rhs is None else self.matvec(x) - rhs)
+        denominator = np.maximum(self.cancellation_scale(x), scale_floor)
+        return np.asarray(residual / denominator, dtype=VALUE_DTYPE)
 
     def cancellation_scale(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
         """``|S|·|x|`` — the magnitude of the terms that ``matvec(x)`` cancels, row by row.

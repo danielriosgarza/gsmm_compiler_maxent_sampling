@@ -529,7 +529,7 @@ def sample_line(
     v: NDArray[np.float64],
     direction: NDArray[np.float64],
     chord: Chord,
-    objective: L1Objective,
+    objective: L1Objective | None,
     beta: float,
     energy_scale: float,
     rng: np.random.Generator,
@@ -544,7 +544,15 @@ def sample_line(
     on its bounds, and the nearby feasible ``t`` for one that has drifted a hair outside. The caller
     must not respond by redrawing a different coordinate: that would make the coordinate-selection
     law depend on the state and break stationarity (see `line_geometry`).
+
+    ``objective`` may be ``None`` **only** at ``β = 0``, where the target is flat and ``J`` provably
+    never enters the draw. That is not a convenience: it lets M5's uniform sampler run the one code
+    path this function already defines, instead of maintaining its own copy of the uniform branch —
+    the copy being the thing that could later drift out of agreement with the tilted branch.
     """
+    if beta > 0.0 and objective is None:
+        raise InvalidObjectiveError("an objective is required to sample at β > 0")
+
     if not chord.is_samplable:
         return chord.degenerate_point
 
@@ -552,6 +560,7 @@ def sample_line(
         # The target is flat: uniform on the chord, with no segment structure built at all
         # (spec §18.2). This is the entire β=0 inner loop.
         return float(rng.uniform(chord.t_lo, chord.t_hi))
+    assert objective is not None  # narrowed by the β > 0 guard above
 
     piecewise = build_piecewise_j(v, direction, chord, objective)
     log_masses = log_segment_masses(piecewise, beta, energy_scale)

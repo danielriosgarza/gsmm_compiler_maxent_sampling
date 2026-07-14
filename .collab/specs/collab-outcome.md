@@ -304,3 +304,120 @@ Every basis direction's chord through the centre contains `t = 0` with positive 
 the centre is *exactly* bound-feasible after a clamp bounded by the LP tolerance (3.1e-13); and the
 support points span all `d` directions (rank 46/46) — so M5's covariance ridge cannot conceal a
 singular covariance instead of failing on it.
+
+---
+
+## M5 — Rounding + β=0 sampler (3 rounds, converged: AGREE, contested: none)
+
+Codex's sandbox (bubblewrap) could not read the working tree at all, and it refused to review the
+stale GitHub mirror rather than invent findings against code that was not there — the right call.
+The code was pasted into the prompt instead, docstrings stripped.
+
+**Six defects found, all in code that 553 tests passed over. None corrupted the β=0 distribution;
+three would have corrupted what we *believed* about it, which on a sampler is nearly as bad.**
+
+### Locked: Geyer's pairs start at lag ZERO — `Γ_m = ρ_{2m} + ρ_{2m+1}`
+
+The ESS estimator paired from lag 1: `(ρ₁+ρ₂), (ρ₃+ρ₄), …`. That sums to the same value **only if
+nothing is truncated**, and the truncation is the entire method. Geyer's theorem — that `Γ_m` is
+positive and decreasing for a reversible chain — is about the pairs that *include lag zero*; applying
+his stopping rule to an offset sequence applies it to something the theorem says nothing about.
+
+Measured trigger: an antithetic AR(1) with `ρ = −0.5` has `ρ_t = (−0.5)ᵗ`, so the correct
+`Γ₀ = ρ₀ + ρ₁ = +0.50` (keep going) while the offset first pair is `ρ₁ + ρ₂ = −0.25` (stop at once).
+The estimator therefore truncated on its very first term and fell back to "ESS = N" for a chain whose
+true ESS is **3N**. Now pairs from lag zero, truncates at the first nonpositive `Γ`, applies the
+initial-monotone accumulate, and `τ = −1 + 2·ΣΓ`. Pinned against the analytic `τ = (1+ρ)/(1−ρ)` for
+`ρ ∈ {−0.8, −0.5, −0.2, 0.5, 0.8, 0.9}`.
+
+### Locked: "feasible" means *both* halves of the polytope's definition
+
+`FeasibilityReport.is_feasible` tested only the bound violations. `P = {v : S·v = rhs, l ≤ v ≤ u}` —
+so a chain that had walked clean off the steady-state manifold, the half the entire affine geometry
+exists to enforce, reported `is_feasible = True` with an arbitrarily large residual. Nothing else in
+the suite asked the question, so nothing else would have caught it. It now requires both.
+
+### Locked: the stored flux is the exact function of the stored state
+
+The sampler stored the *incremental cache* `v`, so `to_flux(coordinates) != fluxes` — two quantities
+that are supposed to be the same and were not. Worse, `max_refresh_drift` was measured **only at
+refresh instants**, which is not a bound on anything: drift can peak and partly cancel between two
+refreshes, and a `refresh_interval` longer than the run would have reported a serene 0.0 having
+measured nothing. Now the exact `centre + T·y` is recomputed at every stored sample, so the equality
+is *bitwise*, and the drift is observed at every sample as well as every refresh.
+
+### Locked: `range(T) = range(diag(s)·B)` is an assumption until something checks it
+
+The identity that licenses *any* ridge holds in exact arithmetic (`diag(s)` invertible, `B` full
+column rank, `L` invertible) — and nothing verified float64 had delivered it. **A `T` that quietly
+lost a column produces no bad numbers, only absent ones**: the chain explores a lower-dimensional
+slice of the polytope, every sample is feasible, every chord positive, mass balance exact, and part
+of the support is simply never visited. Now an SVD rank check, compared against `T`'s *own* column
+count (comparing against the `d` passed in would pass an `n×(d+1)` matrix of rank `d` — the very
+deficiency it exists to find). Measured: rank 46/46, cond(T) = 165.
+
+### Locked: `@dataclass(frozen=True)` freezes the binding, not the buffer
+
+It stops `t.transform = X` and does nothing whatever about `t.transform[0,0] = X`. Not academic:
+`CoordinatePrecompute` holds **copies** of `T`'s columns, validated against `T` once at construction,
+so an in-place write afterwards makes the chord (from the stale precompute) and the flux (from the
+mutated `T`) disagree — a chain sampling one polytope and reporting fluxes from another, with no
+error raised anywhere. All arrays are now physically read-only.
+
+That fix exposed a second, latent bug: **`np.ascontiguousarray` returns its argument unchanged** when
+it is already contiguous and float64, so freezing the centre without copying would have reached back
+through the alias and made `ReducedGeometry.center` read-only *underneath its owner* — a transform
+silently mutating the object it was built from. Hence the explicit `.copy()`.
+
+The guarantee is stated for what it is: **accident-proof, not adversary-proof.** A caller can flip
+`writeable` back on an owning array. The alias hole is closed at the source instead — every frozen
+array is built from a buffer nothing else holds.
+
+### Locked: the residual floor belongs to fluxes and *must not* touch directions
+
+The `scale_floor = 1.0` in `NativeCSC.relative_residual` exists because a sampled **flux** carries
+solver noise at the FVA-blocked reactions (~1e-14, not 0): a metabolite row touched only by blocked
+reactions then divides a noise value by *itself* and reports a relative residual of exactly **1.0**.
+(Measured: `cpd02375_c0`, both its free reactions blocked, absolute residual 3.4e-14, unfloored ratio
+1.0. 24 rows of this model touch a single free reaction and every one is identically 1.0.)
+
+A **direction** carries no such noise — `T`'s rows at blocked reactions are *exactly* `0.0` — so such
+a row's cancellation scale is exactly zero, its residual is a sum of no terms, and it is *excluded*
+rather than divided. Flooring the transform's own check would therefore only weaken it, and measurably
+does: it loosens the bar on 2049 of the 41124 (column, row) pairs. `_transform_mass_balance` is
+unfloored (3.5e-10 against `span_tol` 1e-9, passing on its own merits); the floor is used only for
+sampled fluxes. **The floor is correct where the noise exists and absent where it cannot be.**
+
+### Locked: what per-column `‖S·T‖` does and does not certify
+
+Codex: checking each column independently does not bound `S·T·y` over the support, because the
+cancellation scale at `T·y` can shrink through inter-column cancellation while the column residuals
+reinforce. **Conceded for the *relative* residual.** But the columns *do* bound every combination in
+absolute terms, `‖S·T·y‖_∞ ≤ ‖y‖₁ · max_k ‖S·T_k‖_∞`, and both factors are now **measured** rather
+than assumed: `‖y‖₁ ≤ 27.2` over 12000 sampled states and `max_k ‖S·T_k‖_∞ = 4.1e-12`, giving a
+support-wide absolute bound of **1.1e-10** against a measured 1.7e-11. Consistent.
+
+And the operative guarantee is stronger than any a-priori certificate, because it is empirical: the
+mass balance of every **stored sample** is recomputed and checked, and `is_feasible` now fails on it.
+The points the chain actually emits are *verified*, not bounded. Codex conceded this.
+
+### Settled: the stationarity argument, and exactly how far it goes
+
+Codex's standing objection, conceded in full: **in float64 the chain is not Markov in `y` alone** —
+its state is `(y, cache error, refresh phase)` — and a *measured* per-step drift is **not** a bound on
+the error induced in the stationary law, which would need a spectral-gap argument this package does
+not have. The module docstring now says exactly that, and claims exact Gibbs invariance only in exact
+arithmetic. What is claimed in float64 is that the perturbation is small, corrigible and observed.
+
+Three sub-claims survived attack unchanged:
+- **The batched per-sweep coordinate draw is fine.** `rng.integers(0, d, size=d)` is drawn before any
+  chord is inspected, so the mixture weights are state-independent. A degenerate chord consumes no
+  RNG draw while a samplable one consumes a uniform, so the *number* of draws is state-dependent —
+  which is harmless: each new uniform is still independent of the past given the stream. Codex agreed.
+- **Continuing from the rebuilt `v` is correct**, `y` being the state; the refresh is phase-dependent,
+  never state-dependent, and is an identity in exact arithmetic.
+- **The degenerate-chord move is a self-loop in the sense that matters.** §1.6.6 forbids redrawing a
+  *different coordinate* (that is what makes selection state-dependent). Moving to the single feasible
+  `t` on the *same* coordinate does not touch the coordinate-selection law, and staying put would
+  strand a drifted state outside its bound forever. Codex conceded, asking only that the branch be
+  described as numerical recovery rather than as an exact Gibbs transition. It is.
