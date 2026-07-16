@@ -345,6 +345,31 @@ scale", and *a library default is not a declaration*. A silent `s_J = 1` would m
 to prevent — as a log line nobody reads. `sampler.energy_scale_fallback` defaults to `None`, and
 `None` means stop.
 
+### 1.6.5 (M7) every input to `s_J` is keyed on **both** the objective and the polytope
+
+*(M7 collab finding.)* M7 is the first milestone with **two objectives on one polytope** (base vs
+reweighted), which is the M6 "two artifacts never computed against each other" bug given fresh fuel:
+on the toy, `s_J` is **0.68** under the base objective and **0.0068** under the reweighted one, and
+M6's guard (`energy_scale.polytope_key`) could not tell them apart, because the two share a
+`polytope_key` exactly. `s_J = J* − Q_q(J(W))` is a subtraction of three model-derived inputs — the
+optimum's `J*`, the objective that evaluates `J(W)`, and the warm-up array `W` — and it is only a
+*range* if all three come from one objective on one polytope.
+
+So all three are keyed and cross-checked before a single `J(W)` is formed:
+- `LPOptimum` carries `objective_key` **and** `polytope_key`. `objective_key` alone is insufficient —
+  it hashes the objective's params, *not* the polytope's bounds, so two polytopes differing only in
+  bounds hash identically and `J*(A) − Q(J_B(W))` would pass every objective check (Codex, r2).
+- `ReducedObjective` carries both keys; `choose_energy_scale` requires a **`warmup_polytope_key`** and
+  checks it, because the warm-up array is a bare `(K, n_free)` matrix with no identity of its own — a
+  same-shaped set from the wrong polytope silently changes `s_J` (Codex, r3).
+- `run_ladder` re-checks the `EnergyScale` and the transform against the objective.
+
+`optimum_coordinates`, by contrast, is **deliberately not keyed**: it is a start *hint* (one vertex of
+a Dirichlet hull, then made feasible or the run raises), it enters only the initial state and never
+the kernel/objective/`s_J`/traces, so it **cannot change the invariant target** — a wrong hint only
+seeds a poorer start, which is observable via feasibility and R̂/ESS. Keying it would imply it defines
+the distribution, which it does not (Codex conceded, r5). The boundary is documented instead.
+
 ### 1.7 λ is scale-referenced: `λ = λ̃ · λ*`  *(M3 finding; decision SETTLED)*
 
 `J(v) = μ(v) − λ·C(v)` compares a **biomass flux** with a **sum of hundreds of absolute fluxes**.
@@ -400,10 +425,19 @@ different selection pressures across strains while looking, in the config file, 
 comparison. Measured λ̃ ladder on the example model: `λ̃ = 0 → 100%` of μ_max retained, `0.25 → 95%`,
 `0.5 → 60%`, `0.9 → 30%`. A dial, not a trapdoor.
 
-**Open for M7.** Reweighting changes `w`, and `λ*` is a function of `w` (doubling every weight halves
-`λ*`). So M7 must decide whether the raw λ stays frozen at its base-weight value through the
-reweighting loop, or is re-resolved from the final frozen weights. Either is defensible; it must be
-*chosen* and recorded, because it moves `J`.
+**Settled by M7 — λ is re-resolved every iteration (`λ_k = λ̃·λ*(w_k)`).** Reweighting changes `w`,
+and `λ*` is a function of `w` (doubling every weight halves `λ*`), so M7 had to choose whether the raw
+λ stays frozen at its base-weight value or is re-resolved from the current weights. **Measurement
+closed it, not preference:** one reweighting step moves `λ*` from 1.9e-3 to ~4e2 (default clip) or
+~2.3e5 (wider) because `C_w` changes *units* — a sum of absolute fluxes becomes very nearly a count of
+active reactions. Freezing λ collapses the effective pressure `λ/λ*(w)` from 0.5 to ~4e-6 **and
+crashes M3's `z == |v|` LP gate by the second iteration** (deviation 25 at the default clip). So λ is
+re-resolved: `λ̃` stays the user's dial and goes on meaning the same selection pressure across the loop
+and the batch. This also makes the median renormalization a mathematical **no-op** — `w → cw` sends
+`λ* → λ*/c`, so `λw` (the only thing `J` uses) is invariant — which is why step-4 normalization is a
+*conditioning* step that cannot move the target, and why a frozen λ would have made it a *modelling*
+step that rescaled the pressure by an arbitrary median every iteration. Recorded in
+`.collab/specs/collab-outcome.md` § M7.
 
 ---
 
@@ -421,7 +455,7 @@ reweighting loop, or is re-resolved from the final frozen weights. Either is def
 | **M4** | Affine geometry | sequential warm-started basis discovery (scaled active coords), center from support points, **deterministic span certificate**, geometry diagnostics, memory guard | known toy dims recovered; **truncated basis rejected**; ‖S·diag(s)·B‖≈0; scale-sensitive narrow example classified right; dim-0 singleton path returns constant sample |
 | **M5** | Rounding + β=0 sampler | support-covariance Cholesky rounding (ridge escalation), coordinate hit-and-run at β=0, multi-chain, feasibility + convergence diagnostics | uniform analytic targets reproduced; transform-invariance of moments; positive chords at start; ‖ST‖≈0; **zero inner-loop HiGHS solves** |
 | **M6** | Positive-β maxent sampler | exact piecewise-exp line conditional, explicit β-ladder, objective traces (μ,C,J, norm log-energy), concentration tests | truncated-exponential + truncated-Laplace analytic targets; mean `J` nondecreasing in β within MC uncertainty; large-β stress; 1D quadrature cross-check in reduced coord |
-| **M7** | Reweighted-L1 (frozen weights) | iterative reweighting `w_r ← w_base/(\|v_r\|+ε)` with clipping + median-renormalization, save every weight vector + LP solution, **freeze final weights before sampling**, rebuild objective/LP-optimum/`s_J` (L2 cache) from frozen weights | deterministic weights for fixed seed; active-set converges within tol; weights frozen ⇒ objective `J` unchanged during MCMC (never updated from chain state); labeled experimental (not exact cardinality); sampler still reproduces analytic targets under the reweighted `J` |
+| **M7** ✅ | Reweighted-L1 (frozen weights) | iterative reweighting `w_r ← w_base/(\|v_r\|+ε)` with clipping + median-renormalization, save every weight vector + LP solution, **freeze final weights before sampling**, rebuild objective/LP-optimum/`s_J` (L2 cache) from frozen weights. **λ re-resolved each iteration** (`λ_k = λ̃·λ*(w_k)`, §1.7); every `s_J` input keyed on objective+polytope (§1.6.5) | deterministic weights for fixed seed; active-set + **weight fixed point** converge; weights frozen ⇒ objective `J` unchanged during MCMC (reweighter cannot import sampler); labeled experimental (not exact cardinality); sampler reproduces analytic targets under the reweighted `J`. **PASSED 2026-07-16** (733 tests; `/collab` 5 rounds AGREE) |
 | **M8** | Cache, restart, batch orchestration & production | 4-layer cache, per-chain markers + writer-claim locking, atomic rename + fsync, **batch runner over a models manifest**, one global process pool over `(model, β, chain)`, worker thread-limit env, per-model run dirs + **cross-model aggregation**, manifests + diagnostics + `COMPLETE` | kill-and-resume resumes only missing `(model,chain)` units; partial batch yields valid cross-model tables; concurrent-writer safe; corrupted-artifact rejected; same-env deterministic traces; full batch runs on ≥2 strains with documented resources |
 | **M9** | Performance & GSMM hardening | benchmark suite (parse→CSC→passModel→first LP→warm-start LPs→sparse LP→geometry→rounding→β=0 sps→β>0 sps→breakpoint dist→output), worker-count sweep {1,2,4,7,14} across the batch, allocation + sort profiling, `reduced` storage-mode validation | benchmark report produced; all performance assertions hold (no per-step HiGHS, no scipy, no Python loop in chord, no element-wise highspy extraction, no full reconstruction every step) |
 | **M10** | Deferred extensions | pilot rerounding + **pilot-based s_J** (split bootstrap-geometry → β=0 pilot → {final T, s_J} DAG); β→performance calibration; parallel tempering; slice line kernel; downstream mode-feature extraction | each behind its own tests; none alters the validated v1 target distribution |

@@ -22,6 +22,7 @@ import dataclasses
 
 import numpy as np
 import pytest
+from tests.conftest import synthetic_optimum
 
 from gsmm_compiler.config import ObjectiveConfig
 from gsmm_compiler.flux_polytope import FluxPolytope, ReducedPolytope
@@ -841,7 +842,13 @@ class TestTheEnergyScale:
         _, _, j_warmup = lowered.evaluate_many(warmup)
         expected = j_star - float(np.quantile(j_warmup, 0.05))
 
-        scale = choose_energy_scale(lowered, warmup, j_star=j_star, mode="warmup_range")
+        scale = choose_energy_scale(
+            lowered,
+            warmup,
+            optimum=synthetic_optimum(lowered, j_star),
+            warmup_polytope_key=lowered.polytope_key,
+            mode="warmup_range",
+        )
 
         assert scale.value == pytest.approx(expected)
         assert scale.mode == "warmup_range"
@@ -862,7 +869,13 @@ class TestTheEnergyScale:
         lowered = lower_objective(reduced, _objective(polytope, 0.25))
         points = warmup[:, : reduced.n_free]
 
-        scale = choose_energy_scale(lowered, points, j_star=5.0, mode="warmup_range")
+        scale = choose_energy_scale(
+            lowered,
+            points,
+            optimum=synthetic_optimum(lowered, 5.0),
+            warmup_polytope_key=lowered.polytope_key,
+            mode="warmup_range",
+        )
 
         full = np.array([lowered.evaluate(v).total for v in points])
         reduced_only = np.array([lowered.line.evaluate(v) for v in points])
@@ -871,10 +884,66 @@ class TestTheEnergyScale:
         wrong = 5.0 - float(np.quantile(reduced_only, 0.05))
         assert abs(wrong - scale.value) == pytest.approx(0.5), "the constant must actually bite"
 
+    def test_an_optimum_from_a_different_objective_is_refused(
+        self, lowered: ReducedObjective, warmup: np.ndarray
+    ) -> None:
+        """``s_J = J* − Q_q(J(W))`` is only a range if both ends are the same ``J``. M7 makes two
+        objectives share a polytope, so the optimum carries the objective key and it is checked."""
+        stranger = synthetic_optimum(lowered, 5.0)
+        stranger = dataclasses.replace(stranger, objective_key="a-different-objective-key")
+
+        with pytest.raises(IncompatibleObjectiveError, match="different objective"):
+            choose_energy_scale(
+                lowered,
+                warmup,
+                optimum=stranger,
+                warmup_polytope_key=lowered.polytope_key,
+                mode="warmup_range",
+            )
+
+    def test_an_optimum_from_a_different_polytope_is_refused(
+        self, lowered: ReducedObjective, warmup: np.ndarray
+    ) -> None:
+        """The subtler join (Codex, M7 review round 2): two polytopes with the same reaction order,
+        biomass, λ and weights hash to the **same** ``objective_key`` while their ``J*`` differ. The
+        optimum's `polytope_key` is what stops ``J*(polytope A)`` from being paired with warm-up
+        points over polytope B."""
+        stranger = synthetic_optimum(lowered, 5.0, polytope_key="a-different-polytope-key")
+
+        with pytest.raises(IncompatibleObjectiveError, match="different polytope"):
+            choose_energy_scale(
+                lowered,
+                warmup,
+                optimum=stranger,
+                warmup_polytope_key=lowered.polytope_key,
+                mode="warmup_range",
+            )
+
+    def test_the_warmup_points_from_a_different_polytope_are_refused(
+        self, lowered: ReducedObjective, warmup: np.ndarray
+    ) -> None:
+        """The third input to ``s_J = J* − Q_q(J(W))`` — the warm-up array — carries no identity of
+        its own, so a same-shaped set from the wrong polytope would silently change ``s_J`` (Codex,
+        M7 review round 3). Its `polytope_key` is required and checked."""
+        with pytest.raises(IncompatibleObjectiveError, match="warm-up points came from"):
+            choose_energy_scale(
+                lowered,
+                warmup,
+                optimum=synthetic_optimum(lowered, 5.0),
+                warmup_polytope_key="a-different-polytope-key",
+                mode="warmup_range",
+            )
+
     def test_a_declared_scale_is_used_verbatim(
         self, lowered: ReducedObjective, warmup: np.ndarray
     ) -> None:
-        scale = choose_energy_scale(lowered, warmup, j_star=5.0, mode=2.5)
+        scale = choose_energy_scale(
+            lowered,
+            warmup,
+            optimum=synthetic_optimum(lowered, 5.0),
+            warmup_polytope_key=lowered.polytope_key,
+            mode=2.5,
+        )
 
         assert scale.value == 2.5
         assert scale.mode == "declared"
@@ -900,10 +969,21 @@ class TestTheEnergyScale:
         j_at_point = lowered.evaluate(point[0]).total
 
         with pytest.raises(DegenerateEnergyScaleError, match="not resolvable"):
-            choose_energy_scale(lowered, point, j_star=j_at_point, mode="warmup_range")
+            choose_energy_scale(
+                lowered,
+                point,
+                optimum=synthetic_optimum(lowered, j_at_point),
+                warmup_polytope_key=lowered.polytope_key,
+                mode="warmup_range",
+            )
 
         declared = choose_energy_scale(
-            lowered, point, j_star=j_at_point, mode="warmup_range", fallback=2.5
+            lowered,
+            point,
+            optimum=synthetic_optimum(lowered, j_at_point),
+            warmup_polytope_key=lowered.polytope_key,
+            mode="warmup_range",
+            fallback=2.5,
         )
         assert declared.fell_back
         assert declared.value == 2.5
@@ -936,11 +1016,21 @@ class TestTheEnergyScale:
         warmup = np.array([[0.0] * reduced.n_free, [6.0] + [0.0] * (reduced.n_free - 1)])
         j_star = 12.0
 
-        plain = choose_energy_scale(lowered, warmup, j_star=j_star, mode="warmup_range")
+        plain = choose_energy_scale(
+            lowered,
+            warmup,
+            optimum=synthetic_optimum(lowered, j_star),
+            warmup_polytope_key=lowered.polytope_key,
+            mode="warmup_range",
+        )
 
         shifted_objective = dataclasses.replace(lowered, mu_offset=shift)
         shifted = choose_energy_scale(
-            shifted_objective, warmup, j_star=j_star + shift, mode="warmup_range"
+            shifted_objective,
+            warmup,
+            optimum=synthetic_optimum(shifted_objective, j_star + shift),
+            warmup_polytope_key=shifted_objective.polytope_key,
+            mode="warmup_range",
         )
 
         # The premise. Without it this test proves nothing, which is exactly how it was wrong.
@@ -968,7 +1058,13 @@ class TestTheEnergyScale:
     ) -> None:
         """A range one ULP above the floor is technically resolvable and scientifically worthless.
         Only this number says which one you got."""
-        scale = choose_energy_scale(lowered, warmup, j_star=5.0, mode="warmup_range")
+        scale = choose_energy_scale(
+            lowered,
+            warmup,
+            optimum=synthetic_optimum(lowered, 5.0),
+            warmup_polytope_key=lowered.polytope_key,
+            mode="warmup_range",
+        )
 
         assert scale.resolution is not None
         assert scale.resolution == pytest.approx(
@@ -981,13 +1077,31 @@ class TestTheEnergyScale:
     ) -> None:
         for bad in (0.0, -1.0, float("inf")):
             with pytest.raises(ObjectiveError, match="finite and > 0"):
-                choose_energy_scale(lowered, warmup, j_star=5.0, mode=bad)
+                choose_energy_scale(
+                    lowered,
+                    warmup,
+                    optimum=synthetic_optimum(lowered, 5.0),
+                    warmup_polytope_key=lowered.polytope_key,
+                    mode=bad,
+                )
 
         with pytest.raises(ObjectiveError, match="warmup_range"):
-            choose_energy_scale(lowered, warmup, j_star=5.0, mode="pilot_range")
+            choose_energy_scale(
+                lowered,
+                warmup,
+                optimum=synthetic_optimum(lowered, 5.0),
+                warmup_polytope_key=lowered.polytope_key,
+                mode="pilot_range",
+            )
 
         with pytest.raises(ObjectiveError, match="quantile"):
-            choose_energy_scale(lowered, warmup, j_star=5.0, quantile=1.0)
+            choose_energy_scale(
+                lowered,
+                warmup,
+                optimum=synthetic_optimum(lowered, 5.0),
+                warmup_polytope_key=lowered.polytope_key,
+                quantile=1.0,
+            )
 
     def test_the_manifest_records_everything_needed_to_reproduce_beta(
         self, lowered: ReducedObjective, warmup: np.ndarray
@@ -995,7 +1109,11 @@ class TestTheEnergyScale:
         """Spec §3.6: no hidden scaling. ``β`` is meaningless without the ``s_J`` it was divided by,
         so the manifest must carry both, and the ``J*`` they are relative to."""
         manifest = choose_energy_scale(
-            lowered, warmup, j_star=5.0, mode="warmup_range"
+            lowered,
+            warmup,
+            optimum=synthetic_optimum(lowered, 5.0),
+            warmup_polytope_key=lowered.polytope_key,
+            mode="warmup_range",
         ).manifest()
 
         assert set(manifest) >= {

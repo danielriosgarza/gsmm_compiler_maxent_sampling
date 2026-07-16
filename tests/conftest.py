@@ -276,6 +276,37 @@ def simplex_flux_polytope() -> FluxPolytope:
     )
 
 
+def synthetic_optimum(objective, j_star: float, polytope_key: str | None = None):  # type: ignore[no-untyped-def]
+    """An `LPOptimum` carrying a chosen ``J*``, **keyed to `objective`** (M7).
+
+    `choose_energy_scale` takes a keyed `LPOptimum` rather than a bare ``float`` precisely so that a
+    ``J*`` cannot drift across an objective *or a polytope* boundary — ``s_J = J* − Q_q(J(W))`` is
+    only a *range* if both ends are the same ``J`` on the same polytope, and M7 is the first
+    milestone where two objectives share a polytope (and where two polytopes can share an objective
+    key — Codex, round 2).
+
+    Tests that exercise the *arithmetic* of ``s_J`` (the ULP floor, the quantile, the
+    additive-constant invariance) still want to name a ``J*`` outright. They may — but they must now
+    also say which objective *and polytope* it came from, which is the whole discipline in one line.
+    Defaults the polytope key to the objective's own, so a plain call keys them consistently.
+    """
+    from gsmm_compiler.sparse_objective import LPOptimum, ObjectiveValue
+
+    return LPOptimum(
+        v_full=np.zeros(0, dtype=np.float64),
+        z=np.zeros(0, dtype=np.float64),
+        value=ObjectiveValue(mu=0.0, cost=0.0, total=float(j_star)),
+        solver_objective=float(j_star),
+        max_z_deviation=0.0,
+        max_mass_balance_residual=0.0,
+        max_bound_violation=0.0,
+        simplex_iterations=0,
+        elapsed_seconds=0.0,
+        objective_key=objective.objective_key,
+        polytope_key=objective.polytope_key if polytope_key is None else polytope_key,
+    )
+
+
 @pytest.fixture(scope="session")
 def pinned_nonzero_polytope() -> ReducedPolytope:
     """``{v0 = 1 (0 ≤ v0 ≤ 2), v1 = v2 ∈ [0, 1]}`` — an **immovable reaction at a nonzero value**.

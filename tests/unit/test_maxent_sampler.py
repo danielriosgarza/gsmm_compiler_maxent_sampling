@@ -319,7 +319,11 @@ def tilted_simplex(simplex_flux_polytope):  # type: ignore[no-untyped-def]
 
     solution = solve_sparse_objective(reduced, objective)
     scale = choose_energy_scale(
-        lowered, geometry.support_points, j_star=solution.optimum.j_star, mode=1.0
+        lowered,
+        geometry.support_points,
+        optimum=solution.optimum,
+        warmup_polytope_key=geometry.polytope_key,
+        mode=1.0,
     )
     optimum = transform.to_coordinates(reduced.to_reduced(solution.optimum.v_full))
 
@@ -847,6 +851,7 @@ class TestImmovableIsNotTheSameAsZero:
             l1_penalty=0.0,
             n_free=3,
             polytope_key=pinned_nonzero_polytope.content_key(),
+            objective_key="pinned-lambda-zero-objective",
         )
         return transform, pinned_nonzero_polytope, lowered
 
@@ -923,15 +928,36 @@ class TestEveryJoinInTheSamplerIsBound:
                 chain_index=0,
             )
 
-    def test_an_energy_scale_from_another_objective_is_refused(self, tilted_simplex) -> None:
+    def test_an_energy_scale_from_another_polytope_is_refused(self, tilted_simplex) -> None:
         """``s_J`` is the range ``J`` spans over *one* objective on *one* polytope. Borrowed from
-        another, every β on the ladder silently names a different selection pressure — which is the
-        entire failure ``s_J`` exists to prevent."""
+        another polytope, every β on the ladder silently names a different selection pressure —
+        which is the entire failure ``s_J`` exists to prevent."""
         transform, reduced, lowered, scale, optimum = tilted_simplex
 
-        stranger = replace(scale, polytope_key="a-key-from-some-other-objective")
+        stranger = replace(scale, polytope_key="a-key-from-some-other-model")
 
-        with pytest.raises(SamplerError, match="calibrated from a different objective"):
+        with pytest.raises(SamplerError, match="calibrated on a different polytope"):
+            run_ladder(
+                transform,
+                reduced,
+                config=replace(SHORT, betas=(1.0,)),
+                model_id="mixed-scale",
+                objective=lowered,
+                energy_scale=stranger,
+                optimum_coordinates=optimum,
+            )
+
+    def test_an_energy_scale_from_another_objective_on_the_same_polytope_is_refused(
+        self, tilted_simplex
+    ) -> None:
+        """The M7 hole. The reweighted objective shares the polytope exactly, so `polytope_key`
+        matches — only `objective_key` sets them apart, and on the toy the two ``s_J`` differ 100×.
+        Without this guard the polytope check above passes and the wrong scale is accepted."""
+        transform, reduced, lowered, scale, optimum = tilted_simplex
+
+        stranger = replace(scale, objective_key="a-key-from-a-different-objective-here")
+
+        with pytest.raises(SamplerError, match="different OBJECTIVE on this same polytope"):
             run_ladder(
                 transform,
                 reduced,

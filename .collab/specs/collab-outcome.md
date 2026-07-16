@@ -785,3 +785,60 @@ together and is safe, and it is the only production caller.
 
 This is a genuine defect of the **L0 cache key** and it belongs to M8, where the cache is actually
 built. It is out of M6's scope and is written into DEVELOPMENT_STATUS so it cannot be lost.
+
+---
+
+## M7 — Reweighted-L1 (frozen weights)  ·  Claude × Codex, 5 rounds, converged (AGREE)
+
+**Setting.** M7 is the first milestone where **two objectives exist on one polytope** — the base
+weights and the reweighted ones — which is precisely the shape of the M6 "two artifacts never
+computed against each other" bug. Before writing M7 code, that hole was reproduced: on the toy, `s_J`
+is **0.68** under the base objective and **0.0068** under the reweighted one, and M6's guard
+(`energy_scale.polytope_key != objective.polytope_key`) could not tell them apart — the two objectives
+share a `polytope_key` exactly. So the structural fixes came first, the loop second.
+
+**The λ fork left open since M3 — settled by measurement, not debate.** BUILD_PLAN §1.7 left M7 to
+choose whether the raw λ stays frozen at its base-weight value or is re-resolved from the current
+weights. It is not a close call: `λ*` is a function of `w`, and one reweighting step moves it from
+1.9e-3 to ~4e2 (default clip) or ~2.3e5 (wider), because `C_w` changes *units* (a sum of fluxes → very
+nearly a count of active reactions). Freezing λ collapses the effective pressure `λ/λ*(w)` from 0.5 to
+~4e-6 **and crashes M3's `z == |v|` LP gate by the second iteration** (deviation 25 at the default
+clip). So **λ is re-resolved every iteration: `λ_k = λ̃·λ*(w_k)`**. This also buys the invariance that
+makes the median renormalization a mathematical no-op (`w → cw ⇒ λ* → λ*/c ⇒ λw` unchanged), which is
+why step-4 normalization is a *conditioning* step that cannot move the target.
+
+**What Codex found (and what it did not).** Codex's first round ran in a **broken sandbox** (`bwrap`
+failed; it saw the pre-M7 public branch), so its line-level claims were verified against the real code
+rather than trusted. Points 1–2 (λ policy, median no-op) held. Point 3 (freeze completeness) — the
+concrete `with_weights(view)` attack was **refuted** (all `_frozen` callers pass owned fancy-index /
+`.copy()` buffers; verified at runtime: `owndata=True`, `writeable=False`, in-place mutation raises,
+owner mutation does not propagate); the residual "adversary flips `writeable` back" is accepted as out
+of scope per M5's "accident-proof, not adversary-proof" precedent. The rest were real:
+
+| # | Codex finding | Disposition |
+|---|---|---|
+| 5 | **Convergence tested the fluxes, not the weights.** A *global* relative `max\|Δv\|` is dominated by a large flux (1e3) and blind to a sparsity-critical one (1e-3) whose weight is still halving — so the loop could freeze weights one stale step short of the fixed point. | **Fixed.** Converge on `max_r \|w_{k+1,r} − w_{k,r}\|/max(...)`, a **per-reaction relative** metric that sees the small coordinate. The frozen artifact is the weights, so convergence must be about the weights. |
+| 6 | **`n_shed` is net cardinality only** — an active-set *replacement* (turn one off, one on) reports net 0 while the support changed, and the no-op warning fired spuriously on it. | **Fixed.** Report `n_turned_off`, `n_turned_on`, and `support_unchanged` (symmetric difference empty); the warning now keys on `support_unchanged`, not net count. |
+| 4/D (r2) | **`LPOptimum` carried `objective_key` but no `polytope_key`.** `content_key` hashes the objective's params, *not* the polytope's bounds/stoichiometry, so two polytopes differing only in bounds hash identically — and `s_J = J*(polytope A) − Q(J_B(W))` passed every check. | **Fixed.** Added `polytope_key` to `LPOptimum`; `choose_energy_scale` checks it. Reproduced the cross-join (same `objective_key`, different `polytope_key`) and confirmed it is now refused. |
+| B (r2) | The weight-change denominator was claimed `≥ clip_min`; after median normalization it is bounded by `clip_min/clip_max` (the ratio), and config allowed any finite ratio → underflow. | **Fixed.** Config caps the clip ratio at 1e9 (default [1e-3,1e3] is 1e6; LP breaks at 1e12); `_relative_weight_change` returns `inf` (loud non-convergence) on a non-finite/zero denominator. |
+| 3/D (r3) | **`warmup_fluxes` was an unkeyed positional array** — the *third* input to `s_J = J* − Q_q(J(W))`. A same-shaped support set from the wrong polytope silently changes `s_J`. | **Fixed.** `choose_energy_scale` gains a **required** `warmup_polytope_key`, checked against the objective; production callers pass `geometry.polytope_key` (the `ReducedGeometry` is keyed). |
+
+**The one point held to consensus — `optimum_coordinates` (r4→r5).** Codex flagged it as a fourth
+unkeyed model-derived input to `run_ladder`. **Held, and Codex conceded (AGREE).** It is an
+initialization *hint*: blended as one vertex of a Dirichlet convex combination and then made
+bound-and-chord-feasible (or the run raises), it enters *only* the start state — never the kernel,
+objective, `s_J`, or traces. So unlike the `s_J` joins it **cannot change the invariant target**; a
+wrong hint only seeds a poorer start, which is *observable* via feasibility and R̂/ESS. Keying it would
+imply it defines the distribution, which it does not. The decision: **document the boundary, do not key
+it** — the docstring now states the exact limits Codex named (feasibility only to `feasibility_tol`; a
+bad hint costs convergence time not correctness, and can raise rather than mislead silently; R̂/ESS are
+evidence not proof).
+
+**The invariant, restated for M7.** Every input to the `s_J` subtraction is now keyed on *both* the
+objective and the polytope, and cross-checked before a single `J(W)` is formed: the `LPOptimum` carries
+`objective_key` + `polytope_key`, the `ReducedObjective` carries both, the warm-up array's key is
+passed explicitly, and `run_ladder` re-checks the `EnergyScale` and transform against the objective.
+The frozen weight buffers are physically read-only; the reweighter structurally cannot import the
+sampler (and vice-versa), so a weight cannot move mid-chain. λ, weights and `s_J` are all rebuilt from
+the **frozen** final weights — the fixed point the converged loop actually solved, not a rebuild that
+could differ in its last ulp.

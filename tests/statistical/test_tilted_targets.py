@@ -90,7 +90,11 @@ class Tilted:
         # for. `warmup_range` gets its own tests; mixing the two here would leave a failing KS test
         # ambiguous between "the sampler is wrong" and "s_J is not what I assumed".
         self.energy_scale = choose_energy_scale(
-            self.reduced_objective, geometry.support_points, j_star=self.j_star, mode=energy_scale
+            self.reduced_objective,
+            geometry.support_points,
+            optimum=solution.optimum,
+            warmup_polytope_key=geometry.polytope_key,
+            mode=energy_scale,
         )
         self.kappa = beta / energy_scale
 

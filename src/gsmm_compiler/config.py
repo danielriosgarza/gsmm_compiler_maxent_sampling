@@ -28,6 +28,16 @@ class ConfigError(ValueError):
     """The configuration is malformed, has unknown keys, or violates a stated constraint."""
 
 
+_MAX_WEIGHT_CLIP_RATIO = 1e9
+"""Largest ``weight_clip_max / weight_clip_min`` M7's reweighting will accept.
+
+The default clip [1e-3, 1e3] has ratio 1e6 and is healthy; ratio 1e12 was measured to break the
+Charnes–Cooper ``λ*`` LP, and after median renormalization the smallest weight is bounded by the
+*ratio*, not by ``clip_min``, so an unbounded ratio can underflow the reweighting fixed-point metric
+(Codex, M7 review round 2). 1e9 sits an order of magnitude above the working default and well below
+the failure point."""
+
+
 DEFAULT_NEAR_ZERO_THRESHOLDS: tuple[float, ...] = (1e-9, 1e-6, 1e-3, 1e-1, 1.0)
 """Declared thresholds for *analysing* near-zero fluxes (spec §3.7). Never used by the chain.
 
@@ -97,9 +107,46 @@ class ObjectiveConfig:
     reweighting_enabled: bool = False
     """M7. Weights are frozen before sampling begins — never updated from chain state."""
     reweighting_epsilon: float = 1e-6
+    """``ε`` in ``w_r ← w_base/(|v_r| + ε)``. Bounds the update where ``v_r`` is zero.
+
+    At the default clip it is **inert**: it caps the raw weight at ``1/ε = 1e6``, and
+    `weight_clip_max` then caps it again at 1e3. ε and the ceiling are two guards on the same
+    singularity, and the tighter one wins. Kept because spec §13 asks for it, and because a caller
+    who widens the clip re-arms it.
+    """
     reweighting_max_iterations: int = 10
     weight_clip_min: float = 1e-3
     weight_clip_max: float = 1e3
+    """Clip limits for the raw update (spec §13 step 3), applied **before** normalization.
+
+    **The ceiling is not a safety rail — it decides whether the method does anything at all.** The
+    raw update ``1/(|v|+ε)`` maps "off" (``|v| ≈ 0``) to ``1/ε``, and "nearly off" (``|v| ≈ 1e-3``)
+    to ``≈1e3``. A ceiling *below* the nearly-off band collapses the two into one value, and the
+    whole point of reweighting is the distinction between them. Measured on the example model at
+    λ̃ = 0.25 (base-L1 optimum: 134 active reactions):
+
+    | clip | active | λw dynamic range |
+    |---|---|---|
+    | [1e-2, 1e2] | **134 — sheds nothing** | 1e4 |
+    | **[1e-3, 1e3]** | **131** | **1e6** |
+    | [1e-4, 1e4] | 131 (identical μ, J) | 1e7 |
+    | [1e-6, 1e6] | 131 | 1e9 — Charnes–Cooper LP fails on a mild rescale |
+
+    So a too-tight clip **silently turns reweighted-L1 back into plain L1**: LP healthy, weights
+    deterministic, loop converged, nothing shed, no error. The default is the widest range whose
+    answer has stopped moving ([1e-4, 1e4] agrees exactly), which keeps ``λw``'s dynamic range at a
+    solvable 1e6. `ReweightingReport.n_shed` reports what the run actually shed, so a no-op says so.
+    """
+    reweighting_active_tol: float = 1e-9
+    """``|v_r| > tol`` ⇒ *active*, for the **convergence test only** (spec §13 step 5).
+
+    This never touches a flux. The weights are computed from the exact ``|v_r|``, never from a
+    snapped one — CLAUDE.md forbids snapping small fluxes to zero, and thresholds are for analysis.
+    This one decides only when the active set has stopped moving.
+    """
+    reweighting_solution_tol: float = 1e-8
+    """Relative ``max|Δv|`` between consecutive LP optima. Both this **and** the active set must
+    settle before the loop stops (spec §13 step 5 asks for both)."""
 
     def __post_init__(self) -> None:
         if self.l1_penalty_scaled < 0.0:
@@ -121,10 +168,26 @@ class ObjectiveConfig:
                 "objective weight clips must satisfy 0 < min < max, got "
                 f"{self.weight_clip_min} / {self.weight_clip_max}"
             )
+        if self.weight_clip_max / self.weight_clip_min > _MAX_WEIGHT_CLIP_RATIO:
+            # After median renormalization the smallest positive weight is bounded only by
+            # ``clip_min/clip_max`` (Codex, M7 review round 2) — NOT by ``clip_min`` — so an extreme
+            # ratio can underflow the reweighting convergence metric and, well before that, degrade
+            # the Charnes–Cooper λ* LP (measured to fail at ratio 1e12; 1e6 is healthy). Cap it so a
+            # runaway config is a loud error, not a silent NaN in the fixed-point test.
+            raise ConfigError(
+                f"objective weight-clip ratio {self.weight_clip_max / self.weight_clip_min:.3g} "
+                f"exceeds {_MAX_WEIGHT_CLIP_RATIO:.0g}; such a range underflows the reweighting "
+                "convergence metric and degrades the λ* LP. Narrow the clip (the default "
+                "[1e-3, 1e3] has ratio 1e6)."
+            )
         if self.reweighting_epsilon <= 0.0:
             raise ConfigError("objective.reweighting_epsilon must be > 0")
         if self.reweighting_max_iterations < 1:
             raise ConfigError("objective.reweighting_max_iterations must be >= 1")
+        if not isfinite(self.reweighting_active_tol) or self.reweighting_active_tol <= 0.0:
+            raise ConfigError("objective.reweighting_active_tol must be finite and > 0")
+        if not isfinite(self.reweighting_solution_tol) or self.reweighting_solution_tol <= 0.0:
+            raise ConfigError("objective.reweighting_solution_tol must be finite and > 0")
 
 
 @dataclass(frozen=True)

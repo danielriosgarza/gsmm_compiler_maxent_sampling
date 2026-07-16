@@ -69,6 +69,19 @@ class LPCheckError(RuntimeError):
     """A solved LP failed one of the §12 result checks. The solution is not trusted."""
 
 
+def _frozen(array: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Make a weight buffer physically read-only. See `rounding._freeze` for the full reasoning.
+
+    Kept local rather than imported: `sparse_objective` is importable by an MCMC worker without
+    loading HiGHS (§1.2), and `rounding` reaches the solver through `affine_geometry`.
+
+    Every caller here freezes a buffer it has just created (a fancy-index copy or a fresh product),
+    so this never reaches back and freezes an array its owner still expects to write.
+    """
+    array.flags.writeable = False
+    return array
+
+
 class IncompatibleObjectiveError(ObjectiveError):
     """The objective and the polytope do not describe the same model."""
 
@@ -221,7 +234,7 @@ class SparseFluxObjective:
             biomass_index=self.biomass_index,
             l1_penalty=self.l1_penalty,
             penalty_mask=self.penalty_mask,
-            weights=weight_vector,
+            weights=_frozen(weight_vector),
         )
 
     def content_key(self) -> str:
@@ -306,7 +319,7 @@ class SparseFluxObjective:
             biomass_index=polytope.biomass_index,
             l1_penalty=l1_penalty,
             penalty_mask=mask,
-            weights=weight_vector,
+            weights=_frozen(weight_vector),
         )
 
 
@@ -331,6 +344,30 @@ class LPOptimum:
     max_bound_violation: float
     simplex_iterations: int
     elapsed_seconds: float
+
+    objective_key: str
+    """`SparseFluxObjective.content_key` of the objective this optimum was solved for.
+
+    ``J*`` is a **float**, and a float remembers nothing. Until M7 that was harmless, because a run
+    had exactly one objective and every ``J*`` in it necessarily came from that one. M7 creates a
+    *second* objective on the same polytope — the reweighted one — and then ``s_J = J* − Q_q(J(W))``
+    can be assembled from a ``J*`` belonging to one and a ``J(W)`` belonging to the other. The
+    subtraction succeeds. It returns a plausible number. It is the difference of two functions.
+
+    Carrying the key turns that from *computable* into *refused* (`choose_energy_scale`).
+    """
+
+    polytope_key: str
+    """`ReducedPolytope.content_key` of the polytope this optimum was solved on.
+
+    ``objective_key`` alone is **not enough**, and the gap is subtle (Codex, M7 review round 2):
+    `SparseFluxObjective.content_key` hashes the biomass id, λ, penalty indices and weights — *not*
+    the polytope's bounds or stoichiometry. Two different polytopes with the same reaction order,
+    biomass, λ and weights therefore produce the **same** ``objective_key`` while their ``J*``
+    differ.
+    Without this field, ``s_J = J*(solved on polytope A) − Q_q(J(W over polytope B))`` passes every
+    key check `choose_energy_scale` makes and silently rescales the ladder — the M6 disease, one
+    level up. `choose_energy_scale` checks this against the objective's own `polytope_key` too."""
 
     @property
     def j_star(self) -> float:
@@ -439,6 +476,8 @@ class SparseObjectiveLP:
             max_bound_violation=violation,
             simplex_iterations=solution.simplex_iterations,
             elapsed_seconds=solution.elapsed_seconds,
+            objective_key=self.objective.content_key(),
+            polytope_key=self.reduced.content_key(),
         )
 
 
@@ -1028,6 +1067,22 @@ class ReducedObjective:
     that were never computed against each other. `run_ladder` refuses the pair.
     """
 
+    objective_key: str
+    """`SparseFluxObjective.content_key` of the objective this was lowered from — the **weights**,
+    not just the polytope.
+
+    `polytope_key` answers "which model?". This answers "which *objective on* that model?", and
+    until M7 nothing needed to ask, because a run had exactly one. **M7's whole job is to produce a
+    second one** — same reactions, same bounds, same biomass, different ``w`` and different λ — so
+    the two share a `polytope_key` *exactly*. On the toy, ``s_J`` is 0.68 under the base weights and
+    0.0068 under the reweighted ones: pair the wrong one and every rung of the ladder is 100× colder
+    than it claims, while ``J`` still rises monotonically with β and every diagnostic agrees —
+    because the chain really is maximizing the thing the trace measures.
+
+    That is the M6 defect exactly (*two artifacts never computed against each other, silently
+    joined*), and M7 is the milestone that arms it. So the objective is keyed too.
+    """
+
     def __post_init__(self) -> None:
         if self.weights.shape != (self.n_free,):
             raise ObjectiveError(
@@ -1122,11 +1177,18 @@ def lower_objective(
 
     fixed = objective.evaluate(reduced.offset)
 
+    # The chain samples against these for its whole life. `@dataclass(frozen=True)` freezes the
+    # *binding*, not the buffer (the M5 lesson), and M7's entire safety argument is that ``w`` does
+    # not move once sampling starts — a weight that shifts mid-chain retargets every conditional and
+    # destroys stationarity, silently. So freeze the buffers, and let the interpreter enforce it.
+    kernel_weights = _frozen(weights_free[bending])
+    weights_free = _frozen(weights_free)
+
     return ReducedObjective(
         line=L1Objective(
             biomass_index=reduced.biomass_index,
             penalized_indices=bending,
-            weights=np.ascontiguousarray(weights_free[bending], dtype=VALUE_DTYPE),
+            weights=kernel_weights,
             lam=objective.l1_penalty,
         ),
         weights=weights_free,
@@ -1135,6 +1197,7 @@ def lower_objective(
         l1_penalty=objective.l1_penalty,
         n_free=reduced.n_free,
         polytope_key=reduced.content_key(),
+        objective_key=objective.content_key(),
     )
 
 
@@ -1212,12 +1275,25 @@ class EnergyScale:
     worthless, and only this number says which one you got."""
 
     polytope_key: str
-    """`ReducedPolytope.content_key` of the objective this scale was calibrated from.
+    """`ReducedPolytope.content_key` of the polytope this scale was calibrated on."""
 
-    ``s_J`` is a property of *one* objective on *one* polytope — it is the range ``J`` spans over
-    that polytope's warm-up points. Pair it with a different objective and ``β`` silently means
-    something else on every rung, which is the whole failure ``s_J`` exists to prevent. Keyed so
-    `maxent_sampler.run_ladder` can refuse the pair. (Codex, M6 review round 6.)
+    objective_key: str
+    """`SparseFluxObjective.content_key` of the **objective** it was calibrated from.
+
+    M6 keyed this artifact on the *polytope* while its own docstring said ``s_J`` "is a property of
+    one objective on one polytope". Both statements were in the file at once, and the second was the
+    true one; the guard implemented the first. It never fired, because until now a run had exactly
+    one objective per polytope — so the two keys were distinctions without a difference.
+
+    **M7 makes them differ.** The reweighted objective has the same reactions, the same bounds and
+    the same biomass as the base one, so it shares the `polytope_key` *exactly* — and on the toy its
+    ``s_J`` is 0.0068 where the base objective's is 0.68. A hundredfold. Borrowed across, every β on
+    the ladder names a selection pressure two orders of magnitude from the one it reports, and
+    nothing downstream can see it: ``J`` still rises monotonically with β, because the chain really
+    is maximizing the thing the trace measures.
+
+    (Codex, M6 review round 6 — got the invariant right and the key wrong. Found by M7's
+    reproduction, `test_energy_scale_refuses_a_borrowed_objective`.)
     """
 
     fell_back: bool
@@ -1239,6 +1315,7 @@ class EnergyScale:
             "warmup_max_j": self.warmup_max_j,
             "energy_scale_resolution": self.resolution,
             "energy_scale_polytope_key": self.polytope_key,
+            "energy_scale_objective_key": self.objective_key,
             "energy_scale_fell_back": self.fell_back,
         }
 
@@ -1259,7 +1336,8 @@ def choose_energy_scale(
     objective: ReducedObjective,
     warmup_fluxes: NDArray[np.float64],
     *,
-    j_star: float,
+    optimum: LPOptimum,
+    warmup_polytope_key: str,
     mode: str | float = "warmup_range",
     quantile: float = DEFAULT_ENERGY_QUANTILE,
     fallback: float | None = None,
@@ -1269,6 +1347,22 @@ def choose_energy_scale(
     ``warmup_fluxes`` is ``(K, n_free)`` — M4's **support points**, the vertices the geometry has
     already solved for. They are the cheapest honest sample of how far ``J`` ranges over this
     polytope, and they cost no extra LP.
+
+    **``warmup_polytope_key`` is required, not decorative.** The warm-up array is the *third* input
+    to a subtraction that must all come from one polytope (``s_J = J* − Q_q(J(W))``), and unlike the
+    optimum and the objective it is a bare ``(K, n_free)`` array with no identity of its own. Two
+    polytopes with the same free dimension produce same-shaped support sets, so a warm-up array from
+    the wrong one is silently evaluable and silently changes ``s_J`` (Codex, M7 review round 3). It
+    comes from a keyed `affine_geometry.ReducedGeometry`; pass that geometry's ``polytope_key`` and
+    it is checked against the objective before a single ``J(W)`` is formed.
+
+    **``J*`` arrives as a keyed `LPOptimum`, not as a float, and that is the point.** ``s_J = J* −
+    Q_q(J(W))`` is a *difference of two evaluations of J*, and it is only a range if both are the
+    same ``J``. A float carries no evidence of which objective produced it, so before M7 the two
+    could not be checked against each other — and before M7 they never had to be, because a run held
+    exactly one objective. M7 holds two. The subtraction of one objective's ``J*`` from another's
+    quantile is arithmetically fine, returns a plausible number, and is meaningless; on the toy it
+    gives 1.22 where the honest answers are 0.68 and 0.0068. So the key is checked here.
 
     ``s_J = J* − Q_q(J(W))`` measures ``β`` in units of *the objective range this model actually
     spans*, rather than in units of its raw numerical magnitude — so ``β = 2`` names a comparable
@@ -1290,6 +1384,40 @@ def choose_energy_scale(
     run. The caller who wants one declares it (``sampler.energy_scale_fallback``), and the manifest
     records that it was used.
     """
+    if optimum.objective_key != objective.objective_key:
+        raise IncompatibleObjectiveError(
+            "the LP optimum was solved for a different objective than the one whose J is being "
+            f"measured (optimum.objective_key = {optimum.objective_key[:16]}…, "
+            f"objective.objective_key = {objective.objective_key[:16]}…). ``s_J = J* − Q_q(J(W))`` "
+            "would subtract a quantile of one objective from the optimum of another — the two "
+            "share a polytope, so every shape check passes and the answer is a plausible number "
+            "that is the difference of two different functions. Re-solve the LP against this "
+            "objective (`solve_sparse_objective`), which is what M7's reweighting does after it "
+            "freezes the weights."
+        )
+    if optimum.polytope_key != objective.polytope_key:
+        raise IncompatibleObjectiveError(
+            "the LP optimum was solved on a different polytope than this objective was lowered "
+            "from "
+            f"(optimum.polytope_key = {optimum.polytope_key[:16]}…, objective.polytope_key = "
+            f"{objective.polytope_key[:16]}…). The two objectives can hash identically — the "
+            "objective key does not cover the polytope's bounds or stoichiometry — so ``J*`` from "
+            "one polytope would be subtracted from a warm-up quantile of another, rescaling every "
+            "β "
+            "on the ladder while every shape and objective-key check passes (Codex, M7 review "
+            "round 2). Solve the LP on the same polytope the warm-up points came from."
+        )
+    if warmup_polytope_key != objective.polytope_key:
+        raise IncompatibleObjectiveError(
+            "the warm-up points came from a different polytope than this objective was lowered "
+            f"from (warmup_polytope_key = {warmup_polytope_key[:16]}…, objective.polytope_key = "
+            f"{objective.polytope_key[:16]}…). ``Q_q(J(W))`` would then be a quantile of ``J`` "
+            "the wrong support set — same shape, different geometry — and ``s_J`` would silently "
+            "rescale the ladder (Codex, M7 review round 3). Pass the `polytope_key` of the "
+            "`ReducedGeometry` whose `support_points` you are handing in."
+        )
+    j_star = optimum.j_star
+
     if not isinstance(mode, str):
         declared = float(mode)
         if not np.isfinite(declared) or declared <= 0.0:
@@ -1304,6 +1432,7 @@ def choose_energy_scale(
             warmup_max_j=None,
             resolution=None,
             polytope_key=objective.polytope_key,
+            objective_key=objective.objective_key,
             fell_back=False,
         )
 
@@ -1365,5 +1494,6 @@ def choose_energy_scale(
         warmup_max_j=float(np.max(j_warmup)),
         resolution=resolution,
         polytope_key=objective.polytope_key,
+        objective_key=objective.objective_key,
         fell_back=fell_back,
     )

@@ -122,6 +122,15 @@ class TestConstraints:
         with pytest.raises(ConfigError, match="0 < min < max"):
             from_dict({"objective": {"weight_clip_min": 10.0, "weight_clip_max": 1.0}})
 
+    def test_an_extreme_weight_clip_ratio_is_rejected(self) -> None:
+        """After median renormalization the smallest weight is bounded by the *ratio*, not by
+        clip_min, so an unbounded ratio underflows M7's fixed-point metric (Codex, M7 review r2)."""
+        with pytest.raises(ConfigError, match="clip ratio"):
+            from_dict({"objective": {"weight_clip_min": 1e-20, "weight_clip_max": 1e20}})
+
+    def test_the_default_clip_ratio_is_accepted(self) -> None:
+        from_dict({"objective": {"weight_clip_min": 1e-3, "weight_clip_max": 1e3}})
+
 
 class TestEcho:
     def test_echo_is_valid_toml_that_reloads_to_the_same_config(

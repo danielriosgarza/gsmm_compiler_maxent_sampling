@@ -111,7 +111,8 @@ def ladder(transform, reduced, geometry, objective):  # type: ignore[no-untyped-
     scale = choose_energy_scale(
         lowered,
         geometry.support_points,
-        j_star=solution.optimum.j_star,
+        optimum=solution.optimum,
+        warmup_polytope_key=geometry.polytope_key,
         mode="warmup_range",
     )
     optimum = transform.to_coordinates(reduced.to_reduced(solution.optimum.v_full))

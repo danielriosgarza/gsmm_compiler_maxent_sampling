@@ -294,6 +294,19 @@ def dispersed_start(
     projection — not ``v*`` — is what joins the hull, and it may sit a rounding error outside a
     bound. That is precisely the case the shrink loop below already exists to absorb, and the start
     it finally returns is verified feasible regardless of where it came from.
+
+    **``optimum_coordinates`` is an initialization *hint*, deliberately NOT a keyed artifact** (M7
+    `/collab`, settled). It is the one model-derived input that carries no `polytope_key`, and that
+    is a considered choice: it enters *only* the start state — blended as one vertex of a Dirichlet
+    convex combination, then made bound- and chord-feasible (or the run raises) — and never the
+    transition kernel, the objective, ``s_J``, or the traces. So unlike the keyed joins around
+    ``s_J``, a hint from the wrong polytope **cannot change the invariant target**; at worst it
+    seeds a poorer start. The boundaries, stated exactly (Codex, M7 review round 5): feasibility
+    holds only to ``feasibility_tol``, not in exact arithmetic; a wrong hint changes convergence
+    *time*, not the stationary law; a badly wrong hint can be much worse than "slightly", and may
+    exhaust the shrink loop and raise rather than mislead silently; and the convergence diagnostics
+    are *evidence*, not a proof — a bias shared by every chain can evade R-hat. Keying it would
+    imply it defines the distribution, which it does not; the honest treatment is this boundary.
     """
     if transform.is_singleton:
         return np.zeros(0, dtype=VALUE_DTYPE), 1.0
@@ -1186,10 +1199,23 @@ def _check_bindings(
         )
     if energy_scale.polytope_key != objective.polytope_key:
         raise SamplerError(
-            "the energy scale was calibrated from a different objective. ``s_J`` is the range "
-            "``J`` spans over *this* objective on *this* polytope; borrowed from another, every β "
-            "on the ladder silently names a different selection pressure — the exact failure "
-            "``s_J`` exists to prevent. Rebuild it with `sparse_objective.choose_energy_scale`."
+            "the energy scale was calibrated on a different polytope. ``s_J`` is the range ``J`` "
+            "spans over *this* objective on *this* polytope; borrowed from another, every β on the "
+            "ladder silently names a different selection pressure — the exact failure ``s_J`` "
+            "exists to prevent. Rebuild it with `sparse_objective.choose_energy_scale`."
+        )
+    if energy_scale.objective_key != objective.objective_key:
+        raise SamplerError(
+            "the energy scale was calibrated from a different OBJECTIVE on this same polytope "
+            f"(energy_scale.objective_key = {energy_scale.objective_key[:16]}…, "
+            f"objective.objective_key = {objective.objective_key[:16]}…). The two agree on every "
+            "reaction, bound and biomass index — that is why the polytope check above passes — and "
+            "differ only in ``w`` and λ, which is precisely what M7's reweighting changes. On the "
+            "toy, ``s_J`` is 0.68 under the base weights and 0.0068 under the reweighted ones, so "
+            "a borrowed scale puts every rung of the ladder two orders of magnitude from the "
+            "selection pressure it reports — and no downstream check can see it, because ``J`` "
+            "still rises monotonically with β. Rebuild ``s_J`` from the FROZEN weights: that is "
+            "what `reweighting.reweight_objective` returns, already done."
         )
 
 
