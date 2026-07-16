@@ -253,6 +253,100 @@ class TestCanonicalModel:
         )
 
 
+def _valid_model(*, upper_bound: float = 10.0, model_id: str = "m") -> Any:
+    """A minimal mass-balanced cobra model, assembled in memory (no file behind it)."""
+    from cobra import Metabolite, Model, Reaction
+
+    model = Model(model_id)
+    a, b = Metabolite("A", compartment="c"), Metabolite("B", compartment="c")
+    r_in = Reaction("R_in")
+    r_in.add_metabolites({a: 1.0})
+    r_in.bounds = (0.0, upper_bound)
+    r_out = Reaction("R_out")
+    r_out.add_metabolites({a: -1.0, b: 1.0})
+    r_out.bounds = (0.0, 10.0)
+    r_sink = Reaction("R_sink")
+    r_sink.add_metabolites({b: -1.0})
+    r_sink.bounds = (0.0, 10.0)
+    model.add_reactions([r_in, r_out, r_sink])
+    model.objective = r_out
+    return model
+
+
+class TestL0KeyIsContentAddressedNotFileAddressed:
+    """The M8-opening defect: `build_canonical_model` used to hash `source_path` while freezing a
+    *separately supplied* model, so a model could inherit an unrelated file's cache identity. The
+    L0 key is now derived from the model's own frozen content, which closes every variant of it.
+    """
+
+    def test_mutating_a_model_changes_its_l0_key_under_the_same_source_path(
+        self, toy_path: Path
+    ) -> None:
+        """The exact defect: same file named, different content ⇒ the key must move.
+
+        The old file-hash key would have returned the *same* ``l0_key`` here (both calls hash
+        ``toy_path``), silently stamping the mutated model with the pristine file's identity.
+        """
+        model = load_model(toy_path)
+        before = build_canonical_model(model, toy_path).l0_key
+
+        model.reactions.get_by_id("R1").upper_bound = 500.0  # mutate in memory, keep the same path
+        after = build_canonical_model(model, toy_path).l0_key
+
+        assert before != after
+
+    def test_two_unrelated_models_do_not_collide_via_a_shared_source_path(
+        self, tmp_path: Path
+    ) -> None:
+        source = tmp_path / "shared.json"  # a name both calls point at; neither is hashed for id
+        first = build_canonical_model(_valid_model(upper_bound=10.0), source)
+        second = build_canonical_model(_valid_model(upper_bound=20.0), source)
+
+        assert first.l0_key != second.l0_key
+
+    def test_l0_key_ignores_reformatting_that_leaves_the_content_identical(
+        self, tmp_path: Path, toy_path: Path
+    ) -> None:
+        """Content-addressing gives a beneficial cache *hit* a file hash would have missed.
+
+        Two files with identical parsed content but different bytes (whitespace) produce the same
+        ``l0_key`` — the downstream artifacts would be byte-for-byte identical, so a miss here would
+        only waste work. The recorded ``source_sha256`` still differs; it is provenance, not id.
+        """
+        compact = _write(tmp_path, _toy_dict(toy_path))
+        pretty = tmp_path / "pretty.json"
+        pretty.write_text(json.dumps(_toy_dict(toy_path), indent=4))
+
+        compact_model = load_canonical_model(compact)
+        pretty_model = load_canonical_model(pretty)
+
+        assert compact_model.l0_key == pretty_model.l0_key
+        assert compact_model.source_sha256 != pretty_model.source_sha256  # bytes differ
+
+    def test_l0_key_depends_on_model_id_because_it_names_the_rng_streams(self) -> None:
+        a = build_canonical_model(_valid_model(model_id="strain_a"))
+        b = build_canonical_model(_valid_model(model_id="strain_b"))
+
+        assert a.l0_key != b.l0_key
+
+    def test_source_sha256_is_recorded_only_on_the_trusted_load_path(
+        self, toy_path: Path
+    ) -> None:
+        """A directly built model has no proven file behind it, so no file hash is stored."""
+        built = build_canonical_model(load_model(toy_path), toy_path)
+        assert built.source_sha256 is None
+
+        loaded = load_canonical_model(toy_path)
+        assert loaded.source_sha256 is not None and len(loaded.source_sha256) == 64
+
+    def test_a_model_assembled_with_no_source_path_still_gets_an_identity(self) -> None:
+        canonical = build_canonical_model(_valid_model(model_id="anon"))
+        assert canonical.source_path is None
+        assert canonical.source_sha256 is None
+        assert len(canonical.l0_key) == 64
+        assert canonical.report()["source_path"] is None
+
+
 class TestModelReport:
     def test_report_counts_the_toy_network(self, toy_canonical: CanonicalModel) -> None:
         report = toy_canonical.report()

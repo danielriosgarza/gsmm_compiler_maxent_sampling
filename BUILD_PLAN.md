@@ -52,7 +52,8 @@ bytes. Geometry is β-independent, so it is computed **once** and reused across 
 ```
 source file ──sha256──┐
                       ▼
-[L0] Parsed model IR      key = sha256(file) + cobra_version + parser_schema_version
+[L0] Parsed model IR      key = content_key(model_id, polytope content, exchange mask,
+                                            cobra_version, parser_schema_version)   (M8: content-addressed)
    frozen IDs, coeffs, bounds, metadata (raw file hash alone is NOT enough — parser semantics matter)
                       ▼
 [L1] Reduced polytope IR  key = hash(canonical IDs, CSC arrays, bounds, user overrides,
@@ -73,6 +74,17 @@ source file ──sha256──┐
 ```
 
 Rules (all adopted from the collaboration):
+- **L0 is content-addressed, not file-hash-addressed** *(M8; refines the original `sha256(file)`
+  key)*. `build_canonical_model` accepts a cobra `Model` that may have been assembled or mutated in
+  memory, and a file hash cannot prove such a model came from the file whose bytes it hashes — so the
+  old key let a model inherit **another file's L0 identity** (a model loaded, mutated, and re-frozen
+  against the same path would keep the pristine file's key). The L0 key now fingerprints the IR the
+  model *actually holds* (`model_id`, the polytope's `content_key`, the exchange mask) folded with the
+  cobra + parser versions. A file's `sha256` is still recorded as **provenance** on the trusted
+  `load_canonical_model` path (which both hashes and parses one file, so the correspondence is real),
+  but it is never the identity. M8's cache computes a **file-lookup key** (`sha256(file)+cobra+schema`)
+  separately, to skip re-parsing across runs, and validates the loaded artifact's content L0 key on
+  load — so a false lookup hit is caught, never trusted.
 - **Provenance in every key**: parser + code + artifact-schema versions, dtype/endianness, numpy
   version. A refactor that changes array semantics must miss the cache, not silently load stale bytes.
 - **Validate on load**: shape, dtype, finite-check, and a stored content hash for every array.
@@ -456,7 +468,7 @@ step that rescaled the pressure by an arbitrary median every iteration. Recorded
 | **M5** | Rounding + β=0 sampler | support-covariance Cholesky rounding (ridge escalation), coordinate hit-and-run at β=0, multi-chain, feasibility + convergence diagnostics | uniform analytic targets reproduced; transform-invariance of moments; positive chords at start; ‖ST‖≈0; **zero inner-loop HiGHS solves** |
 | **M6** | Positive-β maxent sampler | exact piecewise-exp line conditional, explicit β-ladder, objective traces (μ,C,J, norm log-energy), concentration tests | truncated-exponential + truncated-Laplace analytic targets; mean `J` nondecreasing in β within MC uncertainty; large-β stress; 1D quadrature cross-check in reduced coord |
 | **M7** ✅ | Reweighted-L1 (frozen weights) | iterative reweighting `w_r ← w_base/(\|v_r\|+ε)` with clipping + median-renormalization, save every weight vector + LP solution, **freeze final weights before sampling**, rebuild objective/LP-optimum/`s_J` (L2 cache) from frozen weights. **λ re-resolved each iteration** (`λ_k = λ̃·λ*(w_k)`, §1.7); every `s_J` input keyed on objective+polytope (§1.6.5) | deterministic weights for fixed seed; active-set + **weight fixed point** converge; weights frozen ⇒ objective `J` unchanged during MCMC (reweighter cannot import sampler); labeled experimental (not exact cardinality); sampler reproduces analytic targets under the reweighted `J`. **PASSED 2026-07-16** (733 tests; `/collab` 5 rounds AGREE) |
-| **M8** | Cache, restart, batch orchestration & production | 4-layer cache, per-chain markers + writer-claim locking, atomic rename + fsync, **batch runner over a models manifest**, one global process pool over `(model, β, chain)`, worker thread-limit env, per-model run dirs + **cross-model aggregation**, manifests + diagnostics + `COMPLETE` | kill-and-resume resumes only missing `(model,chain)` units; partial batch yields valid cross-model tables; concurrent-writer safe; corrupted-artifact rejected; same-env deterministic traces; full batch runs on ≥2 strains with documented resources |
+| **M8** ✅ | Cache, restart, batch orchestration & production | 4-layer cache, per-chain markers + writer-claim locking, atomic rename + fsync, **batch runner over a models manifest**, one global process pool over `(model, β, chain)`, worker thread-limit env, per-model run dirs + **cross-model aggregation**, manifests + diagnostics + `COMPLETE` | kill-and-resume resumes only missing `(model,chain)` units; partial batch yields valid cross-model tables; concurrent-writer safe; corrupted-artifact rejected; same-env deterministic traces; full batch runs on ≥2 strains with documented resources. **PASSED 2026-07-16** (content-addressed cache store with atomic-mkdir writer claim; `spawn` pool workers import no solver; serial==pool byte-identical; L0 key made content-addressed) |
 | **M9** | Performance & GSMM hardening | benchmark suite (parse→CSC→passModel→first LP→warm-start LPs→sparse LP→geometry→rounding→β=0 sps→β>0 sps→breakpoint dist→output), worker-count sweep {1,2,4,7,14} across the batch, allocation + sort profiling, `reduced` storage-mode validation | benchmark report produced; all performance assertions hold (no per-step HiGHS, no scipy, no Python loop in chord, no element-wise highspy extraction, no full reconstruction every step) |
 | **M10** | Deferred extensions | pilot rerounding + **pilot-based s_J** (split bootstrap-geometry → β=0 pilot → {final T, s_J} DAG); β→performance calibration; parallel tempering; slice line kernel; downstream mode-feature extraction | each behind its own tests; none alters the validated v1 target distribution |
 

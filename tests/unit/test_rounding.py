@@ -17,6 +17,7 @@ from gsmm_compiler.flux_polytope import ReducedPolytope
 from gsmm_compiler.line_geometry import chord_on_support, feasible_chord
 from gsmm_compiler.rounding import (
     CoordinatePrecompute,
+    RoundedTransform,
     RoundingError,
     build_transform,
 )
@@ -474,3 +475,64 @@ class TestTheRoundTwoHardening:
 
         assert first.center is not second.center
         assert first.transform is not second.transform
+
+
+class TestCacheBundle:
+    """The L3 artifact serialization (M8): a cached transform must be exactly a rebuilt one."""
+
+    def test_bundle_roundtrip_reconstructs_an_equal_transform(
+        self, simplex_polytope: ReducedPolytope
+    ) -> None:
+        geometry = build_geometry(simplex_polytope, model_id="simplex")
+        transform = build_transform(geometry, simplex_polytope)
+
+        arrays, meta = transform.to_bundle()
+        rebuilt = RoundedTransform.from_bundle(arrays, meta, simplex_polytope)
+
+        assert rebuilt.content_key() == transform.content_key()
+        np.testing.assert_array_equal(rebuilt.transform, transform.transform)
+        np.testing.assert_array_equal(rebuilt.center, transform.center)
+        np.testing.assert_array_equal(rebuilt.support_coordinates, transform.support_coordinates)
+        assert rebuilt.diagnostics == transform.diagnostics  # frozen dataclass equality
+        # The precompute was rebuilt from T, not stored — it must still match every column.
+        rebuilt.precompute.validate(
+            rebuilt.transform, simplex_polytope.lower_bounds, simplex_polytope.upper_bounds
+        )
+
+    def test_bundle_produces_the_same_draws(self, simplex_polytope: ReducedPolytope) -> None:
+        """A chain on the rebuilt transform is bit-identical to one on the original."""
+        from gsmm_compiler.config import SamplerConfig
+        from gsmm_compiler.maxent_sampler import run_chain
+
+        geometry = build_geometry(simplex_polytope, model_id="simplex")
+        transform = build_transform(geometry, simplex_polytope)
+        arrays, meta = transform.to_bundle()
+        rebuilt = RoundedTransform.from_bundle(arrays, meta, simplex_polytope)
+
+        config = SamplerConfig(betas=(0.0,), n_chains=1, n_samples=50, burn_in=50)
+        original = run_chain(
+            transform, simplex_polytope, config=config, model_id="simplex", chain_index=0
+        )
+        cached = run_chain(
+            rebuilt, simplex_polytope, config=config, model_id="simplex", chain_index=0
+        )
+        np.testing.assert_array_equal(original.fluxes, cached.fluxes)
+
+    def test_from_bundle_refuses_a_different_polytope(
+        self, simplex_polytope: ReducedPolytope, coupled_box_polytope: ReducedPolytope
+    ) -> None:
+        geometry = build_geometry(simplex_polytope, model_id="simplex")
+        arrays, meta = build_transform(geometry, simplex_polytope).to_bundle()
+
+        with pytest.raises(RoundingError, match="different polytope"):
+            RoundedTransform.from_bundle(arrays, meta, coupled_box_polytope)
+
+    def test_from_bundle_refuses_a_tampered_array(
+        self, simplex_polytope: ReducedPolytope
+    ) -> None:
+        geometry = build_geometry(simplex_polytope, model_id="simplex")
+        arrays, meta = build_transform(geometry, simplex_polytope).to_bundle()
+        arrays["center"] = arrays["center"] + 1.0  # the stored content_key no longer matches
+
+        with pytest.raises(RoundingError, match="content key"):
+            RoundedTransform.from_bundle(arrays, meta, simplex_polytope)

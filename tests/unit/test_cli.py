@@ -84,6 +84,95 @@ def test_config_show_works_with_no_file(capsys: pytest.CaptureFixture[str]) -> N
     assert "[sampler]" in capsys.readouterr().out
 
 
+class TestMaxentCommands:
+    """The M8 pipeline commands, exercised on the toy network."""
+
+    def test_solve_lp_reports_the_resolved_penalty(
+        self, toy_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert main(["maxent", "solve-lp", str(toy_path)]) == 0
+        out = capsys.readouterr().out
+        assert "λ* (cliff)" in out
+        assert "J*" in out
+        assert "sparsity-dominated False" in out
+
+    def test_build_geometry_reports_the_dimension(
+        self, toy_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert main(["maxent", "build-geometry", str(toy_path)]) == 0
+        out = capsys.readouterr().out
+        assert "dimension d       2" in out
+        assert "span certificate  exhaustive" in out
+
+    def test_sample_then_diagnose(
+        self, toy_path: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        code = main(
+            [
+                "maxent",
+                "sample",
+                str(toy_path),
+                "--model-id",
+                "toy",
+                "--out",
+                str(tmp_path / "r"),
+                "--batch",
+                "b",
+                "--set",
+                "sampler.betas=[0.0,2.0]",
+                "--set",
+                "sampler.n_samples=40",
+                "--set",
+                "sampler.burn_in=40",
+                "--set",
+                "sampler.n_chains=2",
+                "--set",
+                "sampler.refresh_interval=20",
+            ]
+        )
+        assert code == 0
+        assert "complete  toy" in capsys.readouterr().out
+
+        diagnose = ["maxent", "diagnose", str(tmp_path / "r"), "--batch", "b", "--model-id", "toy"]
+        assert main(diagnose) == 0
+        diag = capsys.readouterr().out
+        assert "E[J] monotone" in diag
+        assert (tmp_path / "r" / "b" / "toy" / "diagnostics" / "diagnostics.json").is_file()
+
+    def test_batch_over_a_manifest_with_a_bad_strain_exits_nonzero(
+        self, toy_path: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        manifest = tmp_path / "m.tsv"
+        manifest.write_text(
+            f"model_path\tmodel_id\n{toy_path}\tgood\n/nope.json\tbroken\n"
+        )
+        code = main(
+            [
+                "maxent",
+                "batch",
+                str(manifest),
+                "--out",
+                str(tmp_path / "r"),
+                "--batch",
+                "b",
+                "--set",
+                "sampler.betas=[0.0]",
+                "--set",
+                "sampler.n_samples=30",
+                "--set",
+                "sampler.burn_in=30",
+                "--set",
+                "sampler.n_chains=2",
+                "--set",
+                "sampler.refresh_interval=15",
+            ]
+        )
+        assert code == 1  # one strain failed
+        out = capsys.readouterr().out
+        assert "complete  good" in out
+        assert "failed    broken" in out
+
+
 def test_model_inspect_missing_file(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         main(["model", "inspect", str(tmp_path / "nope.json")])

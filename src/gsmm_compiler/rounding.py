@@ -52,7 +52,7 @@ Implemented in **M5** — see BUILD_PLAN.md.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
 from typing import Any, TypeVar
 
 import numpy as np
@@ -187,6 +187,23 @@ class RoundingDiagnostics:
             "min_chord_at_center": self.min_chord_at_center,
             "transform_memory_bytes": self.transform_memory_bytes,
         }
+
+    def to_cache(self) -> dict[str, Any]:
+        """A round-trippable dict keyed by the **real field names** (not `as_dict`'s report keys).
+
+        `as_dict` renames fields for the human-facing manifest (``dimension`` →
+        ``rounding_dimension``); a cache must instead reconstruct the object exactly, so it keeps
+        the field names and `from_cache` feeds them straight back to the constructor.
+        """
+        return asdict(self)
+
+    @classmethod
+    def from_cache(cls, data: dict[str, Any]) -> RoundingDiagnostics:
+        names = {f.name for f in fields(cls)}
+        missing = names - data.keys()
+        if missing:
+            raise RoundingError(f"cached rounding diagnostics lack fields: {sorted(missing)}")
+        return cls(**{name: data[name] for name in names})
 
 
 @dataclass(frozen=True)
@@ -366,6 +383,79 @@ class RoundedTransform:
             "rounding_impl_version": ROUNDING_IMPL_VERSION,
             **self.diagnostics.as_dict(),
         }
+
+    # ---- caching (L3 artifact, M8) ------------------------------------------------------------
+
+    def to_bundle(self) -> tuple[dict[str, NDArray[np.float64]], dict[str, Any]]:
+        """Split into ``(arrays, meta)`` for the content-addressed cache (`cache.ArtifactCache`).
+
+        The `precompute` is *not* stored: it is a pure function of ``T`` and the bounds, and storing
+        it would only be a second copy to fall out of step. `from_bundle` rebuilds it and validates
+        it against ``T`` — the same by-construction discipline `build_transform` uses (BUILD_PLAN
+        §1.3), so a cached transform is exactly as trustworthy as a freshly built one.
+        """
+        arrays = {
+            "transform": np.ascontiguousarray(self.transform),
+            "inverse_transform": np.ascontiguousarray(self.inverse_transform),
+            "cholesky": np.ascontiguousarray(self.cholesky),
+            "center": np.ascontiguousarray(self.center),
+            "support_coordinates": np.ascontiguousarray(self.support_coordinates),
+        }
+        meta = {
+            "content_key": self.content_key(),
+            "geometry_key": self.geometry_key,
+            "polytope_key": self.polytope_key,
+            "diagnostics": self.diagnostics.to_cache(),
+        }
+        return arrays, meta
+
+    @classmethod
+    def from_bundle(
+        cls,
+        arrays: dict[str, NDArray[Any]],
+        meta: dict[str, Any],
+        reduced: ReducedPolytope,
+    ) -> RoundedTransform:
+        """Rebuild a transform cached by `to_bundle`, against the polytope it was rounded for.
+
+        ``reduced`` supplies the bounds `CoordinatePrecompute` is derived and validated from, and
+        its ``content_key`` is checked against the cached ``polytope_key`` — reconstructing a
+        transform against a *different* polytope is exactly the "two artifacts that never met" join
+        M6 spent six rounds hunting, so it is refused rather than silently producing a transform for
+        the wrong model.
+        """
+        if meta["polytope_key"] != reduced.content_key():
+            raise RoundingError(
+                "cached transform was rounded for a different polytope "
+                f"({str(meta['polytope_key'])[:16]}…) than the one it is being rebuilt against "
+                f"({reduced.content_key()[:16]}…)"
+            )
+        transform = np.asfortranarray(np.asarray(arrays["transform"], dtype=VALUE_DTYPE))
+        precompute = CoordinatePrecompute.build(
+            transform, reduced.lower_bounds, reduced.upper_bounds
+        )
+        precompute.validate(transform, reduced.lower_bounds, reduced.upper_bounds)
+        rebuilt = cls(
+            transform=transform,
+            inverse_transform=np.ascontiguousarray(arrays["inverse_transform"], dtype=VALUE_DTYPE),
+            cholesky=np.ascontiguousarray(arrays["cholesky"], dtype=VALUE_DTYPE),
+            center=np.ascontiguousarray(arrays["center"], dtype=VALUE_DTYPE),
+            support_coordinates=np.ascontiguousarray(
+                arrays["support_coordinates"], dtype=VALUE_DTYPE
+            ),
+            precompute=precompute,
+            diagnostics=RoundingDiagnostics.from_cache(meta["diagnostics"]),
+            geometry_key=meta["geometry_key"],
+            polytope_key=meta["polytope_key"],
+        )
+        # A cheap tripwire: if any array was silently altered, the content key drifts and we would
+        # rather fail loudly than sample against a transform that is not what was cached.
+        if rebuilt.content_key() != meta["content_key"]:
+            raise RoundingError(
+                "rebuilt transform does not match its cached content key — the bundle is corrupt "
+                "or was written by an incompatible version"
+            )
+        return rebuilt
 
 
 def build_transform(

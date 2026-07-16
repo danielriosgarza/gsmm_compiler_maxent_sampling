@@ -68,13 +68,23 @@ class CanonicalModel:
     """The frozen L0 IR: a validated `FluxPolytope` plus the identity and metadata behind it."""
 
     model_id: str
-    source_path: Path
-    source_sha256: str
+    source_path: Path | None
+    """Where the model was read from, for the record. `None` for a model assembled in memory."""
+    source_sha256: str | None
+    """sha256 of the **named source file**, when `load_canonical_model` parsed one — *provenance
+    only*. It is deliberately **not** the L0 identity: `build_canonical_model` accepts a model that
+    was assembled or mutated in memory, and a file hash cannot prove such a model came from that
+    file. `None` when no file was hashed. Identity lives in `l0_key`, which is content-addressed."""
     polytope: FluxPolytope
     exchange_mask: NDArray[np.bool_]
     """Which reactions are exchanges — carried here so `features` never has to import cobra."""
     provenance: Provenance
     l0_key: str
+    """The L0 cache identity, **content-addressed** (BUILD_PLAN §1.1). It hashes the frozen IR the
+    model actually contains — `model_id`, the polytope, the exchange mask — folded with the parser
+    schema and cobra versions, and **never** the source file's bytes. So a model mutated in memory,
+    or one handed the wrong `source_path`, gets a *different* key: it can never inherit another
+    file's identity, which the old file-hash key allowed (the M8-opening defect)."""
 
     @property
     def l1_key(self) -> str:
@@ -89,7 +99,7 @@ class CanonicalModel:
 
         return {
             "model_id": self.model_id,
-            "source_path": str(self.source_path),
+            "source_path": None if self.source_path is None else str(self.source_path),
             "source_sha256": self.source_sha256,
             "l0_key": self.l0_key,
             "l1_key": self.l1_key,
@@ -204,8 +214,10 @@ def _validate_parsed(model: Model) -> None:
 
 def build_canonical_model(
     model: Model,
-    source_path: str | Path,
+    source_path: str | Path | None = None,
     biomass_id: str | None = None,
+    *,
+    source_sha256: str | None = None,
 ) -> CanonicalModel:
     """Validate a parsed cobra model and freeze it into the canonical IR.
 
@@ -213,6 +225,13 @@ def build_canonical_model(
     ``j`` of every bound array, for the rest of the pipeline; metabolite ``i`` is row ``i``. Cobra's
     ``DictList`` order is stable for a given file, and every artifact carries the ID tuples, so a
     reordering upstream changes the L1 key rather than silently permuting a saved flux vector.
+
+    ``model`` may be a model cobra just parsed *or* one assembled or mutated in memory. Because this
+    function cannot tell which, it **does not hash any file for identity**: the L0 key is derived
+    from the model's own frozen content. ``source_path`` is recorded for the record, and
+    ``source_sha256`` is stored as-is only when a caller who *did* the parse
+    (`load_canonical_model`) supplies it — so a model can never be stamped with a file's cache
+    identity it did not come from. See BUILD_PLAN §1.1 and the ``l0_key`` field doc.
     """
     _validate_parsed(model)
 
@@ -241,31 +260,48 @@ def build_canonical_model(
     )
 
     exchange_ids = {r.id for r in model.exchanges}
-    source = Path(source_path)
-    source_sha256 = hash_file(source)
+    exchange_mask = np.array([r in exchange_ids for r in reaction_ids], dtype=bool)
+    source = None if source_path is None else Path(source_path)
+    model_id = model.id or (source.stem if source is not None else "model")
     provenance = Provenance.capture()
 
     return CanonicalModel(
-        model_id=model.id or source.stem,
+        model_id=model_id,
         source_path=source,
         source_sha256=source_sha256,
         polytope=polytope,
-        exchange_mask=np.array([r in exchange_ids for r in reaction_ids], dtype=bool),
+        exchange_mask=exchange_mask,
         provenance=provenance,
-        # The file hash alone would not invalidate on a parser change (§1.1).
+        # Content-addressed, never file-hash-addressed (§1.1): the key fingerprints the IR this
+        # model *actually holds*, so a model mutated in memory — or paired with the wrong
+        # `source_path` — gets a distinct key instead of inheriting an unrelated file's identity.
+        # `polytope.content_key()` covers reaction/metabolite IDs, the CSC arrays, bounds and the
+        # biomass index; `model_id` is folded in because it names the reaction's RNG streams, and
+        # the exchange mask because `features`/aggregation read it. cobra + parser versions fold in
+        # so a parser change that alters what we extract misses the cache rather than loading stale
+        # bytes.
         l0_key=content_key(
-            source_sha256=source_sha256,
+            canonical_ir=polytope.content_key(),
+            model_id=model_id,
+            exchange_mask=exchange_mask,
             parser_schema_version=PARSER_SCHEMA_VERSION,
             cobra_version=provenance.cobra_version,
-            biomass_id=polytope.biomass_id,
         ),
     )
 
 
 def load_canonical_model(path: str | Path, biomass_id: str | None = None) -> CanonicalModel:
-    """Parse and freeze a model file in one step."""
+    """Parse and freeze a model file in one step — the trusted path.
+
+    This is the **only** place a file's hash is bound to a model's identity, and it is honest here
+    because the same call both hashes and parses the file: the ``source_sha256`` it records
+    provably describes the bytes the ``model`` was built from. That hash is provenance; the cache
+    identity is the content-addressed ``l0_key`` computed by `build_canonical_model`.
+    """
     source = Path(path)
-    return build_canonical_model(load_model(source), source, biomass_id)
+    return build_canonical_model(
+        load_model(source), source, biomass_id, source_sha256=hash_file(source)
+    )
 
 
 # ---- reporting ---------------------------------------------------------------------------------

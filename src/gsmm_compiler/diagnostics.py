@@ -400,3 +400,106 @@ def feasibility_report(
         n_bound_violations=n_violations,
         mass_balance_tol=mass_balance_tol,
     )
+
+
+# ---- the M8 run-diagnostics report (feasibility / objective / mcmc / geometry / solver) ---------
+
+
+def run_diagnostics(layout: Any, model_id: str) -> dict[str, Any]:
+    """Assemble one completed model's diagnostics JSON from its stored artifacts (M8).
+
+    Reads only what the run already wrote — the per-``β`` ``J`` traces and each unit's feasibility
+    numbers — so it can be recomputed after the fact without re-sampling. The five sections are the
+    five ways a run can be wrong: it left the polytope (*feasibility*), the objective is mis-scaled
+    (*objective*), the chains have not mixed (*mcmc*), the geometry lost a dimension (*geometry*),
+    or the LP that anchored ``s_J`` was itself off (*solver*).
+
+    The ``mcmc`` section reports R̂ and ESS **of the ``J`` trace itself** at every ``β`` — the
+    statistic the monotonicity claim is about — and whether ``E[J]`` rises with ``β`` within the
+    Monte-Carlo error read from that same ESS. A drop wider than ``n_sigma`` is flagged, because
+    ``dE_β[J]/dβ = Var_β(J) ≥ 0`` is a theorem: a real violation is a bug, not physics.
+    """
+    from gsmm_compiler.output import load_array, read_json  # local: keeps diagnostics import-light
+
+    manifest = read_json(layout.model_manifest_path(model_id))
+    betas = manifest["betas"]
+    n_chains = int(manifest["axes"]["n_chains"])
+
+    per_beta: list[dict[str, Any]] = []
+    worst_bound = 0.0
+    worst_mass_balance = 0.0
+    for beta_index, beta in enumerate(betas):
+        chains = []
+        for chain_index in range(n_chains):
+            chain_dir = layout.chain_dir(model_id, beta_index, chain_index)
+            unit = read_json(chain_dir / "manifest.json")
+            ref = unit["arrays"]["trace_j"]
+            chains.append(
+                load_array(
+                    chain_dir / ref["file"],
+                    sha256=ref["sha256"],
+                    dtype=ref["dtype"],
+                    shape=tuple(ref["shape"]),
+                )
+            )
+            worst_bound = max(worst_bound, float(unit["diagnostics"]["max_bound_violation"]))
+            worst_mass_balance = max(
+                worst_mass_balance, float(unit["diagnostics"]["max_mass_balance_residual"])
+            )
+        stacked = np.stack(chains)  # (n_chains, n_samples)
+        per_beta.append(
+            {
+                "beta": float(beta),
+                "beta_index": beta_index,
+                "mean_j": float(stacked.mean()),
+                "r_hat_j": float(split_r_hat(stacked)[0]),
+                "ess_j": float(effective_sample_size(stacked)[0]),
+                "mcse_j": float(mcse(stacked)[0]),
+            }
+        )
+
+    monotonicity = _mean_j_monotonicity(per_beta)
+    return {
+        "model_id": model_id,
+        "feasibility": {
+            "max_bound_violation": worst_bound,
+            "max_mass_balance_residual": worst_mass_balance,
+        },
+        "objective": manifest.get("objective"),
+        "energy_scale": manifest.get("energy_scale"),
+        "mcmc": {
+            "per_beta": per_beta,
+            "max_r_hat_j": max((b["r_hat_j"] for b in per_beta), default=1.0),
+            "min_ess_j": min((b["ess_j"] for b in per_beta), default=0.0),
+            "mean_j_monotonicity": monotonicity,
+        },
+        "geometry": manifest.get("geometry"),
+        "solver": manifest.get("lp_optimum"),
+    }
+
+
+def _mean_j_monotonicity(per_beta: list[dict[str, Any]], *, n_sigma: float = 4.0) -> dict[str, Any]:
+    """Is ``E[J]`` nondecreasing along ``β``, in units of the pooled ``J`` standard error?"""
+    ordered = sorted(per_beta, key=lambda b: b["beta"])
+    worst = -np.inf
+    for lower, upper in zip(ordered, ordered[1:], strict=False):
+        drop = lower["mean_j"] - upper["mean_j"]
+        pooled = float(np.hypot(lower["mcse_j"], upper["mcse_j"]))
+        sigma = (0.0 if drop <= 0.0 else np.inf) if pooled == 0.0 else drop / pooled
+        worst = max(worst, float(sigma))
+    worst_drop = -np.inf if len(ordered) < 2 else float(worst)
+    return {
+        "n_sigma": n_sigma,
+        "worst_drop_sigma": worst_drop,
+        "is_monotone": bool(worst_drop <= n_sigma),
+    }
+
+
+def write_run_diagnostics(layout: Any, model_id: str) -> Any:
+    """Write ``diagnostics/diagnostics.json`` for a completed model; return its path."""
+    from gsmm_compiler.output import write_json
+
+    report = run_diagnostics(layout, model_id)
+    destination = layout.diagnostics_dir(model_id) / "diagnostics.json"
+    write_json(destination, report)
+    return destination
