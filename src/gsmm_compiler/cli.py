@@ -117,6 +117,22 @@ def _add_maxent_commands(subcommands: Any) -> None:
     diagnose.add_argument("--model-id", required=True, help="which strain to diagnose")
     diagnose.set_defaults(func=_cmd_maxent_diagnose)
 
+    benchmark = actions.add_parser("benchmark", help="time every pipeline stage on one model (M9)")
+    benchmark.add_argument("path", help="path to a model file")
+    benchmark.add_argument("--biomass-id", default=None, help="biomass reaction ID")
+    benchmark.add_argument("--report", default=None, metavar="PATH", help="write the report JSON")
+    benchmark.add_argument(
+        "--repeats", type=int, default=3, help="repeats for the expensive stages (default: 3)"
+    )
+    benchmark.add_argument(
+        "--sweeps",
+        type=int,
+        default=200,
+        help="base sweep count for the sampling slope; chains run at 2x and 4x this (default: 200)",
+    )
+    _add_config_args(benchmark)
+    benchmark.set_defaults(func=_cmd_maxent_benchmark)
+
 
 def _add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--out", required=True, metavar="DIR", help="output root for results")
@@ -196,13 +212,14 @@ def _cmd_maxent_build_geometry(args: argparse.Namespace) -> int:
     from gsmm_compiler.affine_geometry import build_geometry
     from gsmm_compiler.config import load
     from gsmm_compiler.model_input import load_canonical_model
-    from gsmm_compiler.rounding import build_transform
+    from gsmm_compiler.rounding import build_transform, certify_reachable_mass_balance
 
     config = load(args.config, args.overrides)
     canonical = load_canonical_model(args.path, args.biomass_id or config.model.biomass_id)
     reduced = canonical.polytope.reduce()
     geometry = build_geometry(reduced, model_id=canonical.model_id, config=config.geometry)
     transform = build_transform(geometry, reduced, config=config.geometry)
+    certificate = certify_reachable_mass_balance(transform, reduced)
 
     gm = geometry.manifest()
     rd = transform.diagnostics
@@ -214,7 +231,12 @@ def _cmd_maxent_build_geometry(args: argparse.Namespace) -> int:
         f"blocked reactions {gm['n_blocked']}\n"
         f"step_scale_ratio  {rd.step_scale_ratio:g}\n"
         f"cond(Cε)          {rd.condition_number:g}\n"
-        f"min chord @center {rd.min_chord_at_center:g}"
+        f"min chord @center {rd.min_chord_at_center:g}\n"
+        f"reachable ‖Sv−b‖  {certificate.worst_absolute:g} at {certificate.worst_row_id} "
+        f"({'CERTIFIED' if certificate.is_certified else 'REFUSED'} vs contract "
+        f"{certificate.contract:g}, margin {certificate.margin:.0f}×, "
+        f"{certificate.n_lps} LPs)\n"
+        f"‖S·T‖ backward err {rd.transform_mass_balance_error:g}  (reported, not gated — §1.4.2)"
     )
     if args.cache_dir is not None:
         from gsmm_compiler.batch import geometry_cache_key
@@ -297,6 +319,24 @@ def _cmd_maxent_diagnose(args: argparse.Namespace) -> int:
         f"(worst drop {mono['worst_drop_sigma']:g}σ)\n"
         f"wrote {destination}"
     )
+    return 0
+
+
+def _cmd_maxent_benchmark(args: argparse.Namespace) -> int:
+    from gsmm_compiler.benchmark import benchmark_pipeline, format_report, write_report
+    from gsmm_compiler.config import load
+
+    config = load(args.config, args.overrides)
+    report = benchmark_pipeline(
+        args.path,
+        biomass_id=args.biomass_id or config.model.biomass_id,
+        config=config,
+        repeats=args.repeats,
+        sweeps=args.sweeps,
+    )
+    print(format_report(report), end="")
+    if args.report:
+        print(f"\nwrote {write_report(report, args.report)}")
     return 0
 
 

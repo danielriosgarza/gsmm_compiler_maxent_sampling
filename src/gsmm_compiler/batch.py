@@ -55,7 +55,13 @@ from gsmm_compiler.output import (
     write_json,
 )
 from gsmm_compiler.provenance import Provenance, content_key
-from gsmm_compiler.rounding import ROUNDING_IMPL_VERSION, RoundedTransform, build_transform
+from gsmm_compiler.rounding import (
+    ROUNDING_IMPL_VERSION,
+    RoundedTransform,
+    RoundingError,
+    build_transform,
+    certify_reachable_mass_balance,
+)
 from gsmm_compiler.sparse_objective import (
     ReducedObjective,
     choose_energy_scale,
@@ -288,9 +294,28 @@ def _load_or_build_geometry(
     def compute() -> tuple[dict[str, NDArray[Any]], dict[str, Any]]:
         geometry = build_geometry(reduced, model_id=model_id, config=config.geometry)
         transform = build_transform(geometry, reduced, config=config.geometry)
+
+        # M9: prove that **every state the chain can reach** meets the mass-balance contract, before
+        # a single sample is drawn. This is the gate `build_transform` used to attempt with a
+        # per-direction bar — see BUILD_PLAN §1.4.2. It belongs here rather than inside
+        # `build_transform` for the same reason M4's span certificate is its own step: it costs LPs,
+        # and `rounding` stays solver-free so a worker can import it.
+        certificate = certify_reachable_mass_balance(transform, reduced)
+        if not certificate.is_certified:
+            raise RoundingError(
+                f"the rounded geometry admits a reachable state whose mass balance is off by "
+                f"{certificate.worst_absolute:.3e} at metabolite {certificate.worst_row_id!r}, "
+                f"above the declared contract {certificate.contract:.1e}: the chain could step off "
+                "the steady-state manifold, so this transform must not be sampled"
+            )
+
         arrays, meta = transform.to_bundle()
         arrays = {**arrays, "support_points": np.ascontiguousarray(geometry.support_points)}
-        meta = {**meta, "geometry_manifest": geometry.manifest()}
+        meta = {
+            **meta,
+            "geometry_manifest": geometry.manifest(),
+            "reachability_certificate": certificate.as_dict(),
+        }
         return arrays, meta
 
     if cache is None:

@@ -842,3 +842,116 @@ The frozen weight buffers are physically read-only; the reweighter structurally 
 sampler (and vice-versa), so a weight cannot move mid-chain. λ, weights and `s_J` are all rebuilt from
 the **frozen** final weights — the fixed point the converged loop actually solved, not a rebuild that
 could differ in its last ulp.
+
+---
+
+# § M9 — the rounding gate rejected valid geometry 1 time in 3, and the fix I proposed was unsound
+
+**2 rounds, converged.** Codex conceded 1 point, I conceded 4 — including my entire proposed fix.
+This is the round where **being adversarially reviewed changed the answer, not just the wording**.
+
+## What M9 found (measurement, before any argument)
+
+The M9 benchmark's worker sweep would not run: both strains failed with
+`RoundingError: ‖S·T‖ relative ... 1.544e-09, above span_tol 1.0e-09`. But the *same polytope* built
+fine under a different `model_id`. `model_id` keys the RNG (`stream_seed`) → span-certificate probes
+and support-LP directions → support points → covariance → `L` → `T`. So **a label decided whether a
+genome-scale model could be sampled at all**. Across 24 streams: **8 raised, 16 passed.**
+
+| measure | min | median | max | spread | fails 1e-9 |
+|---|---|---|---|---|---|
+| `‖S·T‖` absolute | 3.139e-12 | 3.851e-12 | 5.535e-12 | **1.8×** | — |
+| `‖S·T‖` relative (the gate) | 9.588e-11 | 4.835e-10 | 3.038e-08 | **373×** | **8/24** |
+
+Also found: **`rounding.py:156` documents `max_k ‖S·T_k‖_∞/‖|S|·|T_k|‖_∞` (per-column norms) while
+`rounding.py:788` computes `max_k max_i (r_i/s_i)` (per-(col,row) ratios).** The code never
+implemented its own documentation, and the two differ by five orders of magnitude here.
+
+## The debate
+
+**My position:** the residual is an inherited absolute floor, not a locally-generated one; dividing
+it by a small per-row scale manufactures a meaningless number. **Fix: implement the documented
+per-column formula.**
+
+**Codex, round 1 — DISAGREE on 5 points.** The decisive one killed my fix outright:
+
+> `S=[[1,-1,0],[0,0,1]]`, `|v₁|,|v₂| ≤ 1e12`, `|v₃| ≤ 1`, `T_k=(1,1,1e-10)`.
+> `S·T_k=(0,1e-10)`, `|S|·|T_k|=(2,1e-10)`. **Per-column: `1e-10/2 = 5e-11` — PASSES.**
+> But `v₃` binds the chord at `|y| ≲ 1e10`, so `v₃` reaches **1.0**: a mass-balance violation of
+> order 1 with every reaction bound satisfied.
+
+Dividing by the **largest** row scale lets two unrelated huge reactions hide a 100%-relative
+violation on a tiny one. My fix would have shipped a gate that admits a grossly off-manifold
+transform. **Withdrawn.** (Codex also killed candidate `‖S·T_k‖_∞/(‖S‖_∞‖T_k‖_∞)` as weaker still.)
+
+**I ran Codex's discriminator** — log-log slope of residual `r` vs row scale `q`, 61009 (col,row)
+pairs over 8 streams: **slope +0.165**, not the **+1** a locally-generated error requires. Across ≥4
+decades of `q` the median `r` rises only **6.6×** (locally-generated ⇒ ~1e4×). At large `q`,
+`r/q → 2.4·eps`; at small `q`, `r/q → 1.8e5·eps`. **Round 2: Codex conceded the error model.**
+
+**Codex held one point, and it was right.** `r/q` is *not* meaningless: it is exactly the
+Oettli–Prager componentwise backward error —
+`min{η : |ΔS_ij| ≤ η|S_ij|, (S_i+ΔS_i)·T_k = 0} = |S_i·T_k|/q`. My slope experiment proves it does
+not identify *how* `T_k` acquired its error; it does not make the ratio describe nothing. **Conceded.**
+The honest statement: it is a *structural backward error*, not a bound on what the sampler can emit —
+so it is the wrong thing to **gate** on, not a meaningless number.
+
+**I also conceded:** worst *reachable* coordinate rather than typical chord length; `span_tol`
+conflates three meanings; M5's "exactly-zero rows" argument only solves `0/0` and never licensed
+"legitimate however small it is"; and leakage does **not** accumulate as a random walk
+(`Sv−b = (Sc−b) + STy` is determined by the current bounded `y`, not by step count).
+
+**Codex killed my cheap version too.** I proposed bounding `|y_k| ≤ ρ_k` and summing
+`Σ_k |E_ik|·ρ_k`. Counterexample: `Y = {|y₁|≤1, |y₂|≤1, |y₁−y₂|≤δ}`, `E_i=(1,−1)` → box bound `2`,
+truth `δ`. Unbounded looseness from coordinate coupling; `step_scale_ratio` does not control it.
+
+## Settled — the consensus position
+
+The gate is **`certify_reachable_mass_balance`**: 2 LPs per metabolite over the fixed reachable set
+`Y`, against the **same `η=1e-9` contract `diagnostics.feasibility_report` already applies to emitted
+samples**. One declared definition of "mass balanced", proved a priori and checked a posteriori.
+`transform_mass_balance_error` is retained as a **reported diagnostic that never raises** — Codex
+showed it catches a corruption the certificate deliberately misses (`S=[1]`, `T=[δ]`, true dimension
+zero but `T` invents motion: diagnostic 1.0, certificate 1e-12 and passes).
+
+**Codex's scope verdict, which the user adopted:** build it in M9, not M10. M9 explicitly *is* "GSMM
+hardening"; M5's gate demands `‖S·T‖≈0` and enforced it with the wrong instrument; a proof that the
+represented support meets v1's feasibility contract is not an "extension"; and disabling the gate
+would leave rare reachable endpoints unvalidated, which Codex's own counterexample proves an
+emitted-sample campaign cannot exclude.
+
+## Two things the *implementation* then found, both self-inflicted
+
+1. **I read the primal.** M4's recorded lesson says verbatim: *"Never certify flatness from a primal
+   reading; M5/M6 will face the same temptation."* M9 walked straight in. `objective_value` is a
+   **lower** bound on the max, so a solve stopping short reports the reachable residual too *small*
+   and certifies a transform that reaches further — unsound in the dangerous direction. Now a
+   weak-duality bound: `max e·y ≤ Σ_j max(π_j lo_j, π_j hi_j) + Σ_k |d_k|·Ω_k`, `d = e − Tᵀπ`, valid
+   for **any** `π`, with an outward rounding allowance. `Ω` is unavoidable (`y` is free, so any
+   `d ≠ 0` sends the sup to `+∞`) and comes from a provable outer box via a **freshly recomputed**
+   `T⁺` — the stored inverse does not get to vouch for the transform it is stored beside.
+2. **HiGHS silently drops a tiny row.** With a 1e-10 coefficient beside 1.0 coefficients it reports
+   that row's activity as **0.0** where the truth is **133.3**, `max_primal_infeasibility = 0.0`,
+   status optimal. The row does not survive matrix scaling. That relaxation happens to enlarge `Y`
+   and stay conservative — but *relying on which way a solver's scaling errs is not a certificate*,
+   which is precisely why the bound is dual. Each `E_i` is normalized to unit norm before it reaches
+   the solver and rescaled after; raw, `E_i ≈ 1e-13` sits under the dual feasibility tolerance and
+   every reduced cost reads as zero.
+
+## Result
+
+Certified on every RNG stream. `max_i R_i` = **3.6e-11 … 5.1e-11** — a **1.41×** spread where the old
+gate swung **373×** — **20–28× inside** the contract, **334 LPs / ~0.5 s** (only 167 of 894 metabolite
+rows have `E_i` structurally nonzero). It lands just above M5's independently measured **2.6e-11**
+emitted-sample residual, exactly as an upper bound on a superset must: two calculations sharing no
+code, agreeing.
+
+**Still open, recorded for M10:** the span certificate is a *second* RNG-marginal gate —
+`build_geometry` raises "not exhaustive (214/214 probes, 1 inconclusive)" on ~1–2 of 20 streams. Same
+shape, not diagnosed, deliberately untouched by M9.
+
+**The lesson, which is the M4 lesson at one more remove:** *never divide by a small number that is
+noise* — and the corollary M9 adds, **a bar that a valid input clears only 2 times in 3 is not a
+tolerance, it is a coin flip.** The signature that exposed it: the *absolute* quantity was constant
+to 1.8× while the *relative* one swung 373×. When a ratio is unstable and its numerator is not, the
+denominator is the thing that is wrong.

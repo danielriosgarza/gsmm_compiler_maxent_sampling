@@ -469,6 +469,31 @@ def load_chain(
     return LoadedChain(fluxes=fluxes, traces=traces, manifest=manifest)
 
 
+def load_traces(chain_dir: Path) -> dict[str, NDArray[Any]]:
+    """Read a stored unit's objective traces, validated, **without needing the geometry**.
+
+    `load_chain` reconstructs full-length fluxes, and a ``reduced``-mode unit cannot do that without
+    the transform it was sampled with. A trace has no such dependency — it is a stored scalar per
+    sample, written identically in every storage mode — so requiring the geometry to read one would
+    be a coupling the data does not have. Callers that want ``J`` and nothing else (diagnostics,
+    the M9 worker sweep) use this and stay independent of the storage mode.
+    """
+    chain_dir = Path(chain_dir)
+    if not is_complete(chain_dir):
+        raise OutputError(f"{chain_dir} has no {COMPLETE_MARKER} marker — not a finished unit")
+    manifest = read_json(chain_dir / "manifest.json")
+    refs = manifest["arrays"]
+    return {
+        name: load_array(
+            chain_dir / refs[f"trace_{name}"]["file"],
+            sha256=refs[f"trace_{name}"]["sha256"],
+            dtype=refs[f"trace_{name}"]["dtype"],
+            shape=tuple(refs[f"trace_{name}"]["shape"]),
+        )
+        for name in _TRACE_ARRAYS
+    }
+
+
 def _check_polytope(manifest: dict[str, Any], reduced: ReducedPolytope) -> None:
     stored = manifest.get("polytope_key")
     live = reduced.content_key()

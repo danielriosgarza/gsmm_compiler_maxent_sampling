@@ -1,0 +1,407 @@
+{
+  "dimension": 46,
+  "model_id": "GCF_000010425_1_ASM1042v1_protein_gapfilled",
+  "n_free": 260,
+  "n_metabolites": 894,
+  "n_reactions": 773,
+  "notes": {
+    "cache": "bypassed; every stage is a cold cost",
+    "condition_number": 15368.59987728352,
+    "critical_l1_penalty": 0.0018898757204022243,
+    "energy_scale": 32.51182211426247,
+    "l1_penalty": 0.0009449378602011121,
+    "l1_penalty_scaled": 0.5,
+    "n_blocked": 61,
+    "step_scale_ratio": 0.008066457464849547,
+    "sweep_definition": "one sweep = d coordinate updates"
+  },
+  "platform": {
+    "blas_threads_env": {
+      "MKL_NUM_THREADS": "1",
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1"
+    },
+    "cobra": "0.31.1",
+    "cpu_count": 14,
+    "gsmm_compiler": "0.1.0.dev0",
+    "highspy": "1.15.1",
+    "machine": "aarch64",
+    "numpy": "2.4.6",
+    "processor": "aarch64",
+    "python": "3.11.15",
+    "system": "Linux 6.8.12-tegra"
+  },
+  "stages": [
+    {
+      "fastest_seconds": 0.5095102789928205,
+      "median_seconds": 0.5377127599786036,
+      "n_repeats": 3,
+      "n_units": 1,
+      "name": "parse",
+      "note": "cobra JSON load; no CSC assembly yet",
+      "raw_seconds": [
+        1.1435913369932678,
+        0.5095102789928205,
+        0.5377127599786036
+      ],
+      "seconds_per_unit": 0.5377127599786036,
+      "slowest_seconds": 1.1435913369932678,
+      "spread": 1.179218916109929,
+      "unit": "call",
+      "units_per_second": 1.8597289750754502
+    },
+    {
+      "fastest_seconds": 0.012551976018585265,
+      "median_seconds": 0.013890199013985693,
+      "n_repeats": 3,
+      "n_units": 1,
+      "name": "csc_assembly",
+      "note": "validation + native int32/float64 CSC + L0 content key",
+      "raw_seconds": [
+        0.036140085983788595,
+        0.013890199013985693,
+        0.012551976018585265
+      ],
+      "seconds_per_unit": 0.013890199013985693,
+      "slowest_seconds": 0.036140085983788595,
+      "spread": 1.6981837295097826,
+      "unit": "call",
+      "units_per_second": 71.99320895209097
+    },
+    {
+      "fastest_seconds": 0.00025233699125237763,
+      "median_seconds": 0.00028201998793520033,
+      "n_repeats": 3,
+      "n_units": 1,
+      "name": "reduce",
+      "note": "eliminate l==u; build the affine RHS",
+      "raw_seconds": [
+        0.0006603669899050146,
+        0.00028201998793520033,
+        0.00025233699125237763
+      ],
+      "seconds_per_unit": 0.00028201998793520033,
+      "slowest_seconds": 0.0006603669899050146,
+      "spread": 1.4468123399338275,
+      "unit": "call",
+      "units_per_second": 3545.8479639030757
+    },
+    {
+      "fastest_seconds": 0.0003345769946463406,
+      "median_seconds": 0.00041706798947416246,
+      "n_repeats": 3,
+      "n_units": 1,
+      "name": "pass_model",
+      "note": "HighsLp construction + passModel; no solve",
+      "raw_seconds": [
+        0.000866804999532178,
+        0.00041706798947416246,
+        0.0003345769946463406
+      ],
+      "seconds_per_unit": 0.00041706798947416246,
+      "slowest_seconds": 0.000866804999532178,
+      "spread": 1.2761180870218984,
+      "unit": "call",
+      "units_per_second": 2397.6906049797676
+    },
+    {
+      "fastest_seconds": 0.0028729890182148665,
+      "median_seconds": 0.0029166839958634228,
+      "n_repeats": 3,
+      "n_units": 1,
+      "name": "first_lp",
+      "note": "build + cold solve, no basis to start from",
+      "raw_seconds": [
+        0.003298455005278811,
+        0.0029166839958634228,
+        0.0028729890182148665
+      ],
+      "seconds_per_unit": 0.0029166839958634228,
+      "slowest_seconds": 0.003298455005278811,
+      "spread": 0.145873186011018,
+      "unit": "call",
+      "units_per_second": 342.85510580448437
+    },
+    {
+      "fastest_seconds": 0.05346975501743145,
+      "median_seconds": 0.053750747989397496,
+      "n_repeats": 3,
+      "n_units": 50,
+      "name": "warm_start_lps",
+      "note": "50 random objectives re-solved off the retained basis",
+      "raw_seconds": [
+        0.053750747989397496,
+        0.054655162995914,
+        0.05346975501743145
+      ],
+      "seconds_per_unit": 0.0010750149597879499,
+      "slowest_seconds": 0.054655162995914,
+      "spread": 0.022053795022840796,
+      "unit": "LP",
+      "units_per_second": 930.2196131272938
+    },
+    {
+      "fastest_seconds": 0.008634522993816063,
+      "median_seconds": 0.008637910999823362,
+      "n_repeats": 3,
+      "n_units": 1,
+      "name": "sparse_lp",
+      "note": "the (v,z) sparse-objective LP + the biomass-only diagnostic LP",
+      "raw_seconds": [
+        0.009227528003975749,
+        0.008634522993816063,
+        0.008637910999823362
+      ],
+      "seconds_per_unit": 0.008637910999823362,
+      "slowest_seconds": 0.009227528003975749,
+      "spread": 0.0686514378501715,
+      "unit": "call",
+      "units_per_second": 115.76873158573285
+    },
+    {
+      "fastest_seconds": 1.170046374987578,
+      "median_seconds": 1.170146301999921,
+      "n_repeats": 3,
+      "n_units": 1,
+      "name": "geometry",
+      "note": "FVA + support LPs + orthonormal basis + span certificate (cold; cache bypassed)",
+      "raw_seconds": [
+        1.172413589025382,
+        1.170046374987578,
+        1.170146301999921
+      ],
+      "seconds_per_unit": 1.170146301999921,
+      "slowest_seconds": 1.172413589025382,
+      "spread": 0.0020230068955976524,
+      "unit": "call",
+      "units_per_second": 0.8545939924698984
+    },
+    {
+      "fastest_seconds": 0.003967219992773607,
+      "median_seconds": 0.004032897995784879,
+      "n_repeats": 3,
+      "n_units": 1,
+      "name": "rounding",
+      "note": "support covariance \u2192 ridge \u2192 Cholesky \u2192 T=diag(s)\u00b7B\u00b7L + precompute",
+      "raw_seconds": [
+        0.004300492990296334,
+        0.004032897995784879,
+        0.003967219992773607
+      ],
+      "seconds_per_unit": 0.004032897995784879,
+      "slowest_seconds": 0.004300492990296334,
+      "spread": 0.08263858839748943,
+      "unit": "call",
+      "units_per_second": 247.96064791253937
+    },
+    {
+      "fastest_seconds": 0.2422540000115987,
+      "median_seconds": 0.2429213220020756,
+      "n_repeats": 3,
+      "n_units": 400,
+      "name": "sample_beta0_low",
+      "note": "\u03b2=0, 400 sweeps incl. fixed chain cost",
+      "raw_seconds": [
+        0.24311943599605002,
+        0.2429213220020756,
+        0.2422540000115987
+      ],
+      "seconds_per_unit": 0.0006073033050051891,
+      "slowest_seconds": 0.24311943599605002,
+      "spread": 0.003562618453245241,
+      "unit": "sweep",
+      "units_per_second": 1646.6236751197255
+    },
+    {
+      "fastest_seconds": 0.48221046198159456,
+      "median_seconds": 0.48279351499513723,
+      "n_repeats": 3,
+      "n_units": 800,
+      "name": "sample_beta0_high",
+      "note": "\u03b2=0, 800 sweeps incl. fixed chain cost",
+      "raw_seconds": [
+        0.48279351499513723,
+        0.4830992750066798,
+        0.48221046198159456
+      ],
+      "seconds_per_unit": 0.0006034918937439216,
+      "slowest_seconds": 0.4830992750066798,
+      "spread": 0.0018409796268580943,
+      "unit": "sweep",
+      "units_per_second": 1657.0230857555277
+    },
+    {
+      "fastest_seconds": 1.9195677130192053,
+      "median_seconds": 1.9203226410027128,
+      "n_repeats": 3,
+      "n_units": 400,
+      "name": "sample_beta4_low",
+      "note": "\u03b2=4, 400 sweeps incl. fixed chain cost",
+      "raw_seconds": [
+        1.9195677130192053,
+        1.921920525986934,
+        1.9203226410027128
+      ],
+      "seconds_per_unit": 0.004800806602506782,
+      "slowest_seconds": 1.921920525986934,
+      "spread": 0.0012252175324560472,
+      "unit": "sweep",
+      "units_per_second": 208.29833042594166
+    },
+    {
+      "fastest_seconds": 3.828118806995917,
+      "median_seconds": 3.833497763000196,
+      "n_repeats": 3,
+      "n_units": 800,
+      "name": "sample_beta4_high",
+      "note": "\u03b2=4, 800 sweeps incl. fixed chain cost",
+      "raw_seconds": [
+        3.828118806995917,
+        3.833497763000196,
+        3.840604775992688
+      ],
+      "seconds_per_unit": 0.004791872203750245,
+      "slowest_seconds": 3.840604775992688,
+      "spread": 0.00325706959249634,
+      "unit": "sweep",
+      "units_per_second": 208.68670062139256
+    },
+    {
+      "fastest_seconds": 0.002849702024832368,
+      "median_seconds": 0.00285928399534896,
+      "n_repeats": 3,
+      "n_units": 2000,
+      "name": "kernel_uniform",
+      "note": "sample_line at \u03b2=0: chord \u2192 uniform draw, no piecewise machinery",
+      "raw_seconds": [
+        0.0029688320064451545,
+        0.002849702024832368,
+        0.00285928399534896
+      ],
+      "seconds_per_unit": 1.42964199767448e-06,
+      "slowest_seconds": 0.0029688320064451545,
+      "spread": 0.041664270428040315,
+      "unit": "draw",
+      "units_per_second": 699475.8139636671
+    },
+    {
+      "fastest_seconds": 0.18460093601606786,
+      "median_seconds": 0.18479071100591682,
+      "n_repeats": 3,
+      "n_units": 2000,
+      "name": "kernel_tilted",
+      "note": "sample_line at \u03b2=4: breakpoints \u2192 piecewise J \u2192 segment masses \u2192 inverse CDF",
+      "raw_seconds": [
+        0.18504135898547247,
+        0.18460093601606786,
+        0.18479071100591682
+      ],
+      "seconds_per_unit": 9.239535550295841e-05,
+      "slowest_seconds": 0.18504135898547247,
+      "spread": 0.002383360976356144,
+      "unit": "draw",
+      "units_per_second": 10823.05484465592
+    },
+    {
+      "fastest_seconds": 0.11417737998999655,
+      "median_seconds": 0.11427538801217452,
+      "n_repeats": 3,
+      "n_units": 2000,
+      "name": "kernel_breakpoints",
+      "note": "build_piecewise_j alone (the sort); median 2 breakpoints/chord, max 8",
+      "raw_seconds": [
+        0.11427538801217452,
+        0.11417737998999655,
+        0.11459318298147991
+      ],
+      "seconds_per_unit": 5.713769400608726e-05,
+      "slowest_seconds": 0.11459318298147991,
+      "spread": 0.003638604941241261,
+      "unit": "build",
+      "units_per_second": 17501.581353518806
+    },
+    {
+      "fastest_seconds": 0.009735447994899005,
+      "median_seconds": 0.009872940019704401,
+      "n_repeats": 3,
+      "n_units": 200,
+      "name": "output_float64",
+      "note": "store_chain, mode=full_flux dtype=float64, atomic",
+      "raw_seconds": [
+        0.011086534010246396,
+        0.009872940019704401,
+        0.009735447994899005
+      ],
+      "seconds_per_unit": 4.9364700098522006e-05,
+      "slowest_seconds": 0.011086534010246396,
+      "spread": 0.1368473841278176,
+      "unit": "sample",
+      "units_per_second": 20257.3903620239
+    },
+    {
+      "fastest_seconds": 0.008339343999978155,
+      "median_seconds": 0.008524501987267286,
+      "n_repeats": 3,
+      "n_units": 200,
+      "name": "output_float32",
+      "note": "store_chain, mode=full_flux dtype=float32, atomic",
+      "raw_seconds": [
+        0.008339343999978155,
+        0.009471074998145923,
+        0.008524501987267286
+      ],
+      "seconds_per_unit": 4.262250993633643e-05,
+      "slowest_seconds": 0.009471074998145923,
+      "spread": 0.13276212497318793,
+      "unit": "sample",
+      "units_per_second": 23461.78114554166
+    },
+    {
+      "fastest_seconds": 0.006833774008555338,
+      "median_seconds": 0.0068872190022375435,
+      "n_repeats": 3,
+      "n_units": 200,
+      "name": "output_reduced",
+      "note": "store_chain, mode=reduced dtype=float64, atomic",
+      "raw_seconds": [
+        0.006833774008555338,
+        0.0068872190022375435,
+        0.007017867988906801
+      ],
+      "seconds_per_unit": 3.443609501118772e-05,
+      "slowest_seconds": 0.007017867988906801,
+      "spread": 0.026729799109285458,
+      "unit": "sample",
+      "units_per_second": 29039.2972744185
+    }
+  ],
+  "sweep_rates": [
+    {
+      "beta": 0.0,
+      "dimension": 46,
+      "fixed_seconds": 0.0030491290090139678,
+      "is_resolved": true,
+      "n_sweeps_high": 800,
+      "n_sweeps_low": 400,
+      "seconds_high": 0.48279351499513723,
+      "seconds_low": 0.2429213220020756,
+      "seconds_per_sweep": 0.0005996804824826541,
+      "sweeps_per_second": 1667.5546882233662,
+      "updates_per_second": 76707.51565827485
+    },
+    {
+      "beta": 4.0,
+      "dimension": 46,
+      "fixed_seconds": 0.007147519005229475,
+      "is_resolved": true,
+      "n_sweeps_high": 800,
+      "n_sweeps_low": 400,
+      "seconds_high": 3.833497763000196,
+      "seconds_low": 1.9203226410027128,
+      "seconds_per_sweep": 0.004782937804993708,
+      "sweeps_per_second": 209.07652174693405,
+      "updates_per_second": 9617.520000358967
+    }
+  ],
+  "total_seconds": 8.59853187497356
+}
