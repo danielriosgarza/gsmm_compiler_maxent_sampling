@@ -955,3 +955,156 @@ noise* — and the corollary M9 adds, **a bar that a valid input clears only 2 t
 tolerance, it is a coin flip.** The signature that exposed it: the *absolute* quantity was constant
 to 1.8× while the *relative* one swung 373×. When a ratio is unstable and its numerator is not, the
 denominator is the thing that is wrong.
+
+---
+
+# M10 — the pilot DAG: what should `s_J` actually be?  ·  Claude × Codex, 4 rounds, converged (AGREE)
+
+## The finding that opened it: **the recorded prerequisite was arithmetically false**
+
+M6 deferred a "pilot-based `s_J`" to M10 and promoted it to a **prerequisite**, recording that spec
+§22.2 "already names the remedy" with its phrase "support **or pilot** points", and that reading the
+scale off a pilot chain "tilts ~12× harder".
+
+Measured first, on the example model (d = 46, λ̃ = 0.5, `J*` = 9.4664, 4 chains × (3000+3000),
+N = 12000 pilot draws) — **it does not**:
+
+| candidate `s_J` | value | `dE/dβ|₀` | β to close the gap (linear response) |
+|---|---|---|---|
+| **A** `J* − Q₀₅(J(support))` — current (M6) | 32.5118 | 0.1831 | 116.9 |
+| **B** `J* − Q₀₅(J(pilot))` — **spec §22.2 literal, pilot W** | 25.4075 | 0.2343 | 91.4 |
+| **C** `J* − mean(J(pilot))` | 21.3998 | 0.2781 | 76.9 |
+| **D** `Q₉₅ − Q₀₅(J(pilot))` | 8.0729 | 0.7373 | 29.0 |
+| **E** `sd(J(pilot))` — M6's "12×" | 2.4397 | 2.4397 | **8.77** |
+
+Spec §22.1's own ladder tops out at **β = 16**. Swapping W from support → pilot *inside the spec's
+formula* (A → B) buys **1.28×**, not 12×. **M6 conflated an anchored range *to `J*`* with a
+*spread*, and then cited the spec as authority for a formula the spec does not state.** The "12×" is
+just `32.5 / 2.44` — a ratio between two different quantities.
+
+A prerequisite was recorded, and a milestone gated on it, on arithmetic nobody had done.
+
+## Settled — the consensus position
+
+**`s_J = σ̂₀` = the sd of `J` over a frozen β=0 pilot, as a NEW additive mode
+`energy_scale="pilot_sd"`.** `warmup_range` keeps its semantics and its label; existing results keep
+their original scale method. Codex's opening verdict was DISAGREE — but against my *overclaims*, not
+against E; its own recommendation was E.
+
+**What may be claimed:** `I₀ = 1` and `KL(π_β‖π_0) = ½β² + O(β³)` — a **local Fisher-standardized
+coordinate**, and *exact at the estimand level only*. With the frozen plug-in the implemented
+coordinate has `I₀ = σ₀²/σ̂₀²`. **What may NOT be claimed:** a universal finite-β axis; Fisher–Rao
+arc length at finite β; that the ladder spans.
+
+### Five overclaims of mine that did not survive
+
+1. **"β is Fisher–Rao arc length from the neutral ensemble."** False at finite β. Arc length is
+   `ℓ(β) = ∫₀^β √(Var_t(J))/σ₀ dt`, which equals β **only infinitesimally**. A local property
+   claimed globally.
+2. **"The anchored coordinate governs no realized expectation."** Exactly backwards, and Codex's
+   refutation is the best argument in the exchange. If the neutral deficit `X = J* − J` has a density
+   of states `g(x) ~ C·x^{r−1}` as `x ↓ 0`, the tilted law is `e^{−κx}·g(x)`: **measure-zero is
+   precisely what *produces* the `x^{r−1}` power**, and hence `r/κ` — it does not make `e^{−κx}`
+   irrelevant. So `1 − q(κ) ~ r/(κΔ₀)`, and `κΔ₀/r` governs fractional gap closure. Entropy
+   **modifies** the coordinate; it does not defeat it. Consequence: under C, `1 − q ~ r/β` — q depends
+   only on β and r, so **C is the strain-comparable coordinate in the *sharp* regime while E is
+   natural in the *weak* regime.** No scalar is universal.
+3. **"sd has one input."** It removes the `J*` join only: **3 provenance-bearing artifacts → 2**, not
+   1. The pilot fluxes still join an objective to a polytope.
+4. **"Var_β(J) shrinks."** Not a theorem. `d/dβ Var_β(J) = E_β[(J−E_β J)³]/s_J` — the sign is the
+   tilted **third central moment**. (It *is* measured to shrink here: M6's mean-J rise of 3.14 against
+   a linear-response prediction of 3.44 is exactly that.)
+5. **"β\* = 8.77 closes the gap."** Full closure needs **infinite** β when the argmax set has measure
+   zero. `β*` is a *local scale*, never a predicted endpoint.
+
+Codex conceded that **σ₀ is the better primary local coordinate**, and that its own spanning-by-
+construction alternative `s_J = B·Var₀/Δ₀` is **circular** — it folds `G` into the treatment axis.
+It also killed my candidate D by normalizing it: `(Q₉₅−Q₀₅)/3.289707 = 2.45399`, only **0.586% above
+sd**. Raw D looked like a rival only because it was never normalized. **D and E are one estimand with
+a robustness knob, not a fork.**
+
+### The synthesis: **σ₀ sets the axis, Δ₀ is reported**
+
+Because `1 − q ~ r/(κΔ₀)`, publishing `q(β)`, `Δ₀ = J* − E₀[J]`, `G = Δ₀/σ₀ = 8.77` ("the strain's
+headroom in neutral standard deviations") and `βG` hands the reader the anchored coordinate's
+information as a **derived observable** — instead of baking it into the x-axis, where it would hide
+the very cross-strain quantity the study exists to compare (BUILD_PLAN §1.1).
+
+### `r_eff(κ)` — Codex's falsifiable prediction, now a diagnostic
+
+For a piecewise-linear objective near an optimal face of dimension `f`, with `c = d − f` the
+transverse codimension, Laplace gives `Z(κ) ~ e^{κJ*}·C·κ^{−c}`, hence
+
+```
+J* − E_κ[J] ~ c/κ        r_eff(κ) := κ·[J* − E_κ J] → c        (corroborator: κ²·Var_κ(J) → c)
+```
+
+An **integer-ish plateau under regular local geometry** (not an unconditional expectation). At small
+κ, `r_eff = κΔ₀ − κ²σ₀² + O(κ³)` starts at **zero**, so non-constancy *before* the asymptotic region
+is expected; a **sustained plateau** is the signature of entering the sharp regime. A **linear drift**
+instead of a plateau indicts `J*` itself: a `+δ` error adds `κδ`. Hence the `J*` solver tolerance is
+recorded — at high κ a tiny optimum error masquerades as non-plateauing `r_eff`.
+
+## The pipeline (Codex's sequential design, adopted)
+
+```
+1. geometry pilot at β=0 under T₀     (OBJECTIVE-INDEPENDENT)
+2. freeze its covariance → build T₁
+3. INDEPENDENT scale pilot at β=0 under T₁   (better mixing → better ESS for σ̂₀)
+4. freeze σ̂₀ → production chains on independent streams
+```
+
+It **separates random *efficiency* calibration from random *target* calibration.** One shared pilot
+would be valid — the transform cannot move the stationary law and both artifacts are frozen — but it
+would make pilot-seed sensitivity **unattributable**, because geometry quality and the selected target
+would move together. The scale pilot runs under `T₁` deliberately: a poor `T₀` cannot deform the
+neutral *target*, only the *efficiency* of estimating σ̂₀.
+
+**The β=0 law is objective-independent**, so **one neutral pilot serves many objectives on a
+polytope** — which matters directly, because M7 puts a base *and* a reweighted objective on one
+polytope. The pilot artifact is objective-**independent**; the derived scale artifacts are objective-
+**keyed**. The pilot key covers polytope + input transform + schedule (chains/burn-in/samples/thin) +
+impl version + semantic RNG stream — not merely polytope+objective+stream.
+
+## Precision is a warning; validity is a refusal
+
+`se(σ̂)/σ ≈ √(K−1) / (2·√ESS_{(J−μ)²})` with **Pearson** kurtosis `K` (so `√(K_ex+2)` when reporting
+excess), and the ESS belongs to the **centered-square** influence series — not raw `J²`, and not my
+original Gaussian `√(2·ESS)`. Target ~2%. Degraded precision ⇒ **WARNING, never a gate** — this repo
+has been burned by exactly one noise-floor gate too many (§1.4.2).
+
+**But Codex caught the gate trying to re-enter through the door I opened**: "the numerical-resolution
+refusal needs a predeclared, implementation-level criterion. Otherwise it can quietly become the
+noise-floor gate you explicitly rejected." So the refusal reuses M6's **existing predeclared**
+mechanism (`ENERGY_SCALE_ULP_MARGIN = 64`), and refuses **only** nonpositive / nonfinite / below-
+resolution — the cases where the target is **undefined**, which is a different failure from imprecise.
+
+**The estimand is predeclared as SD and is never switched per-strain after seeing diagnostics** —
+doing so would make β mean different things across the batch, the one thing `s_J` exists to prevent.
+`R₉₀ = (Q₉₅−Q₀₅)/(3.289707·σ)` (= 1 for a Gaussian population; **1.00586** measured here), skewness
+and excess kurtosis are reported *as diagnostics*, not as estimator selectors. Codex's check: the
+central-90 midpoint sits `0.012σ` from the mean — **no evidence E is tail-driven on this model.**
+
+## What the DAG does and does not guarantee (Codex, round 3 — all conceded)
+
+Freezing `T₁` and `σ̂₀` before production gives a **time-homogeneous kernel with a fixed conditional
+invariant law**. It does **not** give stationarity from iteration zero — burn-in provides
+*convergence*, not stationarity, unless the initial state is drawn from the law. And conditional on
+the pilot artifact the invariant target is `π_{β/σ̂₀}`, **not** the ideal `π_{β/σ₀}`; marginalizing
+over pilot randomness yields a **mixture of calibrated targets**. That is *calibration uncertainty*,
+not an MCMC invariance failure — and the distinction is stated rather than blurred.
+
+**Range-invariance alone is not the clean condition.** The requirement is that `T₁` be a *nonsingular
+affine coordinate change on the affine hull*, with constraints and Jacobian handled consistently. The
+real implementation risks are **feasibility tolerances, rank loss, state carry-over, production-
+dependent rerunning, and residual adaptation** — which is what the tests must target. The algebra was
+never in doubt.
+
+Freezing plus reported precision also does **not** exclude **finite-burn-in bias** in σ̂₀, which an
+ESS-based precision estimate cannot see (ESS measures within-chain information, not retained
+initialization). Defences: dispersed independent scale chains, **between-chain agreement on σ̂₀
+itself**, R̂ on the scale pilot's `J` trace, and the transform rank/conditioning checks M5 already has.
+
+**The lesson:** *a deferred remedy is a hypothesis, not a plan.* M6 recorded a prerequisite, a
+mechanism and a magnitude for a fix it had not computed — and all three were wrong while the
+*diagnosis* was exactly right. The β axis really was uncalibrated; the named cure simply was not one.

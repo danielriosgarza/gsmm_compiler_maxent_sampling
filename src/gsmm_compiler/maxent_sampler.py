@@ -115,6 +115,14 @@ SAMPLER_IMPL_VERSION = 1
 
 VALUE_DTYPE = np.float64
 
+SAMPLE_STAGE = "sample"
+"""The production chains' RNG stage (`provenance.stream_seed`).
+
+A *stage* is what distinguishes two otherwise identically-named streams. M10's pilots
+(`calibration.GEOMETRY_PILOT_STAGE`, `SCALE_PILOT_STAGE`) are β=0 chains on the same model with the
+same chain indices, so the stage is the **only** coordinate separating them — and while it was
+hardcoded here, they drew the same numbers."""
+
 SUGGESTED_BETA_LADDER: tuple[float, ...] = (0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0)
 """Spec §22.1's *starting* ladder, in units of ``s_J``. Not a default, and not a recommendation.
 
@@ -386,6 +394,7 @@ def run_chain(
     feasibility_tol: float = 1e-9,
     start: NDArray[np.float64] | None = None,
     optimum_coordinates: NDArray[np.float64] | None = None,
+    stage: str = SAMPLE_STAGE,
 ) -> ChainResult:
     """Run one chain of coordinate hit-and-run and return its thinned draws (spec §18.2).
 
@@ -398,9 +407,17 @@ def run_chain(
     weight at position 772 of a 260-long vector and raises, but on a model where the index happens
     to be in range it would silently tilt by the wrong reactions.
 
-    The RNG is keyed on ``(model_id, "sample", β_index, chain_index)`` — semantic coordinates, not a
+    The RNG is keyed on ``(model_id, stage, β_index, chain_index)`` — semantic coordinates, not a
     position in a `spawn()` sequence (`provenance.stream_seed`). Add a chain, and the others still
     draw the same numbers; reorder a batch, and every stream keeps its name.
+
+    ``stage`` defaults to `SAMPLE_STAGE` and production has no reason to pass anything else. It is
+    a parameter because **M10's pilots are different streams of the same kernel**: a geometry pilot
+    and a scale pilot at the same β on the same model differ in nothing a semantic key can see
+    *except* their stage, so with a hardcoded stage they would draw **identical numbers** — and the
+    independence that makes pilot-seed sensitivity attributable (BUILD_PLAN §1.6.6) would be a
+    comment rather than a fact. It was hardcoded until `test_the_two_pilot_stages_draw_different_
+    numbers` failed.
     """
     if not np.isfinite(beta) or beta < 0.0:
         raise SamplerError(f"beta must be finite and >= 0, got {beta}")
@@ -420,7 +437,7 @@ def run_chain(
 
     seed_sequence = stream_seed(
         model_id=model_id,
-        stage="sample",
+        stage=stage,
         seed=config.seed,
         beta_index=beta_index,
         chain_index=chain_index,
@@ -707,6 +724,7 @@ def run_chains(
     energy_scale: float = 1.0,
     feasibility_tol: float = 1e-9,
     optimum_coordinates: NDArray[np.float64] | None = None,
+    stage: str = SAMPLE_STAGE,
 ) -> SamplerResult:
     """Every chain at one ``β``, each from its own dispersed start and its own named RNG stream.
 
@@ -731,6 +749,7 @@ def run_chains(
             energy_scale=energy_scale,
             feasibility_tol=feasibility_tol,
             optimum_coordinates=optimum_coordinates,
+            stage=stage,
         )
         for chain_index in range(config.n_chains)
     )

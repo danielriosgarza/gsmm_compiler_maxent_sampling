@@ -463,6 +463,116 @@ the kernel/objective/`s_J`/traces, so it **cannot change the invariant target** 
 seeds a poorer start, which is observable via feasibility and R̂/ESS. Keying it would imply it defines
 the distribution, which it does not (Codex conceded, r5). The boundary is documented instead.
 
+### 1.6.6 (M10) `s_J` from the pilot's **spread**, not its range to `J*` — and M6's remedy was wrong
+
+*(M10 collab finding, 4 rounds, converged AGREE.)* M6 recorded a **prerequisite** — that the β axis
+is uncalibrated — together with a remedy, a mechanism and a magnitude: use spec §22.2's "support **or
+pilot** points", and the ladder "tilts ~12× harder". **The diagnosis was exactly right and all three
+parts of the cure were wrong**, which nobody could see because nobody had done the arithmetic.
+
+Measured (Bifido, d = 46, λ̃ = 0.5, `J*` = 9.4664, 4 chains × (3000+3000), N = 12000):
+
+| candidate `s_J` | value | `dE/dβ|₀` | β to close the gap (linear response) |
+|---|---|---|---|
+| **A** `J* − Q₀₅(J(support))` — M6's | 32.51 | 0.183 | 117 |
+| **B** `J* − Q₀₅(J(pilot))` — **spec §22.2 literal** | 25.41 | 0.234 | 91 |
+| **C** `J* − mean(J(pilot))` | 21.40 | 0.278 | 77 |
+| **E** `sd(J(pilot))` | **2.44** | **2.44** | **8.8** |
+
+Spec §22.1's ladder tops out at **β = 16**. Swapping the point set *inside the spec's formula*
+(A → B) buys **1.28×**, not 12× — the `J*` anchor dominates, so the fix does essentially nothing.
+M6's "12×" is `32.5/2.44`: **a ratio between an anchored range and a spread, two different
+quantities.** The remedy that works abandons the formula.
+
+**Decision: `s_J = σ̂₀`, the SD of `J` over a frozen β=0 pilot, as a NEW mode
+`sampler.energy_scale = "pilot_sd"`.** `warmup_range` keeps its semantics and its label; v1's
+results keep their scale method. Measured, the *identical* ladder now closes **75.8%** of the gap at
+β = 16 (E[J] −12.18 → +4.24, monotone, R̂ ≤ 1.06) where `warmup_range` closed **13%**.
+
+**What may be claimed:** `I₀ = 1` and `KL(π_β‖π_0) = ½β² + O(β³)` — β is the **local**
+Fisher-standardized coordinate, and `β = 1` shifts `E[J]` by one neutral SD to first order.
+**Exact at the *estimand* level only:** the implemented coordinate uses the frozen plug-in, so
+`I₀ = σ₀²/σ̂₀²`. **What may NOT be claimed:** a universal finite-β axis; Fisher–Rao arc length at
+finite β (that is `ℓ(β) = ∫₀^β √(Var_t(J))/σ₀ dt`, equal to β only infinitesimally); that the ladder
+"spans". This is M6's own "engine validated, scale not calibrated" distinction, one layer deeper.
+
+**No scalar is universal, so σ₀ sets the axis and Δ₀ is *reported*.** If the neutral deficit
+`X = J* − J` has a density of states `g(x) ~ C·x^{r−1}`, the tilted law is `e^{−κx}·g(x)`:
+measure-zero is what *produces* the `x^{r−1}` power and hence `r/κ`, so `1 − q(κ) ~ r/(κΔ₀)` and the
+anchored coordinate **does** govern fractional gap closure in the sharp regime (entropy modifies it,
+it does not defeat it). E is natural in the *weak* regime, C in the *sharp* one. So the run reports
+`Δ₀ = J* − E₀[J]`, `G = Δ₀/σ̂₀` (9.03 here — "the strain's headroom in neutral standard deviations"),
+`β·G` and `q(β)`: the anchored view stays recoverable as a **derived observable** instead of being
+baked into the x-axis, where it would hide the very cross-strain quantity §1.1 exists to compare.
+
+**The pipeline is sequential, and the two pilots are independent streams.**
+
+```
+1. geometry pilot at β=0 under T₀   (OBJECTIVE-INDEPENDENT)
+2. freeze its covariance → build T₁   (spec §17.4; measured cond(C_q) 1.54e4 → 5.36e3, 2.87×)
+3. INDEPENDENT scale pilot at β=0 under T₁   (better mixing → better ESS for σ̂₀)
+4. freeze σ̂₀ → production chains on independent streams
+```
+
+One shared pilot would be *valid* — the transform cannot move the stationary law and both artifacts
+are frozen — but it would make pilot-seed sensitivity **unattributable**, since geometry quality and
+the selected target would move together. Separating them separates *random efficiency calibration*
+from *random target calibration*. A poor `T₀` cannot deform the neutral **target**, only the
+efficiency of estimating σ̂₀ from it, so the stages do not compound as target deformation.
+**The β=0 law is objective-independent, so one neutral pilot serves every objective on a polytope** —
+which matters directly, because M7 puts a base *and* a reweighted objective on one. The pilot
+artifact carries **no objective key**; the derived scale artifacts do.
+
+**Precision warns; validity refuses.** `se(σ̂)/σ ≈ √(K−1)/(2·√ESS_{(J−μ)²})` with **Pearson**
+kurtosis and the ESS of the **centered-square** series — not the Gaussian `1/√(2·ESS_J)`, which fixes
+`K = 3` and reads the wrong series (measured: the two ESSs differ by **2.17×**). Target ~2%; above it
+a **warning, never a gate** — a precision bar on an MCMC estimate would refuse a correct run for an
+unlucky pilot seed, which is §1.4.2's defect in a new coat. **But** nonpositive / non-finite / below
+`64·ulp(max|J|)` still **raises**: those make the target *undefined*, a different failure from
+imprecise. The refusal reuses M6's predeclared `ENERGY_SCALE_ULP_MARGIN` rather than inventing a bar —
+a bespoke "is σ̂₀ too small" criterion is exactly how the noise-floor gate would re-enter.
+The estimand is **predeclared as the SD and never switched per strain** after seeing diagnostics;
+`R₉₀ = (Q₉₅−Q₀₅)/(3.289707·σ̂)` (1.0 for a Gaussian; **1.015** measured), skew and excess kurtosis are
+reported *as diagnostics*, not as estimator selectors — switching would forfeit `I₀ = 1` and make β
+mean different things in different strains.
+
+**What the DAG guarantees, precisely.** Freezing `T₁` and `σ̂₀` before production gives a
+**time-homogeneous kernel with a fixed conditional invariant law**. It does *not* give stationarity
+from iteration zero — burn-in gives convergence, not stationarity. And conditional on the pilot the
+invariant target is `π_{β/σ̂₀}`, not the ideal `π_{β/σ₀}`; marginalising over pilot randomness gives a
+**mixture of calibrated targets**. That is *calibration uncertainty*, not an invariance failure.
+Range-invariance alone is **not** the clean condition either: `T₁` must be a nonsingular affine
+coordinate change **on the affine hull**. The algebra was never in doubt — the real risks are
+feasibility tolerances, **rank loss**, state carry-over and residual adaptation, which is what the
+tests target.
+
+#### `r_eff(κ)` — a falsifiable prediction, now a diagnostic  *(and the ladder's real ceiling)*
+
+For a piecewise-linear `J` near an optimal face of dimension `f`, with `c = d − f`, Laplace gives
+`Z(κ) ~ e^{κJ*}·C·κ^{−c}`, hence `J* − E_κ[J] ~ c/κ` and
+
+```
+r_eff(κ) := κ·[J* − E_κ J] → c      (corroborator: κ²·Var_κ(J) → the same c)
+```
+
+an **integer-ish plateau under regular local geometry** — not an unconditional expectation. At small
+κ, `r_eff = κΔ₀ − κ²σ₀² + O(κ³)` starts at **zero**, so non-constancy *before* the asymptotic region
+is expected. **Measured, that expansion is confirmed to three digits** (κ=0.104: predicted 2.20,
+measured 2.182; κ=0.209: predicted 4.27, measured 4.263).
+
+Measured plateau: `r_eff` = 35.4 (β=16) → **37.4 ± 1.9 (β=32) → 37.0 ± 3.6 (β=64)** — flat within
+MCSE, and the corroborator agrees where it should (`κ²Var = 38.6` at β=32). So **c ≈ 37–39 and the
+optimal face has dimension f ≈ 7–9** in a d=46 polytope — tentative, and under-powered.
+
+🔴 **Above β=64 the numbers measure mixing failure, not geometry.** R̂ climbs 1.22 → 1.39 → 1.79 →
+**1.91** and ESS collapses to **4**. The proof it is not physics is M6's own theorem
+(`dE_β[J]/dβ = Var_β(J)/s_J ≥ 0`): `E[J]` *falls* 8.6357 → 8.6109 from β=128 to β=256. A drop is
+never physics. Codex's `J*`-indictment signature (a linear drift, `r_eff` 44 → 91 as κ doubles) duly
+fires there — and is **unattributable**, because the diagnostic's precondition is a converged chain.
+**Practical consequence: under `pilot_sd`, β = 16 is the working top rung at a 4×(2000+2000)
+schedule** (q = 0.76, R̂ = 1.06); β ≥ 32 needs a far longer one, because the tilted chain concentrates
+and its chords shorten.
+
 ### 1.7 λ is scale-referenced: `λ = λ̃ · λ*`  *(M3 finding; decision SETTLED)*
 
 `J(v) = μ(v) − λ·C(v)` compares a **biomass flux** with a **sum of hundreds of absolute fluxes**.
@@ -551,7 +661,7 @@ step that rescaled the pressure by an arbitrary median every iteration. Recorded
 | **M7** ✅ | Reweighted-L1 (frozen weights) | iterative reweighting `w_r ← w_base/(\|v_r\|+ε)` with clipping + median-renormalization, save every weight vector + LP solution, **freeze final weights before sampling**, rebuild objective/LP-optimum/`s_J` (L2 cache) from frozen weights. **λ re-resolved each iteration** (`λ_k = λ̃·λ*(w_k)`, §1.7); every `s_J` input keyed on objective+polytope (§1.6.5) | deterministic weights for fixed seed; active-set + **weight fixed point** converge; weights frozen ⇒ objective `J` unchanged during MCMC (reweighter cannot import sampler); labeled experimental (not exact cardinality); sampler reproduces analytic targets under the reweighted `J`. **PASSED 2026-07-16** (733 tests; `/collab` 5 rounds AGREE) |
 | **M8** ✅ | Cache, restart, batch orchestration & production | 4-layer cache, per-chain markers + writer-claim locking, atomic rename + fsync, **batch runner over a models manifest**, one global process pool over `(model, β, chain)`, worker thread-limit env, per-model run dirs + **cross-model aggregation**, manifests + diagnostics + `COMPLETE` | kill-and-resume resumes only missing `(model,chain)` units; partial batch yields valid cross-model tables; concurrent-writer safe; corrupted-artifact rejected; same-env deterministic traces; full batch runs on ≥2 strains with documented resources. **PASSED 2026-07-16** (content-addressed cache store with atomic-mkdir writer claim; `spawn` pool workers import no solver; serial==pool byte-identical; L0 key made content-addressed) |
 | **M9** | Performance & GSMM hardening | `benchmark.py` (new module) + `maxent benchmark` CLI → [benchmarks/M9_REPORT.md](benchmarks/M9_REPORT.md); worker-count sweep {1,2,4,7,14} by **ESS(J)/wall-sec**; allocation + sort profiling; `reduced` storage-mode validation; **the reachable-state mass-balance certificate (§1.4.2)** — scope added mid-milestone when the benchmark's own worker sweep could not run | benchmark report produced; all performance assertions hold (no per-step HiGHS, no scipy, no Python loop in chord, no element-wise highspy extraction, no full reconstruction every step) |
-| **M10** | Deferred extensions | pilot rerounding + **pilot-based s_J** (split bootstrap-geometry → β=0 pilot → {final T, s_J} DAG); β→performance calibration; parallel tempering; slice line kernel; downstream mode-feature extraction | each behind its own tests; none alters the validated v1 target distribution |
+| **M10** | Deferred extensions | **(1) pilot rerounding + pilot-based `s_J` — DONE**, as one DAG (bootstrap `T₀` → geometry pilot → `T₁` → scale pilot → `σ̂₀`), `energy_scale="pilot_sd"` additive beside `warmup_range` (§1.6.6). **(2) wire the DAG into `batch`/CLI + decide whether the pilot and `T₁` enter §1.1's cache DAG as a new layer — NEXT, and a real fork §1.1 does not settle.** Then: β→performance calibration (spec §22.3, now cheap — `q(β)` and `r_eff(κ)` are already computed); parallel tempering; slice line kernel; downstream mode-feature extraction | each behind its own tests; none alters the validated v1 target distribution. **(1) PASSED 2026-07-16** (37 new tests; `/collab` 4 rounds AGREE; ladder closes 75.8% of the gap at β=16 vs 13% before, cond(C_q) 2.87× better) |
 
 ### 2.1 What M6 ships, and what it does not  *(M6 finding; SETTLED — and it constrains M10)*
 
@@ -581,6 +691,16 @@ validates is untouched either way.
 neutral-to-strongly-selected regimes.** Until it lands, a run reports what it measured and does not
 pretend the β axis means more than itself. Recorded here rather than left as folklore, because it is
 exactly the kind of claim a downstream paper would make by accident.
+
+> ✅ **Discharged by M10 (§1.6.6), but not by the remedy named above.** `sampler.energy_scale =
+> "pilot_sd"` closes **75.8%** of the gap at β = 16 where `warmup_range` closed 13%. **The paragraph
+> above got the diagnosis right and the cure wrong**: spec §22.2's formula with pilot points buys
+> **1.28×**, not the 12× claimed — the "12×" was a ratio between an *anchored range* and a *spread*,
+> which are different quantities. The lesson is worth more than the fix: **a deferred remedy is a
+> hypothesis, not a plan.** M10 also bounds what may now be said — β is a *local* Fisher-standardized
+> coordinate (`I₀ = 1`, `KL ≈ ½β²`), exact at the **estimand** level, and **no scalar `s_J` is a
+> universal finite-β axis**. A run reports `q(β)`, `Δ₀`, `G` and `r_eff(κ)` alongside β so the claim
+> stays checkable.
 
 ---
 

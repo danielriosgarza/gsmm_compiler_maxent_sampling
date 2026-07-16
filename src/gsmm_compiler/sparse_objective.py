@@ -1206,6 +1206,36 @@ def lower_objective(
 DEFAULT_ENERGY_QUANTILE: Final = 0.05
 """``s_J = J* − Q_{0.05}(J(W))`` — the robust lower quantile spec §22.2 prescribes."""
 
+NORMAL_Q90_WIDTH: Final = 3.2897072539029444
+"""``Q_{0.95} − Q_{0.05}`` of a standard normal — the divisor making `R₉₀` equal 1 for a Gaussian.
+
+Used only to *report* how Gaussian the pilot's ``J`` is, never to select an estimator. See
+`PilotScaleReport.robust_width_ratio`.
+"""
+
+PILOT_SCALE_TARGET_RELATIVE_SE: Final = 0.02
+"""Relative standard error of ``σ̂₀`` above which a run is **warned** — never refused (M10).
+
+2% is a target, not a bar. ``s_J`` is a *reparameterization*: a 6% error in it makes ``β = 2`` name
+the pressure ``β = 2.12`` would have — a smoothly wrong label on a perfectly valid distribution.
+Nothing about the sample is invalid; every rung is still exactly ``π_{β/σ̂₀}``.
+
+**This must not become a gate, and this repo's own history says why.** M9 found M5's rounding gate
+rejecting a valid genome-scale geometry on 8 of 24 RNG streams, so the ``model_id`` *string* decided
+whether a model could be sampled at all (§1.4.2). A precision bar on an MCMC estimate is the same
+shape: it would refuse a correct run for drawing an unlucky pilot. Imprecise and undefined are
+different failures — the resolution refusal in `pilot_energy_scale` handles the second.
+"""
+
+PILOT_SCALE_MIN_CHAINS: Final = 2
+"""Fewer chains than this and neither R̂ nor the between-chain ``σ̂`` spread exists.
+
+They are the only instruments here that can see **retained initialization**, which an ESS cannot: an
+ESS measures within-chain information, and a chain that never left its starting basin has plenty of
+that. (Codex, M10 review round 3 — "freezing plus reported precision does not by itself exclude
+finite-mixing bias".)
+"""
+
 ENERGY_SCALE_ULP_MARGIN: Final = 64.0
 """How many ULPs of the *operands* a warm-up range must clear to be a range rather than its
 rounding.
@@ -1235,6 +1265,115 @@ class DegenerateEnergyScaleError(ObjectiveError):
 
 
 @dataclass(frozen=True)
+class PilotScaleReport:
+    """What the ``pilot_sd`` scale saw — the estimate, its precision, and its assumptions.
+
+    Recorded in full because ``s_J`` decides **which** distribution each ``β`` names (spec §3.6: no
+    hidden scaling), and because here it is an **MCMC estimate**: at a fixed nominal β, two pilot
+    seeds give genuinely different targets. That is *calibration uncertainty*, not an invariance
+    failure — but it is real, and only honest if reported. (Codex, M10 review round 2.)
+    """
+
+    mean_j: float
+    """``E₀[J]`` over the pilot. Calibration provenance **only** — never the ``E₀`` in a published
+    ``q(β)``, which needs an independent production β=0 chain, or the same draws would sit on both
+    sides of the ratio."""
+
+    sd_j: float
+    """``σ̂₀`` — the estimate that becomes ``s_J``."""
+
+    gap: float
+    """``Δ₀ = J* − E₀[J]``. Reported, never in the axis.
+
+    The anchored coordinate the M10 review argued about, kept as an **observable**. Because
+    ``1 − q(κ) ~ r/(κΔ₀)`` in the sharp-optimum regime, a reader wanting the anchored view can
+    rebuild it from `gap` and `headroom` — whereas folding Δ₀ into ``s_J`` would bury the very
+    cross-strain quantity BUILD_PLAN §1.1 compares, inside the definition of the x-axis.
+    """
+
+    headroom: float
+    """``G = Δ₀/σ̂₀`` — the strain's headroom in neutral standard deviations (8.77 here).
+
+    The per-strain observable ``pilot_sd`` unhides: with ``β`` a universal *local* axis, ``G`` is
+    what actually differs between species, and ``β·G`` is the full-headroom log-odds tilt."""
+
+    relative_se: float
+    """``se(σ̂₀)/σ̂₀ ≈ √(K−1) / (2·√ESS_{(J−μ)²})``, Pearson kurtosis ``K``.
+
+    **Not** the Gaussian ``1/√(2·ESS_J)``: that fixes ``K = 3`` and, worse, reads the ESS of ``J``
+    when the estimator averages ``(J−μ)²`` — a *different* series with its own autocorrelation.
+    (Codex, M10 review round 1.)"""
+
+    ess_centered_square: float
+    """ESS of the ``(J − μ)²`` series — the one the SD estimator actually averages."""
+
+    ess_j: float
+    """ESS of ``J`` itself. Reported alongside because they are not interchangeable, and the
+    difference between them is the point of the field above."""
+
+    r_hat_j: float
+    """Split-R̂ of the pilot's ``J`` trace. The instrument for retained initialization, which
+    `relative_se` cannot see."""
+
+    sd_chain_ratio: float
+    """``max_c σ̂_c / min_c σ̂_c`` over the pilot's chains — between-chain agreement on the estimand
+    *itself*, not merely on its mean. A pilot whose chains disagree about the **spread** of ``J``
+    has not converged in the quantity being frozen, and R̂ (a statement about means) can miss it."""
+
+    skewness: float
+
+    excess_kurtosis: float
+    """``K − 3``. Feeds `relative_se` as ``√(K_ex + 2)`` and warns about tails."""
+
+    robust_width_ratio: float
+    """``R₉₀ = (Q₉₅ − Q₀₅) / (3.289707·σ̂₀)`` — **1.0** for a Gaussian population (1.006 here).
+
+    A pure diagnostic. The estimand is **predeclared as the SD and never switched per strain after
+    seeing this number**: picking a robust estimator only where tails look inconvenient would make
+    ``β`` mean different things in different strains — precisely the failure ``s_J`` exists to
+    prevent — and would forfeit the ``I₀ = 1`` property that motivates the SD at all. If ``J``'s
+    tails are real features of the bounded neutral ensemble, the variance *is* the Fisher
+    information, and trimming them contradicts the whole argument. (Codex, M10 review round 2.)
+    """
+
+    n_chains: int
+
+    n_draws: int
+
+    resolution: float
+    """``64·ulp(max|J|)`` — the float64 resolution of a spread of these numbers.
+
+    The **predeclared** refusal bar (`ENERGY_SCALE_ULP_MARGIN`), reused from M6 rather than invented
+    for M10. Codex's round-3 catch: a bespoke "is σ̂₀ too small" criterion would quietly become the
+    noise-floor gate this design explicitly rejects. This one asks the question that has an answer —
+    *does this spread have any significant digits left?* — and refuses only when it does not.
+    """
+
+    precision_warning: bool
+    """True when `relative_se` exceeds `PILOT_SCALE_TARGET_RELATIVE_SE`. A **label**, not a gate."""
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "pilot_mean_j": self.mean_j,
+            "pilot_sd_j": self.sd_j,
+            "pilot_gap": self.gap,
+            "pilot_headroom_g": self.headroom,
+            "pilot_relative_se": self.relative_se,
+            "pilot_ess_centered_square": self.ess_centered_square,
+            "pilot_ess_j": self.ess_j,
+            "pilot_r_hat_j": self.r_hat_j,
+            "pilot_sd_chain_ratio": self.sd_chain_ratio,
+            "pilot_skewness": self.skewness,
+            "pilot_excess_kurtosis": self.excess_kurtosis,
+            "pilot_robust_width_ratio": self.robust_width_ratio,
+            "pilot_n_chains": self.n_chains,
+            "pilot_n_draws": self.n_draws,
+            "pilot_resolution": self.resolution,
+            "pilot_precision_warning": self.precision_warning,
+        }
+
+
+@dataclass(frozen=True)
 class EnergyScale:
     """``s_J`` — the units ``β`` is measured in, and how it was arrived at (spec §3.6: no hidden
     scaling).
@@ -1252,7 +1391,26 @@ class EnergyScale:
     """``s_J > 0``. The one number the sampler consumes."""
 
     mode: str
-    """``warmup_range`` (spec §22.2) or ``declared`` (``energy_scale = <float>``, spec §3.6)."""
+    """``warmup_range`` (spec §22.2), ``pilot_sd`` (M10), or ``declared`` (spec §3.6).
+
+    **The three are not interchangeable and a run must never be read as if they were.**
+
+    - ``warmup_range`` — ``s_J = J* − Q_q(J(W))`` over M4's support-LP **vertices**. β measures
+      selection against the objective range over the polytope's *outline*.
+    - ``pilot_sd`` — ``s_J = σ̂₀``, the SD of ``J`` over a frozen β=0 pilot. β measures selection in
+      units of the **neutral ensemble's own fluctuation**: ``I₀ = 1`` and
+      ``KL(π_β‖π_0) = ½β² + O(β³)`` — *for the estimand*. The implemented coordinate uses the
+      plug-in σ̂₀ and so has ``I₀ = σ₀²/σ̂₀²`` (Codex, M10 r3: "exact" belongs to the estimand, not
+      the implementation).
+    - ``declared`` — a constant. β is in reciprocal raw-objective units, comparable with nothing.
+
+    Why ``pilot_sd`` exists: on the example model ``warmup_range`` gives ``s_J = 32.5`` while the
+    β=0 chain explores ``sd(J) = 2.44``, so spec §22.1's whole ladder (top rung β = 16) moves
+    ``E[J]`` only a fraction of the way to ``J*``. **M6 recorded the remedy as "use pilot points in
+    §22.2's formula"; M10 measured it and that buys 1.28×, not the 12× claimed** — the formula's
+    ``J*`` anchor dominates. The scale that changes anything is the pilot's *spread*, a different
+    quantity from a range to ``J*``. See BUILD_PLAN §1.6.6.
+    """
 
     j_star: float
 
@@ -1296,7 +1454,14 @@ class EnergyScale:
     reproduction, `test_energy_scale_refuses_a_borrowed_objective`.)
     """
 
-    fell_back: bool
+    pilot: PilotScaleReport | None = None
+    """The pilot's statistics and precision, in ``pilot_sd`` mode. ``None`` in the other two.
+
+    Optional with a default so every existing construction and cached manifest stays valid: M10
+    *adds* a mode, it does not reinterpret the ones already used to produce results.
+    """
+
+    fell_back: bool = False
     """True when the range was below `resolution` and an explicitly **declared** fallback was used.
 
     Never silent. A degenerate range with no declared fallback raises `DegenerateEnergyScaleError`
@@ -1317,6 +1482,7 @@ class EnergyScale:
             "energy_scale_polytope_key": self.polytope_key,
             "energy_scale_objective_key": self.objective_key,
             "energy_scale_fell_back": self.fell_back,
+            **(self.pilot.as_dict() if self.pilot is not None else {}),
         }
 
 
@@ -1329,6 +1495,196 @@ def energy_scale_resolution(j_star: float, low: float) -> float:
     """
     return ENERGY_SCALE_ULP_MARGIN * float(
         np.spacing(max(abs(float(j_star)), abs(float(low)), 1.0))
+    )
+
+
+def pilot_energy_scale(
+    objective: ReducedObjective,
+    pilot_fluxes: NDArray[np.float64],
+    *,
+    optimum: LPOptimum,
+    pilot_polytope_key: str,
+) -> EnergyScale:
+    """``s_J = σ̂₀`` — the SD of ``J`` over a frozen β=0 pilot (M10; BUILD_PLAN §1.6.6).
+
+    ``pilot_fluxes`` is ``(n_chains, n_draws, n_free)``: the **reduced** fluxes of a β=0 chain that
+    has already finished. The chain axis is required, not a convenience — R̂ and the between-chain
+    ``σ̂`` spread are the only instruments here that can see **retained initialization**, and an ESS
+    cannot: a chain that never left its starting basin still has plenty of within-chain information.
+
+    **What this scale claims.** With ``X = (J − E₀J)/σ₀`` the family is ``π_β ∝ π_0·e^{βX}``, so the
+    Fisher information at zero is ``I₀ = 1`` and ``KL(π_β‖π_0) = ½β² + O(β³)``: β is the *local*
+    Fisher-standardized coordinate, and ``β = 1`` shifts ``E[J]`` by one neutral SD to first order.
+    **What it does not claim.** Not a universal finite-β axis, and not Fisher–Rao arc length at
+    finite β — that is ``ℓ(β) = ∫₀^β √(Var_t(J))/σ₀ dt``, which equals β only infinitesimally. And
+    ``I₀ = 1`` holds for the *population* ``σ₀``; the implemented coordinate uses the frozen
+    plug-in, so ``I₀ = σ₀²/σ̂₀²``. Fisher-standardized **exactly at the estimand level, estimated
+    operationally, with reported precision.** (Codex, M10 review rounds 1 and 3.)
+
+    **``J*`` does not enter the scale** — only `PilotScaleReport.gap` and `headroom`, which are
+    reported. That is the structural gain over `choose_energy_scale`: ``J* − Q_q(J(W))`` subtracts
+    three model-derived artifacts, and M6 and M7 each found an unguarded join among exactly those
+    three (§1.6.5). The ``optimum`` is still required and still key-checked, but it now cannot move
+    ``s_J`` by an ULP if it is wrong — a wrong ``J*`` corrupts a *reported diagnostic* instead of
+    the axis. (3 artifacts → 2, not → 1: the pilot fluxes still join an objective to a polytope.)
+
+    **Shift-invariance, both halves.** ``σ̂₀`` is invariant under ``J → J + c``, as ``s_J`` must be
+    (§1.6.4). Its *resolution floor* deliberately is **not**: it tracks what float64 can represent,
+    and a spread of numbers near 1e16 really does have fewer significant digits than the same spread
+    near 1. Same reasoning as `energy_scale_resolution`, whose predeclared mechanism this reuses
+    rather than inventing a bar of its own.
+    """
+    from gsmm_compiler.diagnostics import effective_sample_size, split_r_hat
+
+    if optimum.objective_key != objective.objective_key:
+        raise IncompatibleObjectiveError(
+            "the LP optimum was solved for a different objective than the pilot's J is measured "
+            f"with (optimum.objective_key = {optimum.objective_key[:16]}…, "
+            f"objective.objective_key = {objective.objective_key[:16]}…). It cannot move s_J here, "
+            "but it would corrupt the reported gap Δ₀ and headroom G — exactly the numbers a "
+            "cross-strain comparison reads."
+        )
+    if optimum.polytope_key != objective.polytope_key:
+        raise IncompatibleObjectiveError(
+            "the LP optimum was solved on a different polytope than this objective was lowered "
+            f"from (optimum.polytope_key = {optimum.polytope_key[:16]}…, objective.polytope_key = "
+            f"{objective.polytope_key[:16]}…). The objective key does not cover the polytope's "
+            "bounds, so the two can hash identically (Codex, M7 review round 2)."
+        )
+    if pilot_polytope_key != objective.polytope_key:
+        raise IncompatibleObjectiveError(
+            "the pilot ran on a different polytope than this objective was lowered from "
+            f"(pilot_polytope_key = {pilot_polytope_key[:16]}…, objective.polytope_key = "
+            f"{objective.polytope_key[:16]}…). The pilot fluxes are a bare (chains, draws, n_free) "
+            "array with no identity of their own, so a same-shaped set from the wrong polytope is "
+            "silently evaluable and silently changes s_J — the M7 round-3 defect, one mode on. "
+            "Pass the `polytope_key` of the transform the pilot chain ran under."
+        )
+
+    draws = np.asarray(pilot_fluxes, dtype=VALUE_DTYPE)
+    if draws.ndim != 3 or draws.shape[2] != objective.n_free:
+        raise ObjectiveError(
+            f"pilot fluxes have shape {draws.shape}, expected (n_chains, n_draws, "
+            f"{objective.n_free})"
+        )
+    n_chains, n_draws = int(draws.shape[0]), int(draws.shape[1])
+    if n_chains < PILOT_SCALE_MIN_CHAINS:
+        raise ObjectiveError(
+            f"the pilot has {n_chains} chain(s); s_J from a pilot needs at least "
+            f"{PILOT_SCALE_MIN_CHAINS}, because R̂ and the between-chain σ̂ spread are the only "
+            "checks here that can see retained initialization — and an ESS cannot (a chain that "
+            "never left its starting basin has plenty of within-chain information)."
+        )
+    if n_draws < 2:
+        raise ObjectiveError(
+            f"a standard deviation needs at least 2 draws per chain, got {n_draws}"
+        )
+
+    _, _, j_flat = objective.evaluate_many(
+        draws.reshape(n_chains * n_draws, objective.n_free)
+    )
+    j = np.asarray(j_flat, dtype=VALUE_DTYPE).reshape(n_chains, n_draws)
+    if not np.all(np.isfinite(j)):
+        raise ObjectiveError("the pilot's J trace is not all finite")
+
+    pooled = j.reshape(-1)
+    mean_j = float(np.mean(pooled))
+    sd_j = float(np.std(pooled, ddof=1))
+
+    # The predeclared floor, reused from M6 rather than invented here. `energy_scale_resolution`
+    # returns 64·ulp(max(|a|, |b|, 1)); the extremes of J give 64·ulp(max|J|) — the resolution of a
+    # spread of *these* numbers.
+    max_abs_j = float(np.max(np.abs(pooled)))
+    resolution = energy_scale_resolution(max_abs_j, 0.0)
+    if not np.isfinite(sd_j) or sd_j <= resolution:
+        raise DegenerateEnergyScaleError(
+            f"the pilot's objective spread is not resolvable: σ̂₀ = {sd_j:.6g}, at or below the "
+            f"float64 resolution of a spread of these J values ({resolution:.3e}, i.e. "
+            f"{ENERGY_SCALE_ULP_MARGIN:.0f} ULPs of max|J| = {max_abs_j:.6g}). The β=0 chain sees "
+            "essentially no variation in J, so there is no neutral fluctuation for β to be "
+            "measured against and every rung would be meaningless. Either the objective does not "
+            "discriminate on this polytope (check λ and the penalty set), the pilot did not move, "
+            "or J's magnitude has eaten its own spread — in which case the objective needs "
+            "re-centring, not a fallback. This is a refusal, not a precision warning: the target "
+            "would be undefined, which is a different failure from imprecise."
+        )
+
+    centered = pooled - mean_j
+    m2 = float(np.mean(centered**2))
+    m3 = float(np.mean(centered**3))
+    m4 = float(np.mean(centered**4))
+    kurtosis = m4 / (m2**2)  # Pearson, not excess
+    skewness = m3 / (m2**1.5)
+
+    # se(σ̂)/σ ≈ √(K−1)/(2·√ESS), where the ESS is that of the **centered-square** series — the one
+    # the SD estimator actually averages — not of J. The Gaussian 1/√(2·ESS_J) gets both wrong: it
+    # fixes K = 3 and reads the autocorrelation of the wrong sequence. (Codex, M10 r1.)
+    ess_centered_square = float(effective_sample_size(((j - mean_j) ** 2)[:, :, np.newaxis])[0])
+    ess_j = float(effective_sample_size(j[:, :, np.newaxis])[0])
+    r_hat_j = float(split_r_hat(j[:, :, np.newaxis])[0])
+    relative_se = (
+        float(np.sqrt(max(kurtosis - 1.0, 0.0)) / (2.0 * np.sqrt(ess_centered_square)))
+        if ess_centered_square > 0.0
+        else float("inf")
+    )
+
+    per_chain_sd = np.std(j, axis=1, ddof=1)
+    sd_chain_ratio = (
+        float(np.max(per_chain_sd) / np.min(per_chain_sd))
+        if float(np.min(per_chain_sd)) > 0.0
+        else float("inf")
+    )
+
+    q05, q95 = (float(x) for x in np.quantile(pooled, [0.05, 0.95]))
+    precision_warning = relative_se > PILOT_SCALE_TARGET_RELATIVE_SE
+    if precision_warning:
+        _log.warning(
+            "the pilot's energy scale is imprecise: se(σ̂₀)/σ̂₀ = %.1f%% (target %.1f%%), from "
+            "ESS[(J−μ)²] = %.0f and Pearson kurtosis %.2f. s_J = %.6g is still a valid scale and "
+            "every rung is exactly π_{β/s_J} — but β's *label* carries this error, so two strains "
+            "compared at nominal β differ by it. Lengthen the scale pilot to tighten it. (A "
+            "warning by design: refusing here would let an unlucky pilot seed reject a correct "
+            "run — BUILD_PLAN §1.4.2.)",
+            100.0 * relative_se,
+            100.0 * PILOT_SCALE_TARGET_RELATIVE_SE,
+            ess_centered_square,
+            kurtosis,
+            sd_j,
+        )
+
+    gap = float(optimum.j_star) - mean_j
+    report = PilotScaleReport(
+        mean_j=mean_j,
+        sd_j=sd_j,
+        gap=gap,
+        headroom=gap / sd_j,
+        relative_se=relative_se,
+        ess_centered_square=ess_centered_square,
+        ess_j=ess_j,
+        r_hat_j=r_hat_j,
+        sd_chain_ratio=sd_chain_ratio,
+        skewness=skewness,
+        excess_kurtosis=kurtosis - 3.0,
+        robust_width_ratio=(q95 - q05) / (NORMAL_Q90_WIDTH * sd_j),
+        n_chains=n_chains,
+        n_draws=n_draws,
+        resolution=resolution,
+        precision_warning=precision_warning,
+    )
+
+    return EnergyScale(
+        value=sd_j,
+        mode="pilot_sd",
+        j_star=float(optimum.j_star),
+        n_warmup_points=n_chains * n_draws,
+        quantile=None,
+        warmup_quantile_j=None,
+        warmup_max_j=float(np.max(pooled)),
+        resolution=resolution,
+        polytope_key=objective.polytope_key,
+        objective_key=objective.objective_key,
+        pilot=report,
+        fell_back=False,
     )
 
 

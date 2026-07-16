@@ -343,11 +343,20 @@ class SamplerConfig:
     refresh_interval: int = 1000
     """Sweeps between exact rebuilds of ``v`` from ``y`` — bounds incremental drift (§1.3)."""
     energy_scale: str | float = "warmup_range"
-    """``s_J`` (spec §3.6). ``"warmup_range"`` sets it from the observed objective range of the
-    support points; a positive number declares it, putting ``β`` in reciprocal raw-objective units.
+    """``s_J`` (spec §3.6) — what ``β`` is measured in. Three modes, **not** mutually comparable:
 
-    Only ``warmup_range`` makes ``β`` comparable across strains — see
-    `sparse_objective.EnergyScale`.
+    - ``"warmup_range"`` (default) — ``J* − Q_q(J(W))`` over the geometry's support **vertices**
+      (spec §22.2). v1's validated setting.
+    - ``"pilot_sd"`` (M10) — the SD of ``J`` over a frozen β=0 pilot, so ``β`` is in units of the
+      neutral ensemble's own fluctuation and ``β = 1`` shifts ``E[J]`` by one neutral SD to first
+      order. Costs a pilot chain. **The mode to use when the β axis has to mean something**: on the
+      example model ``warmup_range`` gives ``s_J = 32.5`` against a chain that explores
+      ``sd(J) = 2.44``, so the whole spec §22.1 ladder barely tilts (BUILD_PLAN §1.6.6).
+    - a positive number — declares it. ``β`` is then in reciprocal raw-objective units and is
+      comparable with nothing.
+
+    Both string modes make ``β`` comparable across strains; they answer different questions. See
+    `sparse_objective.EnergyScale.mode`.
     """
     energy_scale_quantile: float = 0.05
     """``q`` in ``s_J = J* − Q_q(J(W))`` (spec §22.2). Ignored when `energy_scale` is a number."""
@@ -370,6 +379,27 @@ class SamplerConfig:
     """Base entropy. Each chain's stream is keyed on ``(model_id, stage, β_index, chain_index)``
     on top of it (`provenance.stream_seed`) — never on a position in a `spawn()` sequence."""
 
+    pilot_reround: bool = False
+    """Re-round ``T`` from a frozen β=0 pilot's own covariance (spec §17.4, M10).
+
+    Off by default: it changes no distribution — the transform is a preconditioner and provably
+    cannot move the target (§1.6.1) — but it costs a pilot chain, and v1's validated numbers were
+    produced without it. On the example model it buys ``cond(C_q)`` 1.54e4 → 5.11e3 and ~2.5× ESS,
+    which is the lever to pull when wall-clock binds. See `calibration.calibrate`.
+    """
+    pilot_chains: int = 4
+    """Chains per pilot. At least 2 is enforced: R̂ and the between-chain ``σ̂`` spread are the only
+    checks that can see retained initialization, and an ESS cannot."""
+    pilot_burn_in: int = 2000
+    pilot_samples: int = 2000
+    """The pilot's schedule, in **sweeps** (one sweep = ``d`` coordinate updates).
+
+    Higher than the production defaults on purpose. M5 measured this model at R̂ = 1.32 after
+    500+500 and 1.08 after 2000+2000, and a pilot is the one chain whose *estimate* is frozen into
+    everything downstream: an under-run pilot does not produce a wrong answer, it produces a
+    confidently mislabelled axis and a poorly conditioned transform.
+    """
+
     def __post_init__(self) -> None:
         if not self.betas:
             raise ConfigError("sampler.betas must list at least one β")
@@ -383,15 +413,18 @@ class SamplerConfig:
             ("burn_in", self.burn_in, 0),
             ("thin", self.thin, 1),
             ("refresh_interval", self.refresh_interval, 1),
+            ("pilot_chains", self.pilot_chains, 2),
+            ("pilot_samples", self.pilot_samples, 2),
+            ("pilot_burn_in", self.pilot_burn_in, 0),
         ):
             if value < minimum:
                 raise ConfigError(f"sampler.{name} must be >= {minimum}, got {value}")
 
         if isinstance(self.energy_scale, str):
-            if self.energy_scale != "warmup_range":
+            if self.energy_scale not in ("warmup_range", "pilot_sd"):
                 raise ConfigError(
-                    "sampler.energy_scale must be \"warmup_range\" or a positive number, got "
-                    f"{self.energy_scale!r}"
+                    'sampler.energy_scale must be "warmup_range", "pilot_sd" or a positive '
+                    f"number, got {self.energy_scale!r}"
                 )
         elif not isfinite(self.energy_scale) or self.energy_scale <= 0.0:
             # A zero or negative s_J does not merely rescale β — it flips or annihilates the tilt,

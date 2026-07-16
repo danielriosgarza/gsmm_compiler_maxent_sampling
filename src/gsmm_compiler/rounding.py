@@ -89,8 +89,14 @@ from gsmm_compiler.provenance import content_key
 
 _ArrayT = TypeVar("_ArrayT", bound=np.ndarray[Any, Any])
 
-ROUNDING_IMPL_VERSION = 1
-"""Bump when the transform's arithmetic changes — invalidates every cached ``T`` and its samples."""
+ROUNDING_IMPL_VERSION = 2
+"""Bump when the transform's arithmetic changes — invalidates every cached ``T`` and its samples.
+
+2 (M10): `RoundingDiagnostics` gained `covariance_source`, so a v1 bundle cannot say which
+estimator produced its ``C_q``. `from_cache` would reject it on the missing field anyway; bumping
+the version makes such a bundle **miss** the cache instead of erroring on a hit — BUILD_PLAN §1.1's
+rule that a refactor changing artifact semantics must miss, never load stale.
+"""
 
 VALUE_DTYPE = np.float64
 
@@ -133,6 +139,19 @@ class RoundingDiagnostics:
     dimension: int
 
     n_support_points: int
+    """How many points the covariance was estimated from — support vertices, or pilot draws when
+    `covariance_source` says ``pilot``."""
+
+    covariance_source: str
+    """``support_points`` (M4's LP vertices), ``pilot`` (M10's frozen β=0 chain), or ``singleton``.
+
+    Not cosmetic: the two estimators estimate *different things*. The support vertices are extreme
+    points and describe the polytope's **outline**; a β=0 pilot describes the **uniform measure's
+    own** covariance, which is what spec §17.4's rounding actually wants. Both give a valid ``T`` —
+    the transform is a preconditioner and provably cannot move the target (§1.6.1) — but they give
+    different *conditioning*, so a reader comparing two runs' `condition_number` has to know which
+    estimator each used.
+    """
 
     covariance_rank: int
     """Rank of ``C_q`` — the support coordinates about **their own mean**, not the centre.
@@ -217,6 +236,7 @@ class RoundingDiagnostics:
         return {
             "rounding_dimension": self.dimension,
             "rounding_n_support_points": self.n_support_points,
+            "covariance_source": self.covariance_source,
             "covariance_rank": self.covariance_rank,
             "covariance_trace": self.covariance_trace,
             "ridge": self.ridge,
@@ -532,7 +552,6 @@ def build_transform(
     if geometry.is_singleton:
         return _singleton_transform(geometry, reduced)
 
-    d = geometry.dimension
     coordinates = geometry.to_coordinates(geometry.support_points)  # (K, d), spec §17.2
     n_support = int(coordinates.shape[0])
     if n_support < 2:
@@ -541,13 +560,110 @@ def build_transform(
             "have produced 2 per discovered direction"
         )
 
+    return _transform_from_coordinates(
+        geometry, reduced, coordinates, config=config, source="support_points"
+    )
+
+
+def reround_transform(
+    geometry: ReducedGeometry,
+    reduced: ReducedPolytope,
+    bootstrap: RoundedTransform,
+    *,
+    pilot_coordinates: NDArray[np.float64],
+    config: GeometryConfig | None = None,
+) -> RoundedTransform:
+    """Re-round from a frozen β=0 pilot's own covariance (spec §17.4) — M10's ``T₁``.
+
+    `build_transform` estimates ``C_q`` from M4's **support-LP vertices**, which are extreme points:
+    they describe the polytope's *outline*, not the uniform measure living inside it. Spec §17.4
+    says to re-round from a pilot chain instead, and it is worth having — measured on the example
+    model, ``cond(C_q)`` falls 1.54e4 → 5.11e3 and ESS rises ~2.5×.
+
+    **This cannot move the target, and that is a theorem.** ``L`` is ``d×d`` and invertible, so
+    ``range(T₁) = range(diag(s)·B·L₁) = range(diag(s)·B) = range(T₀)`` *exactly*, and
+    ``y ↦ centre + T₁·y`` is affine and injective with a constant Jacobian (§1.6.1). What must be
+    guarded is not the algebra — it was never in doubt — but the implementation: rank loss,
+    feasibility tolerance, and above all that the pilot is **frozen before production** and never
+    re-read mid-chain.
+
+    ``pilot_coordinates`` is ``(N, d)`` in ``bootstrap``'s **rounded** frame — the chain's own
+    ``y``. They are mapped back to geometry coordinates *exactly*, by ``q = L₀·y``: from
+    ``diag(s)·B·q = T₀·y = diag(s)·B·L₀·y`` with ``diag(s)·B`` of full column rank. That is an
+    identity, not a projection — which is why this takes the bootstrap transform rather than
+    re-deriving ``q`` from the pilot's fluxes through ``T₀⁺``, which would silently absorb drift
+    instead of carrying it.
+
+    **Arrays, not a pilot object, deliberately.** `rounding` is imported by MCMC workers (§1.2) and
+    must not import the sampler; `calibration` owns the `NeutralPilot` and calls this with its
+    arrays. The binding is still checked — the caller must have run its pilot under this
+    ``bootstrap``.
+    """
+    config = config or GeometryConfig()
+
+    if geometry.polytope_key != reduced.content_key():
+        raise RoundingError(
+            "the geometry was not built from this polytope; re-rounding would carry one model's "
+            "directions and another's bounds"
+        )
+    if bootstrap.polytope_key != reduced.content_key():
+        raise RoundingError(
+            "the bootstrap transform was not built from this polytope, so its `cholesky` does not "
+            "map this pilot's coordinates back into this geometry's frame"
+        )
+    if bootstrap.geometry_key != geometry.content_key():
+        raise RoundingError(
+            "the bootstrap transform was not built from this geometry "
+            f"({bootstrap.geometry_key[:16]}… vs {geometry.content_key()[:16]}…). ``q = L₀·y`` is "
+            "the right change of coordinates only when ``L₀`` is *this* geometry's Cholesky: with "
+            "another's, the re-rounded covariance describes a frame the new ``T₁`` is not built "
+            "in — and every downstream check still passes, because the shapes agree."
+        )
+
+    if geometry.is_singleton:
+        return _singleton_transform(geometry, reduced)
+
+    y = np.asarray(pilot_coordinates, dtype=VALUE_DTYPE)
+    if y.ndim != 2 or y.shape[1] != geometry.dimension:
+        raise RoundingError(
+            f"pilot coordinates have shape {y.shape}, expected (N, {geometry.dimension})"
+        )
+    if int(y.shape[0]) < 2:
+        raise RoundingError(f"a covariance needs at least 2 pilot draws, got {int(y.shape[0])}")
+    if not np.all(np.isfinite(y)):
+        raise RoundingError("the pilot coordinates are not all finite")
+
+    coordinates = y @ bootstrap.cholesky.T  # q = L₀·y, exactly
+
+    return _transform_from_coordinates(
+        geometry, reduced, coordinates, config=config, source="pilot"
+    )
+
+
+def _transform_from_coordinates(
+    geometry: ReducedGeometry,
+    reduced: ReducedPolytope,
+    coordinates: NDArray[np.float64],
+    *,
+    config: GeometryConfig,
+    source: str,
+) -> RoundedTransform:
+    """covariance → ridge → Cholesky → ``T``, from *any* point set in geometry coordinates.
+
+    One implementation for both estimators. They differ only in which points they hand in;
+    everything after the covariance — ridge escalation, the rank check, the structural zeros, the
+    chord at the centre — is the same mathematics and must not drift into two versions of itself.
+    """
+    d = geometry.dimension
+    n_points = int(coordinates.shape[0])
+
     covariance, trace, mean_norm = _support_covariance(coordinates)
     eigenvalues = np.linalg.eigvalsh(covariance)
 
     mean_variance = trace / d
     if not mean_variance > 0.0:
         raise RoundingError(
-            f"the support points have zero spread in reduced coordinates (trace {trace:.3e}); "
+            f"the {source} points have zero spread in reduced coordinates (trace {trace:.3e}); "
             f"they cannot span the {d} directions the geometry says exist"
         )
 
@@ -592,7 +708,14 @@ def build_transform(
     # y = L⁻¹·Bᵀ·diag(s)⁻¹·(v − centre), by a solve against L rather than an explicit inverse.
     scaled_basis = geometry.basis / geometry.scaling[:, np.newaxis]
     inverse_transform = np.linalg.solve(cholesky, scaled_basis.T)
-    support_coordinates = np.linalg.solve(cholesky, coordinates.T).T
+    # Always the **support vertices** in the new rounded frame — never `coordinates`, which on the
+    # pilot path is the pilot's own N draws. `support_coordinates` seeds dispersed chain starts from
+    # a hull that lies inside the polytope by convexity of vertices; a hull of *interior* pilot
+    # points is also inside it, but far less dispersed — exactly when M10's purpose is to detect
+    # retained initialization. On the support path this is `coordinates` and the line is a no-op.
+    support_coordinates = np.linalg.solve(
+        cholesky, geometry.to_coordinates(geometry.support_points).T
+    ).T
 
     # Reported, **not** gated (M9, BUILD_PLAN §1.4.2). This is a componentwise backward error, and
     # its denominator is not the scale of the arithmetic that produced the residual — so a small-
@@ -616,7 +739,8 @@ def build_transform(
 
     diagnostics = RoundingDiagnostics(
         dimension=d,
-        n_support_points=n_support,
+        n_support_points=n_points,
+        covariance_source=source,
         covariance_rank=covariance_rank,
         covariance_trace=float(trace),
         ridge=float(ridge),
@@ -878,6 +1002,7 @@ def _singleton_transform(geometry: ReducedGeometry, reduced: ReducedPolytope) ->
         diagnostics=RoundingDiagnostics(
             dimension=0,
             n_support_points=0,
+            covariance_source="singleton",
             covariance_rank=0,
             covariance_trace=0.0,
             ridge=0.0,
