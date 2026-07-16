@@ -1108,3 +1108,171 @@ itself**, R̂ on the scale pilot's `J` trace, and the transform rank/conditionin
 **The lesson:** *a deferred remedy is a hypothesis, not a plan.* M6 recorded a prerequisite, a
 mechanism and a magnitude for a fix it had not computed — and all three were wrong while the
 *diagnosis* was exactly right. The β axis really was uncalibrated; the named cure simply was not one.
+
+---
+
+# M10.2 — wiring the pilot DAG into `batch`/CLI  ·  Claude × Codex, 4 rounds, converged (AGREE)
+
+## The finding that opened it: **the recorded fork was not a fork**
+
+M10.1's tracker recorded M10.2 as blocked on "a real fork BUILD_PLAN does not settle" — whether the
+pilot and `T₁` join §1.1's 4-layer DAG as a new layer, since a cache hit returns a `RoundedTransform`
+with no `ReducedGeometry`. Measured before arguing:
+
+| stage | Bifido, d = 46, serial | cached? |
+|---|---|---|
+| `build_geometry` (~1100 LPs) | **1.168 s** | yes (as `T₀`'s bundle) |
+| `build_transform` → `T₀` | 0.005 s | — |
+| the two β=0 pilots | **19.202 s** | **no** |
+| `reround_transform` → `T₁` | 0.009 s | **no** |
+
+A layer for `T₁` would exist to avoid rebuilding a 1.17 s stage while costing 19.2 s to fill — 16.4×
+upside-down. And the blocker itself was **plan/code drift**: §1.1 has always said L3 holds `B` and the
+span certificate; `to_bundle` held neither and `ReducedGeometry` had no serializer at all. *The M10.1
+lesson repeating one milestone later: a recorded remedy is a hypothesis until someone does the
+arithmetic.*
+
+## Where Codex was right and I was wrong (round 1–2)
+
+- **"Repairing L3 dissolves the fork" was overreach.** Decisive counter: §1.1's **L2 was already not a
+  strict layer** — `warmup_range`'s `s_J` is nominally L2 but reads L3's support points while the
+  stated L2 key omits L3. `pilot_sd` only makes the hidden edge impossible to ignore. The numeric
+  labels are outliving their usefulness; named immutable nodes would serve better. Conceded.
+- **"L3 caches the transform, not the geometry" is too strong** — it caches a *non-reconstructible
+  hybrid* (`batch` bolts support points + manifest + certificate onto a transform bundle). Conceded.
+- **"The pilot key already exists" was wrong, and an *incomplete* key is worse than an absent one** —
+  absent means no cache; incomplete is a false-hit generator, and §1.1's rule is that a false miss only
+  recomputes while a false hit corrupts. `NeutralPilot.content_key` omitted `seed` (the `SeedSequence`
+  entropy), `refresh_interval` (M5: the float64 state is `(y, cache error, refresh phase)`) and
+  `SAMPLER_IMPL_VERSION`. All verified in code. Conceded.
+
+## Codex's best catch: **the neutral pilot was objective-dependent and its docstring denied it**
+
+`calibrate` fed both β=0 pilots `optimum_coordinates` — the objective's own LP optimum — while
+`NeutralPilot` claimed "**objective-independent** … one neutral pilot serves every objective on a
+polytope" and hashed no objective and no start. Measured, two pilots differing in nothing else:
+
+| | |
+|---|---|
+| `content_key` | **identical** (`d9c3ff…` both) |
+| draws | not bit-identical, max \|Δy\| = 2.79 |
+| `T₁` | cond(C_q) 7198 vs 9663 |
+| `s_J = σ̂₀` | 2.6287 vs 2.4995 |
+
+**Not bias** — both are honest draws from one β=0 law and the spread is Monte Carlo noise, so claiming
+bias would have been the overclaim. The real defect is sharper and unarguable: **the artifact was not a
+function of its key.** M7's two-objectives-on-one-polytope case takes the first hit and never knows.
+
+Codex's mechanism beat mine: I said "a different start is a different trajectory"; Codex said the hint
+changes the **support hull's cardinality**, hence the **Dirichlet draw's dimension**, hence **RNG
+consumption on every later transition** — the streams *desynchronise*. Fix (Codex's option 1, adopted):
+**remove the parameter**, don't default it to `None`. A defaulted parameter can be forgotten; an absent
+one cannot. Its true claim: "…every objective sharing this polytope, **transform, and pilot recipe**".
+M10.1 had shipped that hint with **zero test coverage** — removing it broke no test.
+
+## The v1 defects M10 merely made reachable
+
+- **M9's mass-balance gate was bypassable through the package's own cache-warming path.** It lived only
+  in the `compute()` closure of `_load_or_build_geometry`, which runs **only on a miss**; on a hit
+  nothing read the certificate. Meanwhile `maxent build-geometry --cache-dir` wrote its own bundle
+  under `batch`'s key, omitted the certificate, and **stored it after printing `REFUSED`**. Warm, then
+  sample. That gate cost a 2-round review and Codex's counterexample killed its first fix.
+- **A `COMPLETE` marker named a chain, not an experiment.** §1.1 specified the sample key from the
+  start; nothing computed it. `store_chain` recorded only `polytope_key`. Two experiments in one tree,
+  stacked into one cross-model table, every per-chain diagnostic green *because each chain is correct*.
+
+## Round 3 — Codex reviewed the built diff and found a defect I had just introduced
+
+It opened **DISAGREE** on the implementation, holding 1, 3, 6. All three conceded:
+
+1. **`require_certified_transform` was not total.** `certificate=None` was safe *behind*
+   `prepare_model` and a hole in the public API — a library caller could hand `calibrate` an
+   uncertified `T₀`, and the pilots are chains that step in its frame. Fix: `bootstrap_certificate` is a
+   **required argument** (the proof exists already; recomputing = 334 wasted LPs; a default can be
+   forgotten). `CalibrationResult.certificate` is now never `None` — always the proof for the transform
+   that result ships.
+3. **`optimum_coordinates` had the same identity defect I had just fixed for pilots.** I excluded it
+   from `sample_recipe_key` by importing §1.6.5's reasoning. Codex's refutation is decisive and general:
+   **the recipe key already hashes `seed`, `chain_index`, `schedule`, `storage_mode` — none of which
+   define the stationary law.** So "only initialization" cannot be the criterion. **An artifact key asks
+   "are these bytes the same artifact?", not "is this the same distribution?"** Both keys are right;
+   they answer different questions. Also missing: `model_id` (keys the RNG), `feasibility_tol` (start
+   selection + chord validation), `near_zero_thresholds` (change the stored trace arrays). `movable` is
+   the one exclusion that survives — an exact function of a transform already hashed.
+6. **The manifest bug, committed by me, in the milestone about it.** `prepare_model` copied the
+   cache-shaped `to_cache()` dict into the human-facing report (losing `as_dict`'s derived
+   `reachable_is_certified`/`reachable_margin`) — and **under re-rounding it named `T₀` while production
+   sampled `T₁`**. A manifest describing an artifact that was not used: this package's signature bug.
+
+## Settled — the design
+
+- **Cache what is expensive, derive what is cheap, key everything.** Geometry (1.17 s) and pilots
+  (19.2 s) are cached; `T₀` (5 ms) and `T₁` (9 ms) are derived. `T₁` needs no layer — but it needs an
+  **identity** and **certified provenance**.
+- **`T₁` must be certified before the *scale pilot***, not before production: the scale pilot itself
+  steps in `T₁`'s frame, so an uncertified `T₁` means σ̂₀ is read off off-manifold fluxes. The
+  exact-arithmetic theorem does not transfer `T₀`'s certificate — `range(T₁) = range(T₀)` makes the
+  *true* worst residual identical, but the certificate is a numerical bound over `E = S·T₁` and a fresh
+  `T₁⁺`, and `fl(B·L₀)`/`fl(B·L₁)` need not share a floating-point column space. Measured: `T₁`
+  certifies at **3.86e-11**, inside M9's independently measured `T₀` range 3.6e-11 … 5.1e-11 — two
+  certificates, two matrices, no shared computation, agreeing where the theorem says they must.
+- **`ReachabilityCertificate` gained a `transform_key`.** `T₀` and `T₁` share a `polytope_key`
+  *exactly*, so nothing else could separate them — a pre-M10 world had one transform per polytope and
+  never needed it.
+- **`to_cache` stores evidence; `as_dict` stores the verdict.** `is_certified` is derived, so caching
+  the fields makes a bundle asserting innocence beside contrary evidence *inexpressible* — the loader
+  re-derives. (M9: never trust a reading, check the bound.)
+- **Refuse, don't recompute, on a recipe mismatch.** A results tree is the user's output, not a cache.
+  Codex noted `_already_done` runs over all jobs before `_execute`, so refusal precedes any write —
+  neither destructive overwrite nor partial mixing.
+- **The scope cut (Codex confirmed (f) does not depend on (e)):** **M10.2a** = correctness (L3
+  serialization, pilot key, `T₁` certification, gate totality, recipe key). **M10.2b** = performance
+  (cache the pilots per chain; two-phase pool dispatch — 19.2 s serial per model, Amdahl ceiling 24.9× →
+  ~3.65×). Payload when built: geometry pilot → coordinates only (~2.9 MB); scale pilot → reduced fluxes
+  only (~16.6 MB, preserving multi-objective reuse); **never** reconstruct stored fluxes from
+  coordinates — M9 measured gemv-vs-gemm at 1.1e-13.
+
+## Rounds 4–5 — each repair had a smaller hole behind it, and that is the shape of the thing
+
+Codex confirmed the round-3 repairs introduced no new defect (branch provenance of
+`CalibrationResult.certificate` correct in both branches; `content_key`'s ndarray/`None`
+canonicalization can only cause conservative false *misses*; `CalibrationResult` is the right owner of
+the report conversion). It then found four more, all conceded, and the sequence is the finding:
+
+1. **`run_neutral_pilot` still bypassed the gate.** Requiring the proof on `calibrate` closed one door
+   and left the public one beside it open — the same chain, no fabrication needed. It now takes a
+   required `certificate` too. *Gating an orchestrator does not gate the primitive it calls.*
+2. **`sample_recipe_key` had no *writer* identity.** `SAMPLER_IMPL_VERSION` is scoped to the
+   transition kernel by its own docstring, while `store_chain` decides the arrays, names, casts and
+   manifest fields — and carried no version at all. New `output.OUTPUT_IMPL_VERSION`. §1.1's own rule
+   ("provenance in every key: parser + code + artifact-schema versions"), unapplied to samples.
+3. **The evidence itself was never checked.** The sharpest catch, because it is a hole in *this
+   milestone's own reasoning*: `to_cache` stores fields so `is_certified` can re-derive the verdict,
+   defeating a bundle that *asserts* it passed — but `from_cache` only checked fields were **present**,
+   so `worst_absolute = −1` sails through (`−1 <= 1e-9`). **"Trust the claim" was closed and "trust the
+   evidence" left open.** `__post_init__` now refuses non-finite/negative residuals, non-positive
+   contracts, negative counts, `n_rows_certified > n_rows`.
+4. **The certificate chose its own bar.** One level up again: re-deriving the verdict is worthless if
+   the artifact selects *what it is judged against*. `certify_reachable_mass_balance` accepts any
+   positive `contract`, so `contract=1.0` yields a **truthful** `is_certified` and passes the gate — a
+   proof of a different and useless proposition, no corruption involved. M9 settled that there is **one**
+   declared definition of mass-balanced (η = 1e-9, the same bar emitted samples meet), so
+   `require_certified_transform` now tests `worst_absolute` against **the policy it was given**, and the
+   certificate's own `contract` is demoted to provenance. A *stricter* certificate still passes, since a
+   smaller residual clears a larger bar.
+
+**Deferred by agreement:** a **metadata digest** in `cache.ArtifactCache`, which hashes every array and
+trusts the meta. Domain validation closes *malformed* evidence; integrity of cached metadata is a
+generic property of every layer, not an L3 concern, and is recorded rather than bolted on here. Neither
+this nor the required-argument guards are adversary-proof — a caller who hand-builds a plausible
+certificate defeats any Python-level proof object — and the docstrings say so rather than overclaiming.
+
+**The lesson:** *an artifact must be a function of its key* — and the question a key answers is
+**artifact identity**, never target identity. Confusing the two is how a correct-looking cache serves
+the wrong bytes, and it is subtle enough that this milestone made the mistake **while fixing it**.
+
+**The second lesson, from rounds 3–5:** *a guard is only as total as its weakest entrance, and each fix
+reveals the next one.* Don't trust the claim → check the evidence. Don't trust the evidence → validate
+it. Don't trust the validation → own the bar it is judged against. Four rounds, each finding the hole
+behind the previous repair — which is exactly what M2 recorded ("the first fix for a numerical bug is
+often itself buggy") generalized from arithmetic to authority.

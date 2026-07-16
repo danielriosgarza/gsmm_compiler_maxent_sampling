@@ -71,7 +71,22 @@ source file ──sha256──┐
                                 ▼
    Samples: one artifact per (β, chain) unit
    key = L2 + L3 + β + chain_seed_coords + sampler_version + burn/thin/n_samples
+        (M10.2: `batch.sample_recipe_key` — written into every unit's manifest and matched on
+         restart. It was specified here from the start and computed nowhere; see §1.6.7.)
 ```
+
+**M10.2 corrections to this diagram** (§1.6.7 has the reasoning):
+
+- **L3 stores the `ReducedGeometry`** — `s`, `B`, centre, support points, span certificate — *and* the
+  `T₀` built from it, plus `T₀`'s reachability certificate. It long stored only the transform, which
+  is why `reround_transform` (needing `B` and `s`) could not run on a cache hit. `build_l3_bundle` is
+  the **one writer** of that schema; two writers is what let the CLI cache an uncertified bundle.
+- **The pilot and `T₁` are not a new layer.** Derive `T₁` (9 ms) from L3 and a pilot; the thing worth
+  keying is the **pilot** (19.2 s), which is M10.2b. `NeutralPilot.content_key` already exists and is
+  now complete.
+- **L2 was never a strict layer**: `warmup_range`'s `s_J` is nominally L2 but reads L3's support
+  points, while the stated L2 key omits L3. `pilot_sd` makes the edge explicit. The numeric labels are
+  becoming less useful than named immutable nodes; recorded, not yet acted on.
 
 Rules (all adopted from the collaboration):
 - **L0 is content-addressed, not file-hash-addressed** *(M8; refines the original `sha256(file)`
@@ -463,6 +478,15 @@ the kernel/objective/`s_J`/traces, so it **cannot change the invariant target** 
 seeds a poorer start, which is observable via feasibility and R̂/ESS. Keying it would imply it defines
 the distribution, which it does not (Codex conceded, r5). The boundary is documented instead.
 
+> **Refined by M10.2 — this is about *target* identity, and there is a second question.** The
+> sentence above is correct and it settles exactly one thing: whether the hint belongs in the keys
+> that name a **distribution** (the objective, `s_J`). It does not. But "are these bytes the same
+> **artifact**?" is a different question with a different answer: a finite chain started elsewhere is
+> a different chain. The hint therefore **is** hashed by `batch.sample_recipe_key` and **is** kept out
+> of the β=0 pilots entirely — see §1.6.7. Importing this paragraph's reasoning into an artifact key
+> is precisely the error M10.2 made and Codex caught: a recipe key already hashes `seed` and
+> `chain_index`, which define no law either.
+
 ### 1.6.6 (M10) `s_J` from the pilot's **spread**, not its range to `J*` — and M6's remedy was wrong
 
 *(M10 collab finding, 4 rounds, converged AGREE.)* M6 recorded a **prerequisite** — that the β axis
@@ -572,6 +596,94 @@ fires there — and is **unattributable**, because the diagnostic's precondition
 **Practical consequence: under `pilot_sd`, β = 16 is the working top rung at a 4×(2000+2000)
 schedule** (q = 0.76, R̂ = 1.06); β ≥ 32 needs a far longer one, because the tilted chain concentrates
 and its chords shorten.
+
+### 1.6.7 (M10.2) An artifact must be a **function of its key** — and §1.1's L3/samples were not
+
+*(M10.2 collab finding, 4 rounds, converged AGREE.)* M10.1 recorded the CLI wiring as blocked on a
+**design fork §1.1 does not settle**: the cache returns a `RoundedTransform` with no `ReducedGeometry`,
+so re-rounding on a hit needs "the pilot and `T₁` to enter the DAG as a new layer". The arithmetic
+says otherwise, and it was never done:
+
+| stage | measured (Bifido, d = 46, serial) | cached before M10.2? |
+|---|---|---|
+| `build_geometry` (~1100 LPs) | **1.168 s** | yes — as `T₀`'s bundle |
+| `build_transform` → `T₀` | 0.005 s | — |
+| the two β=0 pilots | **19.202 s** | **no** |
+| `reround_transform` → `T₁` | 0.009 s | **no** |
+
+A layer for `T₁` would exist to avoid rebuilding a **1.17 s** stage while costing **19.2 s** to fill —
+16.4× upside-down. The rule is the one §1.1 already implies: **cache what is expensive, derive what is
+cheap, key everything.** `prepare_model` goes 2.388 s → 21.6 s of *serial parent* work, which is
+Amdahl's term, not a cache question — it is **M10.2b** (pilot caching + two-phase pool dispatch), and
+it is why restart under `pilot_reround` re-runs 19.2 s of pilots before resuming one chain.
+
+**The blocker itself was plan/code drift, not a fork.** §1.1 has always said L3 "holds B,
+support_points, center, L (Cholesky), T, dimension, span certificate". `RoundedTransform.to_bundle`
+holds `T`, `L`, centre and support coordinates — no `B`, no `s`, no reconstructable certificate — and
+`ReducedGeometry` had **no serializer at all**. M9's "the code never implemented its own
+documentation", one layer up. (Codex's correction, conceded: it cached a *non-reconstructible hybrid*,
+not "the transform". And repairing it does **not** dissolve the topology question — §1.1's L2 was
+already not a strict layer, since `warmup_range`'s `s_J` is nominally L2 but reads L3's support points
+while the stated L2 key omits L3. `pilot_sd` only makes that edge impossible to ignore.)
+
+**The through-line, and the reason these are correctness fixes.** §1.1's asymmetry — *a false miss only
+recomputes; a false hit corrupts* — means **an incomplete key is strictly worse than none**: absent
+means no cache, incomplete means a store that confidently returns the wrong bytes. Asking "is this
+artifact a function of its key?" of things this repo already had returned **no** four times:
+
+- **The neutral pilot was objective-dependent and said it wasn't.** `NeutralPilot`'s docstring —
+  "**objective-independent**, and that is load-bearing … one neutral pilot serves every objective on a
+  polytope" — was false when written: `calibrate` fed both β=0 pilots `optimum_coordinates`, derived
+  from the objective's own LP optimum, while `content_key` hashed no objective and no start. Measured,
+  two pilots differing in *nothing else*: **identical `content_key`**, max |Δy| = 2.79, `T₁` cond 7198
+  vs 9663, `s_J` 2.6287 vs 2.4995. Not bias — both are honest draws from one β=0 law and the gap is
+  Monte Carlo noise. The defect is that **the artifact was not a function of its key**, so M7's
+  two-objectives-on-one-polytope case takes the first hit and never knows. Codex's mechanism is
+  sharper than "a different start": the hint changes the support hull's cardinality, hence the
+  Dirichlet draw's dimension, hence **RNG consumption on every later transition** — the streams
+  desynchronise. Fixed **structurally**: `run_neutral_pilot` has no such parameter. The claim's true
+  form is "…every objective sharing this polytope, **transform and pilot recipe**".
+- **M9's mass-balance gate was bypassable through the package's own cache-warming path.** It lived in
+  the `compute()` closure of `batch._load_or_build_geometry` — which runs **only on a miss**. On a hit
+  nothing read the certificate; and `maxent build-geometry --cache-dir` assembled its *own* bundle
+  under `batch`'s key, omitted the certificate from it, and **stored it after printing `REFUSED`**.
+  Two writers of one schema is the defect. `batch.build_l3_bundle` is now the one writer, it raises
+  rather than returning an uncertified bundle, and `require_certified_transform` runs on **every**
+  load path. It checks three things, each refusing a different lie: the polytope (M6's join), the
+  **transform** (new — `T₀` and `T₁` share a `polytope_key` *exactly*, so `ReachabilityCertificate`
+  gained a `transform_key`), and the **verdict, re-derived** from `worst_absolute` vs `contract`
+  rather than read off a stored boolean. Hence `to_cache` stores the fields and `as_dict` the verdict:
+  a bundle asserting innocence beside contrary evidence is inexpressible. (M9: never trust a reading,
+  check the bound.)
+- **`T₁` was sampled uncertified — and must be certified before the *scale pilot*, not production.**
+  The scale pilot is itself a chain stepping in `T₁`'s frame; an uncertified `T₁` lets it walk off the
+  manifold and `σ̂₀` is then read off off-manifold fluxes. The exact-arithmetic theorem does **not**
+  transfer `T₀`'s certificate: `range(T₁) = range(T₀)` exactly (§1.6.1), so the true worst residual is
+  the same number, but the certificate is a *numerical* bound recomputing `E = S·T₁` and `Ω` from a
+  fresh `T₁⁺`, and `fl(B·L₀)` and `fl(B·L₁)` need not share a floating-point column space. Measured:
+  `T₁` certifies at **3.86e-11**, inside M9's independently measured `T₀` range of 3.6e-11 … 5.1e-11 —
+  two certificates, two matrices, no shared computation, agreeing where the theorem says they must.
+  Order: certify `T₀` → geometry pilot → `T₁` → **certify `T₁`** → scale pilot → production. And
+  `calibrate` takes `bootstrap_certificate` as a **required argument** rather than recomputing it: the
+  proof exists already, and demanding it makes an uncertified transform unable to enter the DAG.
+- **A `COMPLETE` marker named a chain, not an experiment.** §1.1 has always specified the sample key
+  (`L2 + L3 + β + chain seed coords + sampler_version + burn/thin/n_samples`). **Nothing computed it**:
+  restart skipped on the marker alone and `store_chain` recorded only `polytope_key`. So a results
+  directory reused after any change that moves the numbers resumed the units it had and sampled the
+  rest **from a different law** — two experiments in one tree, stacked into one cross-model table,
+  every per-chain diagnostic green *because each chain really is correct*. M10 forced this rather than
+  created it: `T` and `s_J` were once pure functions of the polytope and config; now they descend from
+  a pilot, so two runs of one unchanged config can honestly disagree. `batch.sample_recipe_key` now
+  computes it and `_already_done` **refuses** rather than recomputing — a results tree is the user's
+  output, not a cache.
+
+**The criterion, stated once because getting it wrong is easy:** an artifact key asks *"are these bytes
+the same artifact?"*, **not** *"is this the same distribution?"* M10.2 initially excluded
+`optimum_coordinates` from the sample recipe by importing §1.6.5's target-identity reasoning — while
+having just fixed the identical defect for the pilots. Codex's refutation is decisive and general: the
+recipe key already hashes `seed`, `chain_index`, `schedule` and `storage_mode`, **none of which define
+the stationary law**. Both keys are right; they answer different questions. `movable` is the one
+exclusion that survives, being an exact function of a transform already hashed.
 
 ### 1.7 λ is scale-referenced: `λ = λ̃ · λ*`  *(M3 finding; decision SETTLED)*
 

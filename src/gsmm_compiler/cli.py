@@ -209,20 +209,26 @@ def _cmd_maxent_solve_lp(args: argparse.Namespace) -> int:
 
 
 def _cmd_maxent_build_geometry(args: argparse.Namespace) -> int:
-    from gsmm_compiler.affine_geometry import build_geometry
+    from gsmm_compiler.batch import build_l3_bundle, geometry_cache_key
     from gsmm_compiler.config import load
     from gsmm_compiler.model_input import load_canonical_model
-    from gsmm_compiler.rounding import build_transform, certify_reachable_mass_balance
+    from gsmm_compiler.rounding import ReachabilityCertificate, RoundingDiagnostics
 
     config = load(args.config, args.overrides)
     canonical = load_canonical_model(args.path, args.biomass_id or config.model.biomass_id)
     reduced = canonical.polytope.reduce()
-    geometry = build_geometry(reduced, model_id=canonical.model_id, config=config.geometry)
-    transform = build_transform(geometry, reduced, config=config.geometry)
-    certificate = certify_reachable_mass_balance(transform, reduced)
 
-    gm = geometry.manifest()
-    rd = transform.diagnostics
+    # The **same writer** `batch` uses, and that is the whole point (M10.2). This command used to
+    # build its own geometry, its own transform and its own bundle under `batch`'s cache key — so
+    # the two schemas drifted, and this one both omitted the reachability certificate and stored
+    # the bundle after printing `REFUSED` for it. Warm the cache here, sample there, and M9's gate
+    # never ran. `build_l3_bundle` raises instead of returning an uncertified bundle, so this
+    # command can no longer poison a cache it shares.
+    arrays, meta = build_l3_bundle(reduced, config, model_id=canonical.model_id)
+    certificate = ReachabilityCertificate.from_cache(meta["reachability_certificate"])
+
+    gm = meta["geometry_manifest"]
+    rd = RoundingDiagnostics.from_cache(meta["transform"]["diagnostics"])
     print(
         f"model             {canonical.model_id}\n"
         f"dimension d       {gm['dimension']}\n"
@@ -232,20 +238,17 @@ def _cmd_maxent_build_geometry(args: argparse.Namespace) -> int:
         f"step_scale_ratio  {rd.step_scale_ratio:g}\n"
         f"cond(Cε)          {rd.condition_number:g}\n"
         f"min chord @center {rd.min_chord_at_center:g}\n"
+        # Always CERTIFIED by the time it prints: `build_l3_bundle` raises otherwise, which is the
+        # M10.2 fix — this line used to be able to read REFUSED and cache the bundle regardless.
         f"reachable ‖Sv−b‖  {certificate.worst_absolute:g} at {certificate.worst_row_id} "
-        f"({'CERTIFIED' if certificate.is_certified else 'REFUSED'} vs contract "
-        f"{certificate.contract:g}, margin {certificate.margin:.0f}×, "
-        f"{certificate.n_lps} LPs)\n"
+        f"(CERTIFIED vs contract {certificate.contract:g}, "
+        f"margin {certificate.margin:.0f}×, {certificate.n_lps} LPs)\n"
         f"‖S·T‖ backward err {rd.transform_mass_balance_error:g}  (reported, not gated — §1.4.2)"
     )
     if args.cache_dir is not None:
-        from gsmm_compiler.batch import geometry_cache_key
         from gsmm_compiler.cache import ArtifactCache
 
         cache = ArtifactCache(Path(args.cache_dir))
-        arrays, meta = transform.to_bundle()
-        arrays = {**arrays, "support_points": geometry.support_points}
-        meta = {**meta, "geometry_manifest": gm}
         key = geometry_cache_key(reduced, config, model_id=canonical.model_id)
         cache.store("L3", key, arrays=arrays, meta=meta)
         print(f"cached L3          {key[:16]}…")

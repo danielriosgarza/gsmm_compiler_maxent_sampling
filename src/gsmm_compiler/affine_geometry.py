@@ -136,7 +136,7 @@ Implemented in **M4** — see BUILD_PLAN.md §1.4.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
 from typing import Any, Final
 
 import numpy as np
@@ -154,8 +154,16 @@ from gsmm_compiler.native_csc import VALUE_DTYPE
 from gsmm_compiler.provenance import content_key, stream_seed
 from gsmm_compiler.sparse_objective import build_flux_lp
 
-GEOMETRY_IMPL_VERSION: Final = 1
-"""Bumped when a change here can alter the bytes of a geometry. Feeds the L3 cache key (§1.1)."""
+GEOMETRY_IMPL_VERSION: Final = 2
+"""Bumped when a change here can alter the bytes of a geometry. Feeds the L3 cache key (§1.1).
+
+2 (M10.2): L3 now stores the **geometry** (``s``, ``B``, centre, support points, certificate) and
+not only the transform built from it, and `ReducedGeometry.content_key` hashes ``support_points``.
+The bump is load-bearing rather than cosmetic: `batch.geometry_cache_key` does *not* fold in
+`ReducedGeometry.content_key`, so without it a v1 bundle — transform arrays, no ``basis`` — would
+still be a cache **hit** and `from_bundle` would die on a missing key. §1.1's rule is that a schema
+change must **miss**, never error on stale bytes.
+"""
 
 NOISE_SAFETY: Final = 10.0
 """How far a width must clear the solver's own admitted error before we call the direction real."""
@@ -919,6 +927,24 @@ class SpanCertificate:
             "complement_is_complete": self.complement_is_complete,
         }
 
+    def to_cache(self) -> dict[str, Any]:
+        """A round-trippable dict keyed by the **real field names** (not `as_dict`'s report keys).
+
+        `as_dict` is the human-facing manifest: it renames fields (``exhaustive`` →
+        ``span_certificate_exhaustive``) and injects the *derived* `resolution`, which is not a
+        field and must not be fed back to the constructor. A cache reconstructs the object, so it
+        keeps the field names — the same split `rounding.RoundingDiagnostics` already draws.
+        """
+        return asdict(self)
+
+    @classmethod
+    def from_cache(cls, data: dict[str, Any]) -> SpanCertificate:
+        names = {f.name for f in fields(cls)}
+        missing = names - data.keys()
+        if missing:
+            raise GeometryError(f"cached span certificate lacks fields: {sorted(missing)}")
+        return cls(**{name: data[name] for name in names})
+
 
 def complement_basis(
     basis_matrix: NDArray[np.float64],
@@ -1144,6 +1170,18 @@ class GeometryDiagnostics:
             "basis_memory_bytes": self.basis_memory_bytes,
         }
 
+    def to_cache(self) -> dict[str, Any]:
+        """Round-trippable, keyed by the real field names — see `SpanCertificate.to_cache`."""
+        return asdict(self)
+
+    @classmethod
+    def from_cache(cls, data: dict[str, Any]) -> GeometryDiagnostics:
+        names = {f.name for f in fields(cls)}
+        missing = names - data.keys()
+        if missing:
+            raise GeometryError(f"cached geometry diagnostics lack fields: {sorted(missing)}")
+        return cls(**{name: data[name] for name in names})
+
 
 @dataclass(frozen=True)
 class ReducedGeometry:
@@ -1197,17 +1235,96 @@ class ReducedGeometry:
         return ((v - self.center) / self.scaling) @ self.basis
 
     def content_key(self) -> str:
-        """The L3 cache key (§1.1): the polytope, the scaling, the basis, the code behind them."""
+        """The L3 cache key (§1.1): the polytope, the scaling, the basis, the code behind them.
+
+        ``support_points`` is hashed too (M10.2). It is a *field of this artifact*, and it is
+        load-bearing downstream in two places that outlive the geometry: `rounding.build_transform`
+        takes ``C_q`` from it, and `sparse_objective.choose_energy_scale` reads ``warmup_range``'s
+        ``s_J`` off it. Omitting it let two geometries agreeing on ``B`` but disagreeing on their
+        support hull hash **identically** — the M6 join again, one artifact further on.
+        """
         return content_key(
             polytope_key=self.polytope_key,
             scaling=self.scaling,
             basis=self.basis,
             center=self.center,
+            support_points=self.support_points,
             dimension=self.dimension,
             geometry_impl_version=GEOMETRY_IMPL_VERSION,
             backend_impl_version=BACKEND_IMPL_VERSION,
             numpy_version=np.__version__,
         )
+
+    def to_bundle(self) -> tuple[dict[str, NDArray[np.float64]], dict[str, Any]]:
+        """Split into ``(arrays, meta)`` for the content-addressed cache (`cache.ArtifactCache`).
+
+        M10.2 exists because this method did not. §1.1 has always said L3 "holds B, support_points,
+        centre, L (Cholesky), T, dimension, span certificate", but the only serializer in the
+        package was `rounding.RoundedTransform.to_bundle` — which holds ``T`` and ``L`` and neither
+        ``B`` nor ``s``. So a cache **hit** returned a transform and no geometry, and
+        `rounding.reround_transform` (which needs ``B``, ``s``, and this key) could not run: M10's
+        pilot DAG was reachable from the library and unreachable from the CLI. That was recorded as
+        a design fork; it was plan/code drift.
+        """
+        return (
+            {
+                "scaling": np.ascontiguousarray(self.scaling),
+                "basis": np.ascontiguousarray(self.basis),
+                "center": np.ascontiguousarray(self.center),
+                "support_points": np.ascontiguousarray(self.support_points),
+            },
+            {
+                "content_key": self.content_key(),
+                "polytope_key": self.polytope_key,
+                "certificate": self.certificate.to_cache(),
+                "diagnostics": self.diagnostics.to_cache(),
+            },
+        )
+
+    @classmethod
+    def from_bundle(
+        cls,
+        arrays: dict[str, NDArray[Any]],
+        meta: dict[str, Any],
+        reduced: ReducedPolytope,
+    ) -> ReducedGeometry:
+        """Rebuild a geometry cached by `to_bundle`, against the polytope it was built for.
+
+        Two guards, and they catch different things. The ``polytope_key`` check refuses the M6 join
+        — a geometry rebuilt against a *different* model's bounds. The ``content_key`` round-trip
+        then proves the reconstructed object **hashes to the key it was stored under**: the cache is
+        content-addressed, so an artifact that does not reproduce its own key is not the artifact
+        the key names, whatever its arrays look like.
+
+        The arrays are left writable, matching `build_geometry` exactly — a cached geometry must be
+        indistinguishable from a fresh one, and a reconstruction that hardened them differently
+        would be its own drift (M5 left ``center`` writable for its owner on purpose).
+        """
+        if meta["polytope_key"] != reduced.content_key():
+            raise GeometryError(
+                "cached geometry was built for a different polytope "
+                f"({str(meta['polytope_key'])[:16]}…) than the one it is being rebuilt against "
+                f"({reduced.content_key()[:16]}…)"
+            )
+        geometry = cls(
+            scaling=np.asarray(arrays["scaling"], dtype=VALUE_DTYPE),
+            # `(n_free, d)`, Fortran-contiguous — the layout the dataclass documents and the column
+            # reads want. `hash_array` C-orders before hashing, so this is a performance contract,
+            # never an identity one: the key below is order-blind by construction.
+            basis=np.asfortranarray(np.asarray(arrays["basis"], dtype=VALUE_DTYPE)),
+            center=np.asarray(arrays["center"], dtype=VALUE_DTYPE),
+            support_points=np.asarray(arrays["support_points"], dtype=VALUE_DTYPE),
+            certificate=SpanCertificate.from_cache(meta["certificate"]),
+            diagnostics=GeometryDiagnostics.from_cache(meta["diagnostics"]),
+            polytope_key=str(meta["polytope_key"]),
+        )
+        if geometry.content_key() != meta["content_key"]:
+            raise GeometryError(
+                "the rebuilt geometry does not reproduce its own cached content key "
+                f"({geometry.content_key()[:16]}… vs {str(meta['content_key'])[:16]}…); the stored "
+                "bytes are not the artifact this key names, so nothing downstream may trust it"
+            )
+        return geometry
 
     def manifest(self) -> dict[str, Any]:
         return {

@@ -46,6 +46,18 @@ if TYPE_CHECKING:  # pragma: no cover - typing only; avoids importing the sample
     from gsmm_compiler.maxent_sampler import ChainResult, ObjectiveTrace
     from gsmm_compiler.rounding import RoundedTransform
 
+OUTPUT_IMPL_VERSION = 1
+"""Bump when a change here alters the **bytes a unit stores** — the arrays written, their names, the
+casts applied, or the manifest's fields. Feeds `batch.sample_recipe_key` (§1.1: "provenance in every
+key: parser + code + artifact-schema versions").
+
+It exists because that rule was not applied to samples. The recipe key carried
+`SAMPLER_IMPL_VERSION`, which by its own docstring covers **the transition kernel** — while
+`store_chain` decides everything about the stored artifact and carried no version at all. So an
+output-only change kept the recipe key identical and left stale units looking resumable, which is a
+false hit on the one key that guards a user's results tree. (Codex, M10.2 review round 4.)
+"""
+
 COMPLETE_MARKER = "COMPLETE"
 """The file whose *presence* means an artifact directory is finished. Written last, atomically."""
 
@@ -359,6 +371,7 @@ def store_chain(
     beta_index: int,
     chain_index: int,
     storage: SampleStorage,
+    recipe_key: str = "",
 ) -> dict[str, Any]:
     """Persist one ``(model, β, chain)`` unit atomically, returning its manifest.
 
@@ -369,6 +382,12 @@ def store_chain(
     The manifest carries the polytope's L1 ``content_key``: a sample loaded for aggregation can then
     be checked against the geometry it is reconstructed with, so the M6/M8 "two artifacts that never
     met" failure cannot slip in at read time either.
+
+    ``recipe_key`` (`batch.sample_recipe_key`, M10.2) is the rest of that identity: the polytope key
+    says *which model*, and this says **which experiment** — the transform, the objective, ``s_J``,
+    the schedule, the seed and the storage mode that produced these bytes. It is what lets restart
+    tell "this unit is already done" from "this unit is a different run's". Defaulted for the
+    direct-library caller who has no batch plan; `batch` always passes it.
     """
     to_store: dict[str, NDArray[Any]] = {}
     if storage.mode == "full_flux":
@@ -400,6 +419,7 @@ def store_chain(
             "store_mode": storage.mode,
             "store_flux_dtype": storage.flux_dtype,
             "polytope_key": reduced.content_key(),
+            "recipe_key": recipe_key,
             "n_samples": int(np.asarray(chain.fluxes).shape[0]),
             "n_free": int(reduced.n_free),
             "n_full": int(reduced.n_full),

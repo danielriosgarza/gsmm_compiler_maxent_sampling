@@ -37,7 +37,12 @@ from gsmm_compiler.calibration import (
 from gsmm_compiler.config import SamplerConfig
 from gsmm_compiler.flux_polytope import FluxPolytope, ReducedPolytope
 from gsmm_compiler.native_csc import NativeCSC
-from gsmm_compiler.rounding import RoundingError, build_transform, reround_transform
+from gsmm_compiler.rounding import (
+    RoundingError,
+    build_transform,
+    certify_reachable_mass_balance,
+    reround_transform,
+)
 from gsmm_compiler.sparse_objective import (
     PILOT_SCALE_TARGET_RELATIVE_SE,
     DegenerateEnergyScaleError,
@@ -99,17 +104,34 @@ def fork_setup(fork_reduced: ReducedPolytope):  # type: ignore[no-untyped-def]
 
 
 @pytest.fixture(scope="module")
+def fork_certificate(fork_setup, fork_reduced: ReducedPolytope):  # type: ignore[no-untyped-def]
+    """M9's proof for ``T₀``. `calibrate` requires it rather than recomputing it: a pilot is a
+    chain, so an uncertified ``T₀`` walks off the manifold before production exists, and every
+    artifact the DAG freezes descends from those draws (Codex, M10.2 review round 3)."""
+    _, transform = fork_setup
+    return certify_reachable_mass_balance(transform, fork_reduced)
+
+
+@pytest.fixture(scope="module")
 def simplex_setup(simplex_polytope: ReducedPolytope):  # type: ignore[no-untyped-def]
     geometry = build_geometry(simplex_polytope, model_id="simplex")
     return geometry, build_transform(geometry, simplex_polytope)
 
 
 @pytest.fixture(scope="module")
-def simplex_pilot(simplex_setup, simplex_polytope: ReducedPolytope) -> NeutralPilot:  # type: ignore[no-untyped-def]
+def simplex_certificate(simplex_setup, simplex_polytope: ReducedPolytope):  # type: ignore[no-untyped-def]
+    _, transform = simplex_setup
+    return certify_reachable_mass_balance(transform, simplex_polytope)
+
+
+@pytest.fixture(scope="module")
+def simplex_pilot(  # type: ignore[no-untyped-def]
+    simplex_setup, simplex_polytope: ReducedPolytope, simplex_certificate
+) -> NeutralPilot:
     geometry, transform = simplex_setup
     return run_neutral_pilot(
         transform, simplex_polytope, config=PILOT, model_id="simplex",
-        stage=GEOMETRY_PILOT_STAGE,
+        stage=GEOMETRY_PILOT_STAGE, certificate=simplex_certificate,
     )
 
 
@@ -288,7 +310,7 @@ class TestThePilotIsFrozen:
         assert "ok" in result.stdout
 
     def test_the_two_pilot_stages_draw_different_numbers(
-        self, simplex_setup, simplex_polytope: ReducedPolytope
+        self, simplex_setup, simplex_polytope: ReducedPolytope, simplex_certificate
     ) -> None:
         """Independence is what makes pilot-seed sensitivity attributable (Codex, M10 r2).
 
@@ -300,34 +322,38 @@ class TestThePilotIsFrozen:
         _, transform = simplex_setup
         geometry_pilot = run_neutral_pilot(
             transform, simplex_polytope, config=PILOT, model_id="m",
-            stage=GEOMETRY_PILOT_STAGE,
+            stage=GEOMETRY_PILOT_STAGE, certificate=simplex_certificate,
         )
         scale_pilot = run_neutral_pilot(
             transform, simplex_polytope, config=PILOT, model_id="m", stage=SCALE_PILOT_STAGE,
+            certificate=simplex_certificate,
         )
         assert not np.allclose(geometry_pilot.coordinates, scale_pilot.coordinates)
 
     def test_a_pilot_is_reproducible_from_its_semantic_key(
-        self, simplex_setup, simplex_polytope: ReducedPolytope
+        self, simplex_setup, simplex_polytope: ReducedPolytope, simplex_certificate
     ) -> None:
         """Same coordinates ⇒ same draws, bit for bit. The RNG is named, not positional."""
         _, transform = simplex_setup
         first = run_neutral_pilot(
-            transform, simplex_polytope, config=PILOT, model_id="m", stage=SCALE_PILOT_STAGE
+            transform, simplex_polytope, config=PILOT, model_id="m", stage=SCALE_PILOT_STAGE,
+            certificate=simplex_certificate,
         )
         second = run_neutral_pilot(
-            transform, simplex_polytope, config=PILOT, model_id="m", stage=SCALE_PILOT_STAGE
+            transform, simplex_polytope, config=PILOT, model_id="m", stage=SCALE_PILOT_STAGE,
+            certificate=simplex_certificate,
         )
         assert np.array_equal(first.coordinates, second.coordinates)
         assert first.content_key() == second.content_key()
 
     def test_an_unknown_stage_is_refused(
-        self, simplex_setup, simplex_polytope: ReducedPolytope
+        self, simplex_setup, simplex_polytope: ReducedPolytope, simplex_certificate
     ) -> None:
         _, transform = simplex_setup
         with pytest.raises(CalibrationError, match="unknown pilot stage"):
             run_neutral_pilot(
-                transform, simplex_polytope, config=PILOT, model_id="m", stage="typo"
+                transform, simplex_polytope, config=PILOT, model_id="m", stage="typo",
+                certificate=simplex_certificate,
             )
 
 
@@ -612,7 +638,7 @@ class TestCalibrateRunsOnlyThePilotsItWasAsked:
     """Both stages are opt-in switches, and `calibrate` must run exactly what was asked."""
 
     def test_neither_switch_leaves_v1_untouched(
-        self, fork_setup, fork_reduced: ReducedPolytope, fork_lowered
+        self, fork_setup, fork_reduced: ReducedPolytope, fork_lowered, fork_certificate
     ) -> None:  # type: ignore[no-untyped-def]
         """With both stages off, `calibrate` must return ``T₀`` and the support-vertex scale
         **unchanged** — so a caller can route every run through it without changing v1's numbers."""
@@ -621,6 +647,7 @@ class TestCalibrateRunsOnlyThePilotsItWasAsked:
             geometry, fork_reduced, bootstrap, fork_lowered,
             model_id="fork",
             optimum=synthetic_optimum(fork_lowered, 12.0),
+            bootstrap_certificate=fork_certificate,
             sampler=dataclasses.replace(PILOT, pilot_reround=False, energy_scale="warmup_range"),
         )
         assert result.transform is bootstrap
@@ -629,13 +656,14 @@ class TestCalibrateRunsOnlyThePilotsItWasAsked:
         assert result.energy_scale.mode == "warmup_range"
 
     def test_reround_alone_runs_one_pilot(
-        self, fork_setup, fork_reduced: ReducedPolytope, fork_lowered
+        self, fork_setup, fork_reduced: ReducedPolytope, fork_lowered, fork_certificate
     ) -> None:  # type: ignore[no-untyped-def]
         geometry, bootstrap = fork_setup
         result = calibrate(
             geometry, fork_reduced, bootstrap, fork_lowered,
             model_id="fork",
             optimum=synthetic_optimum(fork_lowered, 12.0),
+            bootstrap_certificate=fork_certificate,
             sampler=dataclasses.replace(PILOT, pilot_reround=True, energy_scale="warmup_range"),
         )
         assert result.geometry_pilot is not None
@@ -645,7 +673,7 @@ class TestCalibrateRunsOnlyThePilotsItWasAsked:
         assert result.energy_scale.mode == "warmup_range"
 
     def test_the_scale_pilot_runs_under_the_rerounded_transform(
-        self, fork_setup, fork_reduced: ReducedPolytope, fork_lowered
+        self, fork_setup, fork_reduced: ReducedPolytope, fork_lowered, fork_certificate
     ) -> None:  # type: ignore[no-untyped-def]
         """Step 3 of the DAG: the scale pilot uses ``T₁``, so σ̂₀ is estimated from the
         better-mixing chain — while the geometry pilot stays bound to ``T₀``, the frame it ran in.
@@ -658,6 +686,7 @@ class TestCalibrateRunsOnlyThePilotsItWasAsked:
             geometry, fork_reduced, bootstrap, fork_lowered,
             model_id="fork",
             optimum=synthetic_optimum(fork_lowered, 12.0),
+            bootstrap_certificate=fork_certificate,
             sampler=dataclasses.replace(PILOT, pilot_reround=True, energy_scale="pilot_sd"),
         )
         assert result.scale_pilot is not None
@@ -669,7 +698,7 @@ class TestCalibrateRunsOnlyThePilotsItWasAsked:
         assert result.energy_scale.pilot is not None
 
     def test_the_two_pilots_are_independent_streams(
-        self, fork_setup, fork_reduced: ReducedPolytope, fork_lowered
+        self, fork_setup, fork_reduced: ReducedPolytope, fork_lowered, fork_certificate
     ) -> None:  # type: ignore[no-untyped-def]
         """Even were they run under the same transform, they must not share draws — otherwise
         "the rounding got unlucky" and "the scale got unlucky" are indistinguishable."""
@@ -678,6 +707,7 @@ class TestCalibrateRunsOnlyThePilotsItWasAsked:
             geometry, fork_reduced, bootstrap, fork_lowered,
             model_id="fork",
             optimum=synthetic_optimum(fork_lowered, 12.0),
+            bootstrap_certificate=fork_certificate,
             sampler=dataclasses.replace(PILOT, pilot_reround=True, energy_scale="pilot_sd"),
         )
         assert result.geometry_pilot is not None and result.scale_pilot is not None
@@ -687,7 +717,7 @@ class TestCalibrateRunsOnlyThePilotsItWasAsked:
         )
 
     def test_the_reround_improves_conditioning(
-        self, fork_setup, fork_reduced: ReducedPolytope, fork_lowered
+        self, fork_setup, fork_reduced: ReducedPolytope, fork_lowered, fork_certificate
     ) -> None:  # type: ignore[no-untyped-def]
         """The whole reason spec §17.4 exists. Reported so the improvement is *shown*, not asserted:
         `bootstrap_condition_number` is kept beside the final one."""
@@ -696,6 +726,7 @@ class TestCalibrateRunsOnlyThePilotsItWasAsked:
             geometry, fork_reduced, bootstrap, fork_lowered,
             model_id="fork",
             optimum=synthetic_optimum(fork_lowered, 12.0),
+            bootstrap_certificate=fork_certificate,
             sampler=dataclasses.replace(PILOT, pilot_reround=True, energy_scale="warmup_range"),
         )
         assert result.bootstrap_condition_number == bootstrap.diagnostics.condition_number
@@ -705,7 +736,8 @@ class TestCalibrateRunsOnlyThePilotsItWasAsked:
         )
 
     def test_an_objective_from_another_polytope_is_refused(
-        self, simplex_setup, simplex_polytope: ReducedPolytope, fork_lowered
+        self, simplex_setup, simplex_polytope: ReducedPolytope, fork_lowered,
+        simplex_certificate,
     ) -> None:  # type: ignore[no-untyped-def]
         """The M6 "two artifacts that never met" join, guarded at the DAG's own entrance.
 
@@ -720,5 +752,6 @@ class TestCalibrateRunsOnlyThePilotsItWasAsked:
                 geometry, simplex_polytope, bootstrap, fork_lowered,
                 model_id="simplex",
                 optimum=synthetic_optimum(fork_lowered, 1.0),
+                bootstrap_certificate=simplex_certificate,
                 sampler=PILOT,
             )

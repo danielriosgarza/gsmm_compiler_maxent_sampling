@@ -111,7 +111,20 @@ from gsmm_compiler.rounding import RoundedTransform
 from gsmm_compiler.sparse_objective import EnergyScale, ReducedObjective
 
 SAMPLER_IMPL_VERSION = 1
-"""Bump when the transition kernel changes — invalidates every cached sample artifact."""
+"""Bump when **anything this module computes for persistence** changes — invalidates every cached
+sample artifact and every `NeutralPilot`.
+
+Scope, stated explicitly because a narrow reading of it left a real gap (Codex, M10.2 review round
+5). This covers the transition kernel *and* `trace_objective`, which derives six persisted arrays
+and the trace summary from the draws. The kernel is the obvious half; the traces are the half that
+was uncovered, since `batch.sample_recipe_key` names only this constant and
+`output.OUTPUT_IMPL_VERSION` — the writer that lays bytes down, not the code that decides what they
+mean. A change to what `trace_j` *is* moves neither unless this one is read the way it is now
+written.
+
+One version rather than three because the boundary that matters is the module, not the function: if
+you edit anything here whose result reaches disk, bump it.
+"""
 
 VALUE_DTYPE = np.float64
 

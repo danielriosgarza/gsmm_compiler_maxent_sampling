@@ -1100,9 +1100,62 @@ class ReachabilityCertificate:
     elapsed_seconds: float
     polytope_key: str
 
+    transform_key: str
+    """`RoundedTransform.content_key` of the transform this certifies — **not** decoration (M10.2).
+
+    The certificate is a statement about one materialized matrix: it recomputes ``E = S·T``, the
+    reachable box from *that* ``T``, and ``Ω`` from a fresh ``T⁺``. Without this field a certificate
+    could sit beside any transform of the right shape and every check would pass — the M6 "two
+    artifacts that never met" join, wearing M9's hat. It matters now because M10 makes a *second*
+    transform (``T₁``, re-rounded from the pilot) on the same polytope: ``polytope_key`` alone
+    cannot tell ``T₀``'s certificate from ``T₁``'s.
+    """
+
+    def __post_init__(self) -> None:
+        """The evidence must be *evidence* before the verdict derived from it means anything.
+
+        `to_cache` stores the fields and lets `is_certified` re-derive the verdict, so that a bundle
+        cannot simply *assert* it passed. That argument has a hole unless the fields are themselves
+        checked: ``worst_absolute = −1`` is not a claim of innocence, it is nonsense, and it makes
+        ``worst_absolute <= contract`` **true**. So a corrupted certificate certified — through the
+        very mechanism built to stop a fabricated one. (Codex, M10.2 review round 4.)
+
+        This closes *malformed* evidence, which is the repo's stated corruption model (accidental
+        cache damage), and it is deliberately not a claim about an adversary: a caller who
+        hand-builds a plausible-but-false certificate defeats any Python-level proof object, and
+        pretending otherwise would be the kind of overclaim this package's reviews exist to kill.
+        A metadata digest in `cache.ArtifactCache` — which today hashes every array and trusts the
+        meta — is the remaining gap and belongs at the cache layer, not here.
+        """
+        if not (np.isfinite(self.worst_absolute) and self.worst_absolute >= 0.0):
+            raise RoundingError(
+                f"a reachability certificate's worst residual must be finite and non-negative, got "
+                f"{self.worst_absolute!r}: it is a maximum of absolute values, so this is not a "
+                "certificate that passed — it is one whose evidence is corrupt"
+            )
+        if not (np.isfinite(self.contract) and self.contract > 0.0):
+            raise RoundingError(
+                f"a reachability certificate's contract must be finite and positive, got "
+                f"{self.contract!r}"
+            )
+        if min(self.n_rows, self.n_rows_certified, self.n_lps) < 0:
+            raise RoundingError(
+                f"a reachability certificate cannot have negative counts (n_rows={self.n_rows}, "
+                f"n_rows_certified={self.n_rows_certified}, n_lps={self.n_lps})"
+            )
+        if self.n_rows_certified > self.n_rows:
+            raise RoundingError(
+                f"a reachability certificate claims {self.n_rows_certified} rows certified out of "
+                f"{self.n_rows}"
+            )
+
     @property
     def is_certified(self) -> bool:
-        """True when **every** reachable state meets the declared contract."""
+        """True when **every** reachable state meets the declared contract.
+
+        Derived, never stored — and sound only because `__post_init__` has already established that
+        ``worst_absolute`` is a non-negative real and ``contract`` a positive one.
+        """
         return bool(self.worst_absolute <= self.contract)
 
     @property
@@ -1122,7 +1175,98 @@ class ReachabilityCertificate:
             "reachable_elapsed_seconds": self.elapsed_seconds,
             "reachable_is_certified": self.is_certified,
             "reachable_margin": self.margin,
+            "reachable_transform_key": self.transform_key,
         }
+
+    def to_cache(self) -> dict[str, Any]:
+        """Round-trippable, keyed by the real field names — see `RoundingDiagnostics.to_cache`.
+
+        Deliberately **not** `as_dict`, and here the distinction has teeth. `as_dict` writes
+        ``reachable_is_certified``, a *derived* verdict. Caching that would let a loader trust a
+        stored boolean; caching the fields instead makes `from_cache` re-derive the verdict from
+        ``worst_absolute`` and ``contract`` — the evidence, not the claim. A bundle asserting
+        ``is_certified: true`` beside a ``worst_absolute`` above its contract is then simply
+        impossible to express. (M9: never trust a reading, check the bound.)
+        """
+        return asdict(self)
+
+    @classmethod
+    def from_cache(cls, data: dict[str, Any]) -> ReachabilityCertificate:
+        names = {f.name for f in fields(cls)}
+        missing = names - data.keys()
+        if missing:
+            raise RoundingError(f"cached reachability certificate lacks fields: {sorted(missing)}")
+        return cls(**{name: data[name] for name in names})
+
+
+def require_certified_transform(
+    certificate: ReachabilityCertificate,
+    transform: RoundedTransform,
+    reduced: ReducedPolytope,
+    *,
+    contract: float = DEFAULT_MASS_BALANCE_CONTRACT,
+) -> None:
+    """Refuse to sample ``transform`` unless ``certificate`` proves **it** meets the contract.
+
+    M9's gate, made *total*. It was installed in exactly one place — inside the ``compute()``
+    closure of `batch._load_or_build_geometry` — which runs only on a cache **miss**. So a cache
+    hit skipped the gate entirely, and `maxent build-geometry --cache-dir` would cheerfully store a
+    bundle it had just printed ``REFUSED`` for. Warm the cache, then sample: an uncertified
+    transform, no error, every downstream check green. This is the one door, and all three callers
+    (`batch`, the CLI, `calibration`'s ``T₁``) go through it.
+
+    The three checks are not redundant — each refuses a different lie:
+
+    - **the polytope**: a certificate about another model's bounds (M6's join);
+    - **the transform**: a certificate about another ``T``. M10 makes this reachable for the first
+      time — ``T₀`` and ``T₁`` share a ``polytope_key`` exactly, so nothing else separates them;
+    - **the verdict**: re-derived here from ``worst_absolute`` against **``contract``, the policy
+      this gate was given** — never read off a stored boolean, and never against the bar the
+      certificate chose for itself.
+
+    That last distinction is the one it took a fifth review round to see. Re-deriving the verdict
+    stops an artifact *asserting* it passed; it does not stop one **relaxing the bar it is judged
+    against**. `certify_reachable_mass_balance` accepts any positive ``contract``, so a caller could
+    ask for ``contract=1.0``, get a truthful `is_certified`, and walk through — no fabrication, no
+    corruption, just a proof of a different and useless proposition. M9's finding was that there
+    must be **one declared definition of "mass balanced"** (``η = 1e-9``, the same one
+    `diagnostics.feasibility_report` applies to emitted samples); the certificate's own ``contract``
+    is therefore *provenance* — what it happened to be computed against — and this default is the
+    policy. A certificate proved against a **stricter** bar still passes, because
+    ``worst_absolute`` is what is tested and a smaller residual clears a larger bar. (Codex, M10.2
+    review round 5.)
+    """
+    if not (np.isfinite(contract) and contract > 0.0):
+        raise RoundingError(
+            f"the mass-balance contract must be finite and positive, got {contract}"
+        )
+    if certificate.polytope_key != reduced.content_key():
+        raise RoundingError(
+            "the certificate was computed against a different polytope "
+            f"({certificate.polytope_key[:16]}… vs {reduced.content_key()[:16]}…), so it bounds "
+            "the mass balance of some other model's reachable set"
+        )
+    if certificate.transform_key != transform.content_key():
+        raise RoundingError(
+            "the certificate was computed for a different transform "
+            f"({certificate.transform_key[:16]}… vs {transform.content_key()[:16]}…). It "
+            "recomputes E = S·T and Ω from T⁺, so it is a statement about one materialized "
+            "matrix: two transforms on one polytope (M10's T₀ and T₁) share a polytope_key "
+            "exactly and are not interchangeable here"
+        )
+    if not certificate.worst_absolute <= contract:
+        proved_against = (
+            ""
+            if certificate.contract == contract
+            else f" (the certificate was proved against a {certificate.contract:.1e} bar, which is "
+            "not this package's declared contract)"
+        )
+        raise RoundingError(
+            f"the rounded geometry admits a reachable state whose mass balance is off by "
+            f"{certificate.worst_absolute:.3e} at metabolite {certificate.worst_row_id!r}, "
+            f"above the declared contract {contract:.1e}: the chain could step off "
+            f"the steady-state manifold, so this transform must not be sampled{proved_against}"
+        )
 
 
 def certify_reachable_mass_balance(
@@ -1179,6 +1323,7 @@ def certify_reachable_mass_balance(
             n_lps=0,
             elapsed_seconds=time.perf_counter() - start,
             polytope_key=transform.polytope_key,
+            transform_key=transform.content_key(),
         )
 
     # Y = {y : l − c ≤ T·y ≤ u − c}. Fixed for every solve; only the objective moves.
@@ -1228,6 +1373,7 @@ def certify_reachable_mass_balance(
         n_lps=n_lps,
         elapsed_seconds=time.perf_counter() - start,
         polytope_key=transform.polytope_key,
+        transform_key=transform.content_key(),
     )
 
 

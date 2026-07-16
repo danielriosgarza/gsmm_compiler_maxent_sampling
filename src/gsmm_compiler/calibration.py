@@ -76,9 +76,15 @@ from gsmm_compiler.affine_geometry import ReducedGeometry
 from gsmm_compiler.config import GeometryConfig, SamplerConfig
 from gsmm_compiler.flux_polytope import ReducedPolytope
 from gsmm_compiler.logging_utils import get_logger
-from gsmm_compiler.maxent_sampler import run_chains
+from gsmm_compiler.maxent_sampler import SAMPLER_IMPL_VERSION, run_chains
 from gsmm_compiler.provenance import content_key
-from gsmm_compiler.rounding import RoundedTransform, reround_transform
+from gsmm_compiler.rounding import (
+    ReachabilityCertificate,
+    RoundedTransform,
+    certify_reachable_mass_balance,
+    require_certified_transform,
+    reround_transform,
+)
 from gsmm_compiler.sparse_objective import (
     EnergyScale,
     LPOptimum,
@@ -90,8 +96,15 @@ _log = get_logger(__name__)
 
 VALUE_DTYPE = np.float64
 
-CALIBRATION_IMPL_VERSION = 1
-"""Bump when the pilot's arithmetic or schedule semantics change — invalidates cached pilots."""
+CALIBRATION_IMPL_VERSION = 2
+"""Bump when the pilot's arithmetic or schedule semantics change — invalidates cached pilots.
+
+2 (M10.2): the β=0 pilots no longer receive the objective's ``optimum_coordinates`` start hint, so
+every pilot's draws change; and `NeutralPilot.content_key` gained `seed`, `refresh_interval` and
+`sampler_impl_version`. The bump would be redundant with the added key components alone — but a
+*removed* input leaves no trace in a key, so a v1 pilot and an M10.2 pilot of the same recipe would
+otherwise hash identically while holding different draws.
+"""
 
 GEOMETRY_PILOT_STAGE = "geometry_pilot"
 SCALE_PILOT_STAGE = "scale_pilot"
@@ -109,13 +122,39 @@ class NeutralPilot:
     """A frozen β=0 pilot chain — **objective-independent**, and that is load-bearing.
 
     The β=0 law does not see ``J``: the target is uniform on the polytope and the kernel draws
-    uniformly on each chord. So **one neutral pilot serves every objective on a polytope**, which is
-    not a micro-optimisation — M7 puts a base *and* a reweighted objective on one polytope, and they
-    must be calibrated against the *same* neutral ensemble or their β axes are not comparable with
-    each other, let alone across strains.
+    uniformly on each chord. So **one neutral pilot serves every objective sharing this polytope,
+    transform and pilot recipe**, which is not a micro-optimisation — M7 puts a base *and* a
+    reweighted objective on one polytope, and they must be calibrated against the *same* neutral
+    ensemble or their β axes are not comparable with each other, let alone across strains.
 
     Hence the split: this artifact carries **no objective key**, and the derived `EnergyScale` does.
     (Codex, M10 review round 2.)
+
+    🔴 **M10.2: that claim was false when it was written, and the docstring was the only place it
+    was true.** `calibrate` passed ``optimum_coordinates`` — a *start hint*, derived from the
+    objective's own LP optimum — into both pilots. The β=0 **stationary law** is objective-
+    independent; a **finite pilot artifact** is not. Measured on the example model, two pilots
+    differing in nothing but that hint:
+
+    ===========================  ==============================
+    ``content_key``              **identical**
+    draws                        not bit-identical, max |Δy| 2.79
+    ``T₁``                       cond(C_q) 7198 vs 9663
+    ``s_J = σ̂₀``                 2.6287 vs 2.4995
+    ===========================  ==============================
+
+    That is not bias — both are honest draws from one β=0 law, and their spread is Monte Carlo
+    noise. It is worse: **the artifact was not a function of its key.** A content-addressed store
+    must return the bytes its key names, so the first cache hit across two objectives on one
+    polytope (M7's exact case) would have served the base objective's pilot to the reweighted one
+    while the manifest reported determinism. The mechanism is sharper than "a different start":
+    the hint changes the support hull's cardinality, hence the Dirichlet draw's dimension, hence
+    **RNG consumption on every subsequent transition** — the streams desynchronise (Codex, M10.2
+    review round 2).
+
+    The fix is structural, per this module's own rule: `run_neutral_pilot` **has no**
+    ``optimum_coordinates`` parameter, so objective state cannot reach a neutral pilot by
+    forgetting to pass ``None``. Production chains at β>0 keep the hint; it is theirs.
     """
 
     coordinates: NDArray[np.float64]
@@ -145,6 +184,14 @@ class NeutralPilot:
     burn_in: int
     thin: int
 
+    seed: int
+    """``SamplerConfig.seed``. `provenance.stream_seed` passes it as the `SeedSequence` *entropy*,
+    so it changes every draw — and it was missing from `content_key`, which is a false hit."""
+
+    refresh_interval: int
+    """Sweeps between exact rebuilds of ``v`` from ``y``. M5 settled that in float64 this chain's
+    state is ``(y, cache error, refresh phase)``, not ``y`` alone — so this changes the bytes."""
+
     @property
     def dimension(self) -> int:
         return int(self.coordinates.shape[2])
@@ -159,6 +206,14 @@ class NeutralPilot:
         Not merely polytope+stream: the **input transform** and the **schedule** change the draws
         too, and a key that omits them lets a pilot run under one ``T`` be reused under another.
         (Codex, M10 review round 3.)
+
+        **M10.2 completed it, and an incomplete key is worse than none** — no key means no cache;
+        an incomplete one is a false-hit generator, and §1.1's rule is that a false miss only
+        recomputes while a false hit corrupts. M10.1 wrote this key and never wired it to a store,
+        so nothing had yet been able to hit it. Added: `seed` and `refresh_interval` (see the
+        fields), and `sampler_impl_version`, because the *kernel's* arithmetic decides these draws
+        and this key must miss when it changes. The objective is deliberately still absent — but
+        that is now true by construction rather than by hope; see the class docstring.
         """
         return content_key(
             model_id=self.model_id,
@@ -169,6 +224,9 @@ class NeutralPilot:
             n_draws=self.n_draws,
             burn_in=self.burn_in,
             thin=self.thin,
+            seed=self.seed,
+            refresh_interval=self.refresh_interval,
+            sampler_impl_version=SAMPLER_IMPL_VERSION,
             calibration_impl_version=CALIBRATION_IMPL_VERSION,
             numpy_version=np.__version__,
         )
@@ -184,6 +242,8 @@ class NeutralPilot:
             "pilot_n_draws": self.n_draws,
             "pilot_burn_in": self.burn_in,
             "pilot_thin": self.thin,
+            "pilot_seed": self.seed,
+            "pilot_refresh_interval": self.refresh_interval,
             "calibration_impl_version": CALIBRATION_IMPL_VERSION,
         }
 
@@ -205,6 +265,28 @@ class CalibrationResult:
     """``cond(C_q)`` of ``T₀`` — the support-vertex rounding, kept so the improvement is *shown*
     rather than asserted."""
 
+    certificate: ReachabilityCertificate
+    """M9's reachable mass-balance proof for **`transform`** — always, never ``None``.
+
+    It was ``None`` when re-rounding was off, on the reasoning that ``T₀``'s builder already held
+    its certificate. Codex (M10.2 review round 3) was right that this is a hole: it makes the
+    *caller* remember which of two objects to consult, and a reader of the run manifest then gets
+    ``T₀``'s certificate reported as the run's while production samples ``T₁``. So this field is
+    the proof for the transform this result actually ships, whichever branch produced it — one
+    object, one question, no bookkeeping.
+    """
+
+    optimum_coordinates: NDArray[np.float64] | None
+    """The production start hint, re-expressed in `transform`'s frame (BUILD_PLAN §1.6.5).
+
+    A start hint and nothing more: it enters only a production chain's initial state, never the
+    kernel, the objective or ``s_J``. It is **not** given to the pilots — that is the M10.2 defect
+    (`NeutralPilot`). But it is expressed in ``T₀``'s coordinates, so once ``T₁`` exists a caller
+    handing the old vector to a chain stepping in the new frame would aim it at an arbitrary
+    interior point. `calibrate` owns both frames, so it does the change of coordinates here rather
+    than leaving a trap for the caller.
+    """
+
     def manifest(self) -> dict[str, Any]:
         out: dict[str, Any] = {
             "bootstrap_condition_number": self.bootstrap_condition_number,
@@ -218,23 +300,40 @@ class CalibrationResult:
             out["scale_pilot"] = self.scale_pilot.manifest()
         return out
 
+    def certificate_report(self) -> dict[str, Any]:
+        """The reachable mass-balance certificate **of the transform this run samples**.
+
+        `as_dict`, not `to_cache`: this is the human-facing manifest, where the renamed keys and the
+        derived ``reachable_is_certified`` / ``reachable_margin`` are the point. The cache stores
+        the fields and re-derives the verdict; a reader wants the verdict.
+        """
+        return self.certificate.as_dict()
+
 
 def run_neutral_pilot(
     transform: RoundedTransform,
     reduced: ReducedPolytope,
     *,
     config: SamplerConfig, model_id: str, stage: str,
-    optimum_coordinates: NDArray[np.float64] | None = None,
+    certificate: ReachabilityCertificate,
 ) -> NeutralPilot:
     """Run a β=0 pilot under ``transform`` and freeze it.
 
     ``stage`` names the RNG stream, so `GEOMETRY_PILOT_STAGE` and `SCALE_PILOT_STAGE` draw
     independent numbers on the same model — which is the whole point of running two.
 
-    No ``objective`` argument, and that is deliberate rather than an omission: at β=0 the target is
-    flat and ``J`` provably never enters the draw, so an objective here could only be decoration
-    that
-    a later reader would mistake for a dependency.
+    ``certificate`` must prove **this** ``transform``. Gating `calibrate` alone left this door open:
+    it is public and it starts the very same chain, so a caller could step past the guard without
+    fabricating anything (Codex, M10.2 review round 4). A pilot is not a lesser chain — every
+    artifact the DAG freezes descends from its draws, so it earns the same gate production gets.
+
+    **No ``objective`` and no ``optimum_coordinates``**, and neither is an omission — together they
+    are what makes `NeutralPilot`'s objective-independence a fact about the code rather than a
+    sentence in a docstring. At β=0 the target is flat and ``J`` provably never enters the draw, so
+    an objective here could only be decoration a later reader would mistake for a dependency. The
+    start hint is subtler and it is what M10.2 had to fix: it carries the objective's LP optimum,
+    it changes the draws, and `content_key` does not hash it. Absent parameters cannot be passed by
+    mistake; a defaulted ``None`` can. (See `NeutralPilot`.)
     """
     if stage not in (GEOMETRY_PILOT_STAGE, SCALE_PILOT_STAGE):
         raise CalibrationError(
@@ -247,6 +346,7 @@ def run_neutral_pilot(
             "the transform was not built from this polytope; the pilot would step along one "
             "model's directions and be bounds-checked against another's"
         )
+    require_certified_transform(certificate, transform, reduced)
 
     result = run_chains(
         transform, reduced,
@@ -255,7 +355,6 @@ def run_neutral_pilot(
         beta=0.0,
         beta_index=0,
         objective=None,
-        optimum_coordinates=optimum_coordinates,
         stage=stage,
     )
 
@@ -279,6 +378,8 @@ def run_neutral_pilot(
         n_draws=int(coordinates.shape[1]),
         burn_in=int(config.burn_in),
         thin=int(config.thin),
+        seed=int(config.seed),
+        refresh_interval=int(config.refresh_interval),
     )
 
 
@@ -291,6 +392,7 @@ def calibrate(
     model_id: str,
     optimum: LPOptimum,
     sampler: SamplerConfig,
+    bootstrap_certificate: ReachabilityCertificate,
     geometry_config: GeometryConfig | None = None,
     optimum_coordinates: NDArray[np.float64] | None = None,
 ) -> CalibrationResult:
@@ -303,11 +405,26 @@ def calibrate(
 
     Returns ``T₀`` and the support-vertex scale unchanged when neither is enabled, so a caller can
     route every run through here without a branch and without changing v1's numbers.
+
+    ``optimum_coordinates`` is **for production only** and never reaches a pilot: it comes back on
+    `CalibrationResult.optimum_coordinates`, mapped into the final transform's frame. `calibrate`
+    is the only place that holds both frames, so it is the only place that can do that mapping —
+    and `run_neutral_pilot` has no parameter to receive it through (`NeutralPilot`).
+
+    ``bootstrap_certificate`` is **required, and it is an argument rather than a computation** on
+    purpose. A pilot is a chain: it steps in ``T₀``'s frame long before production exists, so an
+    uncertified ``T₀`` walks off the steady-state manifold *here*, and every artifact this function
+    freezes descends from those draws. Certifying it internally would re-run 334 LPs that
+    `batch.build_l3_bundle` has already run for the same matrix; demanding the proof instead costs
+    nothing, cannot be forgotten, and makes an uncertified transform unable to enter the pilot DAG
+    at all. (Codex, M10.2 review round 3: `certificate=None` was safe behind `prepare_model` and a
+    hole in the public API.)
     """
     geometry_config = geometry_config or GeometryConfig()
 
     if bootstrap.polytope_key != reduced.content_key():
         raise CalibrationError("the bootstrap transform was not built from this polytope")
+    require_certified_transform(bootstrap_certificate, bootstrap, reduced)
     if objective.polytope_key != reduced.content_key():
         raise CalibrationError(
             "the objective was not lowered from this polytope — the M6 'two artifacts that never "
@@ -320,6 +437,7 @@ def calibrate(
 
     transform = bootstrap
     geometry_pilot: NeutralPilot | None = None
+    certificate = bootstrap_certificate
     if wants_reround:
         pilot_config = _pilot_schedule(sampler)
         _log.info(
@@ -332,20 +450,35 @@ def calibrate(
             config=pilot_config,
             model_id=model_id,
             stage=GEOMETRY_PILOT_STAGE,
-            optimum_coordinates=optimum_coordinates,
+            certificate=bootstrap_certificate,  # this pilot steps in T₀'s frame
         )
         transform = reround_transform(
             geometry, reduced, bootstrap,
             pilot_coordinates=geometry_pilot.pooled_coordinates(),
             config=geometry_config,
         )
+        # M9's gate, applied to T₁ — **here, before the scale pilot**, not before production.
+        # The scale pilot is itself a chain stepping in T₁'s frame: an uncertified T₁ would let it
+        # walk off the steady-state manifold, and σ̂₀ would then be computed from off-manifold
+        # fluxes — the β axis calibrated against states the model forbids.
+        #
+        # The exact-arithmetic theorem does *not* transfer T₀'s certificate. range(T₁) = range(T₀)
+        # exactly (§1.6.1), so the reachable *flux set* is identical and the true worst residual is
+        # the same number. But the certificate is a **numerical** bound: it recomputes E = S·T₁ and
+        # Ω from a fresh T₁⁺, and fl(B·L₀) and fl(B·L₁) need not share a floating-point column
+        # space just because their exact formulas do. 334 LPs / ~0.5 s against a ~19 s pilot.
+        certificate = certify_reachable_mass_balance(transform, reduced)
+        require_certified_transform(certificate, transform, reduced)
         _log.info(
-            "re-rounded: cond(C_q) %.3g → %.3g (%.2f×), step_scale_ratio %.3g → %.3g",
+            "re-rounded: cond(C_q) %.3g → %.3g (%.2f×), step_scale_ratio %.3g → %.3g; "
+            "T₁ reachable ‖Sv−b‖ %.3g (certified, %.0f× inside contract)",
             bootstrap_condition,
             transform.diagnostics.condition_number,
             bootstrap_condition / transform.diagnostics.condition_number,
             bootstrap.diagnostics.step_scale_ratio,
             transform.diagnostics.step_scale_ratio,
+            certificate.worst_absolute,
+            certificate.margin,
         )
 
     scale_pilot: NeutralPilot | None = None
@@ -356,7 +489,9 @@ def calibrate(
             config=pilot_config,
             model_id=model_id,
             stage=SCALE_PILOT_STAGE,
-            optimum_coordinates=_recoordinate(bootstrap, transform, optimum_coordinates),
+            # `certificate` tracks `transform`: T₁'s proof when re-rounding ran, T₀'s otherwise.
+            # This is the pairing the ordering exists for — the scale pilot steps in *this* frame.
+            certificate=certificate,
         )
         energy_scale = pilot_energy_scale(
             objective, scale_pilot.fluxes,
@@ -390,6 +525,8 @@ def calibrate(
         geometry_pilot=geometry_pilot,
         scale_pilot=scale_pilot,
         bootstrap_condition_number=bootstrap_condition,
+        certificate=certificate,
+        optimum_coordinates=_recoordinate(bootstrap, transform, optimum_coordinates),
     )
 
 

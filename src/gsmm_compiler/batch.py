@@ -38,16 +38,23 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from gsmm_compiler.affine_geometry import GEOMETRY_IMPL_VERSION, build_geometry
+from gsmm_compiler.affine_geometry import (
+    GEOMETRY_IMPL_VERSION,
+    ReducedGeometry,
+    build_geometry,
+)
 from gsmm_compiler.cache import ArtifactCache
+from gsmm_compiler.calibration import calibrate
 from gsmm_compiler.config import Config
 from gsmm_compiler.flux_polytope import ReducedPolytope
 from gsmm_compiler.maxent_sampler import (
+    SAMPLER_IMPL_VERSION,
     movable_reactions,
     run_chain,
     trace_objective,
 )
 from gsmm_compiler.output import (
+    OUTPUT_IMPL_VERSION,
     RunLayout,
     SampleStorage,
     is_complete,
@@ -57,17 +64,24 @@ from gsmm_compiler.output import (
 from gsmm_compiler.provenance import Provenance, content_key
 from gsmm_compiler.rounding import (
     ROUNDING_IMPL_VERSION,
+    ReachabilityCertificate,
     RoundedTransform,
-    RoundingError,
     build_transform,
     certify_reachable_mass_balance,
+    require_certified_transform,
 )
 from gsmm_compiler.sparse_objective import (
     ReducedObjective,
-    choose_energy_scale,
     lower_objective,
     resolve_objective,
     solve_sparse_objective,
+)
+
+_GEOMETRY_ARRAY_NAMES = (
+    "scaling",
+    "basis",
+    "center",
+    "support_points",
 )
 
 _TRANSFORM_ARRAY_NAMES = (
@@ -201,11 +215,17 @@ class ModelPlan:
 def prepare_model(
     spec: ModelSpec, config: Config, *, cache: ArtifactCache | None = None
 ) -> ModelPlan:
-    """Run L0→L3 for one strain and return the frozen artifacts its chains sample from.
+    """Run L0→L3, calibrate, and return the frozen artifacts its chains sample from.
 
     Imports cobra lazily (parsing is the one place it is needed) so the module stays worker-safe.
     The geometry — the expensive, β-independent stage — goes through the cache; the rest is cheap
     enough to recompute each run.
+
+    **Every run goes through `calibration.calibrate`, with no branch** (M10.2). With the pilot
+    switches off it returns ``T₀`` and the support-vertex ``s_J`` unchanged, so v1's numbers keep
+    v1's labels; with them on it runs the pilot DAG. Routing the default path through the same call
+    is deliberate — a second, uncalibrated code path is how the two would drift apart, and this
+    package has spent two milestones on artifacts that never met.
     """
     from gsmm_compiler.model_input import load_canonical_model  # cobra; parent-only
 
@@ -218,20 +238,31 @@ def prepare_model(
     lowered = lower_objective(reduced, resolved.objective)
     solution = solve_sparse_objective(reduced, resolved.objective)
 
-    transform, support_points, geometry_manifest = _load_or_build_geometry(
+    geometry, bootstrap, geometry_meta = _load_or_build_geometry(
         reduced, config, model_id=model_id, cache=cache
     )
 
-    scale = choose_energy_scale(
+    calibration = calibrate(
+        geometry,
+        reduced,
+        bootstrap,
         lowered,
-        support_points,
+        model_id=model_id,
         optimum=solution.optimum,
-        warmup_polytope_key=reduced.content_key(),
-        mode=config.sampler.energy_scale,
-        quantile=config.sampler.energy_scale_quantile,
-        fallback=config.sampler.energy_scale_fallback,
+        sampler=config.sampler,
+        # The proof `_load_or_build_geometry` already checked, handed on rather than recomputed:
+        # the pilots are chains stepping in T₀'s frame, so T₀ must be certified before them.
+        bootstrap_certificate=ReachabilityCertificate.from_cache(
+            geometry_meta["reachability_certificate"]
+        ),
+        geometry_config=config.geometry,
+        # In T₀'s frame; `calibrate` returns it in the final transform's frame. Production only —
+        # it never reaches a pilot (`calibration.NeutralPilot`).
+        optimum_coordinates=bootstrap.to_coordinates(reduced.to_reduced(solution.optimum.v_full)),
     )
-    optimum_coordinates = transform.to_coordinates(reduced.to_reduced(solution.optimum.v_full))
+    transform = calibration.transform
+    scale = calibration.energy_scale
+    optimum_coordinates = calibration.optimum_coordinates
 
     return ModelPlan(
         model_id=model_id,
@@ -240,7 +271,11 @@ def prepare_model(
         objective=lowered,
         energy_scale_value=scale.value,
         j_star=scale.j_star,
-        optimum_coordinates=np.ascontiguousarray(optimum_coordinates, dtype=np.float64),
+        optimum_coordinates=(
+            None
+            if optimum_coordinates is None
+            else np.ascontiguousarray(optimum_coordinates, dtype=np.float64)
+        ),
         movable=movable_reactions(transform),
         storage=SampleStorage.from_config(config.output),
         sampler=config.sampler,
@@ -249,8 +284,14 @@ def prepare_model(
         reports={
             "model_report": canonical.report(),
             "objective": lowered.manifest(),
-            "geometry": geometry_manifest,
+            "geometry": geometry_meta["geometry_manifest"],
             "energy_scale": scale.manifest(),
+            "calibration": calibration.manifest(),
+            # The certificate of the transform **this run samples**, in report form. Under
+            # re-rounding that is T₁, not T₀ — reporting the bootstrap's certificate here while
+            # production steps in T₁'s frame would be this package's signature bug (a manifest
+            # describing an artifact that was not used), committed in the milestone about it.
+            "reachability_certificate": calibration.certificate_report(),
             "lp_optimum": solution.diagnostics(),
             "config": config.as_dict(),
             "provenance": Provenance.capture().as_dict(),
@@ -263,6 +304,84 @@ def prepare_model(
                 "activity_threshold": float(min(config.objective.near_zero_thresholds)),
             },
         },
+    )
+
+
+def sample_recipe_key(plan: ModelPlan, *, beta_index: int, chain_index: int) -> str:
+    """§1.1's **sample artifact key**: ``L2 + L3 + β + chain seed coords + sampler version +
+    burn/thin/n_samples``.
+
+    §1.1 has always specified this key. Nothing computed it. Restart skipped a unit on its
+    ``COMPLETE`` marker alone, and `output.store_chain` recorded only the ``polytope_key`` — so a
+    results directory reused after *any* change that moves the numbers (a new pilot seed, a longer
+    schedule, `energy_scale` switched to ``pilot_sd``) resumed the units it still had and sampled
+    the rest **from a different law**. The per-strain tree would then hold two experiments, the
+    cross-model aggregation would stack them into one table, and every diagnostic would pass:
+    each chain is individually correct, which is exactly what makes the mixture invisible.
+
+    M10 forced the issue rather than created it. Before the pilot DAG, ``T`` and ``s_J`` were pure
+    functions of the polytope and the config; now they are functions of a *pilot*, so two runs of
+    an unchanged config against an unchanged model can legitimately disagree — and the marker could
+    not tell.
+
+    **The criterion here is artifact identity, not target identity, and they are different keys.**
+    M7 settled that ``optimum_coordinates`` is *deliberately not keyed* on the objective and
+    ``s_J``: it is a start hint, it enters only the initial state, and a wrong one cannot move the
+    invariant target — only seed a poorer start. That reasoning is correct and it does not belong
+    here. This key asks "are these bytes the same artifact?", and by that question the hint is no
+    different from `seed` or `chain_index`, which are hashed and define no law either. (Codex,
+    M10.2 review round 3 — and it is the identical defect this milestone fixed for the pilots, so
+    excluding it here while fixing it there was incoherent.)
+    """
+    return content_key(
+        layer="samples",
+        # L2: the objective, and the two numbers `s_J`'s subtraction produced (BUILD_PLAN §1.6.5).
+        # `energy_scale_value` is the pilot's fingerprint on production: under `pilot_sd` it is
+        # σ̂₀, so a re-run with a different pilot lands here and nowhere else.
+        objective_key=plan.objective.objective_key,
+        energy_scale_value=float(plan.energy_scale_value),
+        j_star=float(plan.j_star),
+        # L3: `T` itself, not the settings that were meant to produce it. Under re-rounding this is
+        # `T₁`, whose identity no configuration predicts.
+        polytope_key=plan.reduced.content_key(),
+        transform_key=plan.transform.content_key(),
+        # The unit, and the stream that draws it. `model_id` is here because `provenance.
+        # stream_seed` keys the RNG on it — a run that overrides `--model-id` against the same file
+        # draws different numbers, and only this names that.
+        model_id=plan.model_id,
+        beta=float(plan.sampler.betas[beta_index]),
+        beta_index=int(beta_index),
+        chain_index=int(chain_index),
+        seed=int(plan.sampler.seed),
+        # The start hint — see the note above on artifact vs target identity. It moves the draws
+        # (it changes the support hull's cardinality, so the Dirichlet dimension, so RNG
+        # consumption on every later transition), and under re-rounding it is expressed in T₁'s
+        # frame, so it is not even redundant with the transform key.
+        optimum_coordinates=plan.optimum_coordinates,
+        # Consumed by start selection and chord validation, so it can move the draws.
+        feasibility_tol=float(plan.feasibility_tol),
+        # These change the stored `trace_near_zero_counts` arrays — bytes of this artifact.
+        near_zero_thresholds=list(plan.near_zero_thresholds),
+        # The schedule — and `refresh_interval`, because M5 settled that in float64 the state is
+        # `(y, cache error, refresh phase)`, so it moves the draws, not just their bookkeeping.
+        burn_in=int(plan.sampler.burn_in),
+        n_samples=int(plan.sampler.n_samples),
+        thin=int(plan.sampler.thin),
+        refresh_interval=int(plan.sampler.refresh_interval),
+        # Storage decides the *bytes on disk*: M9 measured that `reduced` round-trips to 1.1e-13 and
+        # not bit-exactly (gemv per row vs gemm per block), so byte-identity holds within a mode and
+        # not across one — two modes in one directory are two different artifacts.
+        store_mode=plan.storage.mode,
+        store_flux_dtype=plan.storage.flux_dtype,
+        # Two versions, because two different pieces of code decide these bytes:
+        # `SAMPLER_IMPL_VERSION` covers the transition kernel that draws them (its docstring says
+        # so), `OUTPUT_IMPL_VERSION` the writer that lays them down. An output-only change moves
+        # only the second, and used to move neither.
+        sampler_impl_version=SAMPLER_IMPL_VERSION,
+        output_impl_version=OUTPUT_IMPL_VERSION,
+        # `movable` is deliberately absent, and it is the one exclusion that survives the criterion
+        # above: `movable_reactions(transform)` is an exact function of a transform already hashed
+        # here, so hashing it too would only assert the same fact twice.
     )
 
 
@@ -286,50 +405,80 @@ def geometry_cache_key(reduced: ReducedPolytope, config: Config, *, model_id: st
     )
 
 
+def build_l3_bundle(
+    reduced: ReducedPolytope, config: Config, *, model_id: str
+) -> tuple[dict[str, NDArray[Any]], dict[str, Any]]:
+    """Build L3 from scratch and return its cache bundle: **the one writer of this schema.**
+
+    Before M10.2 there were two. This function's body lived in a closure here, while
+    `cli._cmd_maxent_build_geometry --cache-dir` assembled its *own* bundle under the *same*
+    `geometry_cache_key` — and the two disagreed: the CLI's meta carried no
+    ``reachability_certificate``, and it stored the bundle even when the certificate came back
+    **REFUSED**. Since `batch` gated only inside its miss path, warming the cache from the CLI and
+    then sampling walked M9's gate straight past. Two writers of one schema is the defect; one
+    writer is the fix, so the drift has nowhere to live.
+
+    The certificate is computed here rather than inside `build_transform` for the reason M4's span
+    certificate is its own step: it costs LPs, and `rounding` stays solver-free so a worker can
+    import it (BUILD_PLAN §1.2, §1.4.2).
+    """
+    geometry = build_geometry(reduced, model_id=model_id, config=config.geometry)
+    transform = build_transform(geometry, reduced, config=config.geometry)
+    certificate = certify_reachable_mass_balance(transform, reduced)
+    require_certified_transform(certificate, transform, reduced)
+
+    geometry_arrays, geometry_meta = geometry.to_bundle()
+    transform_arrays, transform_meta = transform.to_bundle()
+    return (
+        # Namespaced, because both artifacts have a `center` and a flat merge would silently keep
+        # one of them. Each is then rebuilt and re-keyed by its own class, so a divergence between
+        # the two centres is caught by whichever key it breaks — not hidden by a dedupe.
+        {
+            **{f"geometry_{name}": array for name, array in geometry_arrays.items()},
+            **transform_arrays,
+        },
+        {
+            "geometry": geometry_meta,
+            "transform": transform_meta,
+            "geometry_manifest": geometry.manifest(),
+            "reachability_certificate": certificate.to_cache(),
+        },
+    )
+
+
 def _load_or_build_geometry(
     reduced: ReducedPolytope, config: Config, *, model_id: str, cache: ArtifactCache | None
-) -> tuple[RoundedTransform, NDArray[np.float64], dict[str, Any]]:
-    """Return ``(transform, support_points, geometry_manifest)``, from the cache if present."""
+) -> tuple[ReducedGeometry, RoundedTransform, dict[str, Any]]:
+    """Return ``(geometry, T₀, meta)``, from the cache if present — certificate enforced either way.
 
-    def compute() -> tuple[dict[str, NDArray[Any]], dict[str, Any]]:
-        geometry = build_geometry(reduced, model_id=model_id, config=config.geometry)
-        transform = build_transform(geometry, reduced, config=config.geometry)
-
-        # M9: prove that **every state the chain can reach** meets the mass-balance contract, before
-        # a single sample is drawn. This is the gate `build_transform` used to attempt with a
-        # per-direction bar — see BUILD_PLAN §1.4.2. It belongs here rather than inside
-        # `build_transform` for the same reason M4's span certificate is its own step: it costs LPs,
-        # and `rounding` stays solver-free so a worker can import it.
-        certificate = certify_reachable_mass_balance(transform, reduced)
-        if not certificate.is_certified:
-            raise RoundingError(
-                f"the rounded geometry admits a reachable state whose mass balance is off by "
-                f"{certificate.worst_absolute:.3e} at metabolite {certificate.worst_row_id!r}, "
-                f"above the declared contract {certificate.contract:.1e}: the chain could step off "
-                "the steady-state manifold, so this transform must not be sampled"
-            )
-
-        arrays, meta = transform.to_bundle()
-        arrays = {**arrays, "support_points": np.ascontiguousarray(geometry.support_points)}
-        meta = {
-            **meta,
-            "geometry_manifest": geometry.manifest(),
-            "reachability_certificate": certificate.as_dict(),
-        }
-        return arrays, meta
-
+    Returns the **geometry**, not just the transform. That is M10.2's enabling change: `calibration`
+    needs ``B`` and ``s`` to re-round from a pilot, and a cache hit used to hand back a transform
+    from which they cannot be recovered without inverting ``L₀``.
+    """
     if cache is None:
-        arrays, meta = compute()
+        arrays, meta = build_l3_bundle(reduced, config, model_id=model_id)
     else:
         key = geometry_cache_key(reduced, config, model_id=model_id)
-        artifact = cache.get_or_compute("L3", key, compute)
+        artifact = cache.get_or_compute(
+            "L3", key, lambda: build_l3_bundle(reduced, config, model_id=model_id)
+        )
         arrays, meta = artifact.arrays, artifact.meta
 
-    transform = RoundedTransform.from_bundle(
-        {name: arrays[name] for name in _TRANSFORM_ARRAY_NAMES}, meta, reduced
+    geometry = ReducedGeometry.from_bundle(
+        {name: arrays[f"geometry_{name}"] for name in _GEOMETRY_ARRAY_NAMES},
+        meta["geometry"],
+        reduced,
     )
-    support_points = np.asarray(arrays["support_points"], dtype=np.float64)
-    return transform, support_points, meta["geometry_manifest"]
+    transform = RoundedTransform.from_bundle(
+        {name: arrays[name] for name in _TRANSFORM_ARRAY_NAMES}, meta["transform"], reduced
+    )
+    # On **every** path, not just the miss. `build_l3_bundle` already gated what it built, so this
+    # line exists for the cache hit — where nothing previously looked at the certificate at all,
+    # and a bundle written by any other process was simply believed.
+    require_certified_transform(
+        ReachabilityCertificate.from_cache(meta["reachability_certificate"]), transform, reduced
+    )
+    return geometry, transform, meta
 
 
 # ---- one sampling unit (worker-side: no cobra, no HiGHS) ----------------------------------------
@@ -355,6 +504,44 @@ class SampleJob:
     sampler: Any
     near_zero_thresholds: tuple[float, ...]
     feasibility_tol: float
+    recipe_key: str = ""
+    """`sample_recipe_key` for this unit — written into its manifest, and what restart matches."""
+
+
+def _already_done(job: SampleJob) -> bool:
+    """Is this unit's work already on disk — **from this same experiment**? (§1.1 restart.)
+
+    ``COMPLETE`` alone answers the wrong question. It says "a chain finished here", not "*this*
+    chain finished here", and M10 makes the difference material: with re-rounding on, ``T₁`` and
+    ``s_J`` come from a pilot, so two runs of one unchanged config against one unchanged model can
+    honestly differ. A marker-only check would resume half a ladder from the old law and sample the
+    rest from the new one, into the same directory, and the cross-model table would average the two.
+
+    Refuse rather than recompute. A results tree is the user's output, not a cache: an unreadable
+    or foreign unit could be silently overwritten, but that destroys a run someone may still want,
+    and this package's rule is to refuse where a wrong number would otherwise be reported (M9).
+    """
+    if not is_complete(job.chain_dir):
+        return False
+
+    manifest_path = job.chain_dir / "manifest.json"
+    try:
+        found = str(read_json(manifest_path).get("recipe_key", ""))
+    except (OSError, ValueError) as exc:
+        raise BatchError(
+            f"{job.chain_dir} is marked COMPLETE but its manifest cannot be read ({exc}); refusing "
+            "to treat it as this run's work"
+        ) from exc
+
+    if found == job.recipe_key:
+        return True
+    raise BatchError(
+        f"{job.chain_dir} is marked COMPLETE but was sampled by a different recipe "
+        f"({found[:16] or '<none>'}… vs {job.recipe_key[:16]}…): its transform, objective, s_J, "
+        "schedule, seed or storage mode differs from this run's. Resuming would leave two "
+        "experiments in one directory and stack them into one cross-model table, with every "
+        "per-chain diagnostic green. Point --out at a new directory, or remove the stale unit."
+    )
 
 
 def run_sample_unit(job: SampleJob) -> dict[str, Any]:
@@ -398,6 +585,7 @@ def run_sample_unit(job: SampleJob) -> dict[str, Any]:
         beta_index=job.beta_index,
         chain_index=job.chain_index,
         storage=job.storage,
+        recipe_key=job.recipe_key,
     )
     return {
         "model_id": job.model_id,
@@ -429,6 +617,9 @@ def _jobs_for(plan: ModelPlan, layout: RunLayout) -> Iterator[SampleJob]:
                 sampler=plan.sampler,
                 near_zero_thresholds=plan.near_zero_thresholds,
                 feasibility_tol=plan.feasibility_tol,
+                recipe_key=sample_recipe_key(
+                    plan, beta_index=beta_index, chain_index=chain_index
+                ),
             )
 
 
@@ -533,7 +724,13 @@ def _run_one_model(
         )
 
     jobs = list(_jobs_for(plan, layout))
-    pending = [job for job in jobs if not is_complete(job.chain_dir)]
+    try:
+        pending = [job for job in jobs if not _already_done(job)]
+    except BatchError as exc:
+        return ModelOutcome(
+            model_id=plan.model_id, status="failed", n_units=len(jobs), n_completed=0,
+            error=f"{type(exc).__name__}: {exc}",
+        )
 
     summaries: dict[tuple[int, int], dict[str, Any]] = {}
     try:
