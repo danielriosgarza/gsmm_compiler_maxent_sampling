@@ -30,7 +30,7 @@ import multiprocessing as mp
 import os
 import traceback
 from collections.abc import Iterator, Sequence
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -819,10 +819,28 @@ def run_batch(
 
     outcomes: list[ModelOutcome] = []
     try:
-        for spec in specs:
-            outcomes.append(
-                _run_one_model(spec, config, layout=layout, cache=cache, executor=executor)
-            )
+        if specs:
+            # M10.2c. The loop below is a two-stage pipeline, and the shape is the milestone:
+            # model `index`'s units go to the pool, *then* model `index + 1` is prepared in the
+            # parent, *then* model `index`'s units are drained. The prepare therefore runs while
+            # the pool is busy, which is §1.2's "process models so their per-model geometry can
+            # overlap the *sampling* of earlier models". `prepared` is the one-model lookahead.
+            #
+            # One deep, never two: after this fix the *parent* is the bottleneck (23.1 s prepare
+            # vs 21.5 s sampling, §1.6.9), so a second lookahead would queue rather than overlap
+            # while holding a third strain's arrays live. Worth 1.41x at M=3 and 1.91x at M=100 —
+            # `speedup = M(P+S)/(M*P + S)`, since only the last model's sampling has no prepare to
+            # hide behind. On the `n_workers == 1` path there is no pool, so the lookahead overlaps
+            # nothing and merely runs early; the numbers are unaffected either way, because a
+            # stream is named by `(model_id, stage, β, chain)` and never by when it ran. Keeping
+            # one path rather than branching is deliberate: this package has spent two milestones
+            # on a hit path and a miss path that disagreed.
+            prepared = _prepare_one(specs[0], config, cache=cache)
+            for index in range(len(specs)):
+                submitted = _submit_one(prepared, layout=layout, executor=executor)
+                if index + 1 < len(specs):
+                    prepared = _prepare_one(specs[index + 1], config, cache=cache)  # the overlap
+                outcomes.append(_settle_one(submitted, layout=layout))
     finally:
         if executor is not None:
             executor.shutdown()
@@ -844,38 +862,89 @@ def run_batch(
     return BatchResult(batch_dir=layout.batch_dir, outcomes=tuple(outcomes))
 
 
-def _run_one_model(
-    spec: ModelSpec,
-    config: Config,
-    *,
-    layout: RunLayout,
-    cache: ArtifactCache | None,
-    executor: ProcessPoolExecutor | None,
-) -> ModelOutcome:
+@dataclass(frozen=True)
+class _InFlight:
+    """One model's units handed to the pool, plus what finalizing them needs (M10.2c).
+
+    This type exists so that submitting and draining are *separate* calls: everything the parent
+    does between them — §1.2's cross-model overlap — happens while these units are already running.
+    ``futures`` is ``None`` on the in-process path (``n_workers == 1``), where there is no pool to
+    overlap with and the jobs run at drain time; that path keeps the deterministic tests free of
+    multiprocessing, and its numbers are identical either way because each stream is named by
+    ``(model_id, stage, β, chain)`` rather than by when it ran.
+    """
+
+    plan: ModelPlan
+    jobs: tuple[SampleJob, ...]
+    pending: tuple[SampleJob, ...]
+    futures: tuple[Future[dict[str, Any]], ...] | None
+
+
+def _prepare_one(
+    spec: ModelSpec, config: Config, *, cache: ArtifactCache | None
+) -> ModelPlan | ModelOutcome:
+    """L0→L3 + calibration for one strain, or the outcome recording why it could not run.
+
+    A bad strain must not sink the batch (§1.1), so the failure is *returned* rather than raised:
+    the pipeline in `run_batch` prepares one model ahead, and an exception thrown there would
+    abort a *different* model's already-in-flight units.
+    """
     try:
-        plan = prepare_model(spec, config, cache=cache)
-    except Exception as exc:  # a bad strain must not sink the batch
-        model_id = spec.model_id or Path(spec.model_path).stem
+        return prepare_model(spec, config, cache=cache)
+    except Exception as exc:
         return ModelOutcome(
-            model_id=model_id,
+            model_id=spec.model_id or Path(spec.model_path).stem,
             status="failed",
             n_units=0,
             n_completed=0,
             error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
         )
 
-    jobs = list(_jobs_for(plan, layout))
+
+def _submit_one(
+    prepared: ModelPlan | ModelOutcome,
+    *,
+    layout: RunLayout,
+    executor: ProcessPoolExecutor | None,
+) -> _InFlight | ModelOutcome:
+    """Hand this model's pending units to the pool and return without waiting for them.
+
+    Returning promptly is the whole point: the caller's next act is to prepare the *next* model.
+    A strain that failed to prepare passes straight through, so the pipeline stays one branch.
+    """
+    if isinstance(prepared, ModelOutcome):
+        return prepared
+
+    jobs = list(_jobs_for(prepared, layout))
     try:
         pending = [job for job in jobs if not _already_done(job)]
     except BatchError as exc:
         return ModelOutcome(
-            model_id=plan.model_id, status="failed", n_units=len(jobs), n_completed=0,
+            model_id=prepared.model_id, status="failed", n_units=len(jobs), n_completed=0,
             error=f"{type(exc).__name__}: {exc}",
         )
 
+    futures = (
+        tuple(executor.submit(run_sample_unit, job) for job in pending)
+        if executor is not None
+        else None
+    )
+    return _InFlight(
+        plan=prepared, jobs=tuple(jobs), pending=tuple(pending), futures=futures
+    )
+
+
+def _settle_one(
+    submitted: _InFlight | ModelOutcome, *, layout: RunLayout
+) -> ModelOutcome:
+    """Wait for this model's units, then write its manifest and diagnostics."""
+    if isinstance(submitted, ModelOutcome):
+        return submitted
+
+    plan, jobs, pending = submitted.plan, list(submitted.jobs), list(submitted.pending)
     summaries: dict[tuple[int, int], dict[str, Any]] = {}
     try:
-        for result in _execute(pending, executor):
+        for result in _drain(submitted):
             summaries[(result["beta_index"], result["chain_index"])] = result
     except Exception as exc:
         return ModelOutcome(
@@ -906,16 +975,18 @@ def _run_one_model(
     )
 
 
-def _execute(
-    jobs: Sequence[SampleJob], executor: ProcessPoolExecutor | None
-) -> Iterator[dict[str, Any]]:
-    """Run the pending units — in the pool if given one, else in-process (deterministic tests)."""
-    if executor is None:
-        for job in jobs:
+def _drain(in_flight: _InFlight) -> Iterator[dict[str, Any]]:
+    """Collect the units — from the pool they were submitted to, or by running them here.
+
+    The submit half lives in `_submit_one`; splitting them is what lets the parent prepare the
+    next model in between (M10.2c). With no pool there is nothing to overlap, so the jobs simply
+    run now.
+    """
+    if in_flight.futures is None:
+        for job in in_flight.pending:
             yield run_sample_unit(job)
         return
-    futures = [executor.submit(run_sample_unit, job) for job in jobs]
-    for future in futures:
+    for future in in_flight.futures:
         yield future.result()
 
 

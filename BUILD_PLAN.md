@@ -183,6 +183,15 @@ Rules (all adopted from the collaboration):
   feed **one global worker pool** sized once for the machine — never a pool per model, which would
   oversubscribe the 14 cores. Each model gets its own result subdir; a final aggregation stage reads
   the per-model summaries into cross-model tables (§1.1).
+  - **Implemented in M10.2c** as a *one-model lookahead* — submit `i`'s units, prepare `i+1`, drain
+    `i` (§1.6.9). Measured A/B at M=3, cold, 8-rung ladder: **131.6 s → 93.1 s (1.41×)**; the
+    asymptote is **1.93×** and `speedup = M(P+S)/(M·P + S)`, so **quote the M, not the limit**.
+  - ⚠️ **This bullet's premise is `P ≲ S`, and it holds only at a real ladder.** Measured, `P` (parent:
+    parse + geometry + **pilots**) is 23.1 s against `S` (pooled sampling) of **21.5 s at 8 rungs** but
+    **1.3 s at the `betas=(0.0,)` default** — where the same overlap is worth ~5%. M10's pilot DAG made
+    `P` 20× more expensive and nobody re-derived this bullet. *Before extending it, re-measure both
+    terms: a scheduling decision is a claim about a ratio, and it expires when either side moves
+    (§1.6.6b).*
 - **RNG**: derive streams from stable semantic coordinates `(model_id, stage, β_index, chain_index)`
   via `SeedSequence`, and store the spawn keys. A flat `spawn()` sequence renumbers every downstream
   stream when task count changes — reproducibility death. Keying on `model_id` keeps each strain's
@@ -821,6 +830,117 @@ R̂ → 1 as the chain grows is a theorem, so the **schedule** is the honest lev
 draws R̂ is 1.033–1.059 and min ESS 59.7–155.0 across 5 seeds — the same bars, now with 2.5× and 3×
 margin, catching a regression that breaks mixing instead of sampling the noise.
 
+### 1.6.9 (M10.2c) The mandate was real, the *premise* had expired — and the arithmetic decides which
+
+**§1.2's batch-scheduling bullet says exactly what the tracker claimed it says**, and this time there
+is no over-application: it is a *top-level* bullet whose subject **is** scheduling across models
+("process models so their per-model geometry can overlap the *sampling* of earlier models, but feed
+one global worker pool"), and `run_batch` was `for spec in specs: _run_one_model(...)`, which prepares,
+submits and **drains** in one breath. So the code disagreed with the plan. **That is not sufficient
+reason to build it, and the difference is the milestone.** §1.6.7's rule — *cache what is expensive,
+derive what is cheap* — has a scheduling twin: **overlap what is long, and measure which term that
+is.** A mandate names a mechanism; only arithmetic says whether it pays.
+
+**Measured first (Bifido, d = 46, 14 cores, cold cache):**
+
+| | `betas=(0.0,)` — the default | the 8-rung ladder — production |
+|---|---|---|
+| `P` prepare (parent, **1 core**) | 23.1 s | 23.1 s |
+| `S` sampling (pool, **14 cores**) | **1.3 s** (4 units) | **21.5 s** (32 units) |
+| `P/S` | **18×** | **1.08×** |
+| overlap is worth | **~5%** | **1.93×** (asymptotic) |
+
+**The default config would have sent this milestone to the wrong lever.** At `betas=(0.0,)` the
+parent's 23.1 s dwarfs 1.3 s of sampling, the pilots are 86.7% of `prepare_model`, and the obvious
+conclusion is that §1.2's overlap is noise while the *pilots* need the pool. At the ladder the package
+actually exists to run, `P ≈ S` and the conclusion inverts. **Which lever wins is a function of which
+config you measure, and the default is not the production case.**
+
+**And that inversion vindicates the tracker's "weaker remedy" label for pilot-chain dispatch, for a
+reason it did not state.** `prepare_model` is 23.1 s of which the two β=0 pilots are **20.1 s
+(86.7%)** — 8 chains (2 pilots × 4) walking one at a time in the parent while 13 cores idle, and
+`run_chains`' own docstring says they are poolable and that a pool "draws the *same numbers*". It
+reads like an obvious win. It is not, **because the parent and the pool are different cores**: once
+prepare overlaps sampling the pilots are **free — hidden behind the pool** — so pooling them buys a
+further **0.7%** (23.1 → 22.9 s/model) against a **23.2 s/model** all-cores floor. Overlap alone lands
+on that floor. *Two levers on the same 20 s can differ by 100× in value depending only on what else is
+running.*
+
+| per model, 8-rung ladder | s/model | speedup |
+|---|---|---|
+| today (serial) | 44.6 | 1.00× |
+| **+ cross-model overlap** | **23.1** | **1.93×** |
+| + pilot pooling only | 29.6 | 1.51× |
+| + both | 22.9 | 1.94× |
+
+**The win is a function of batch size, and quoting the asymptote alone would be the M6 "12×" error
+again.** Only the *last* model's sampling has nothing to hide behind, so `speedup = M(P+S)/(M·P + S)`:
+**1.32× at M=2, 1.47× at M=3, 1.77× at M=10, 1.91× at M=100**, → 1.93×. Measured A/B at M=3, both arms
+run: **131.6 s → 93.1 s = 1.41×**, which is **96% of the 1.47× achievable at that M** (the residual is
+the parent becoming a 15th process on 14 cores). *1.93× is the limit, not the number a 3-strain batch
+sees.*
+
+**Shape of the fix.** `_run_one_model` split into `_prepare_one` → `_submit_one` → `_settle_one`, and
+the loop became a **one-model lookahead**: submit `i`'s units, prepare `i+1`, *then* drain `i`. One
+deep, never two — after the fix the parent is the bottleneck, so a second lookahead would queue rather
+than overlap while holding a third strain's arrays live. The overlap is safe because §1.2's own RNG
+rule already earned it: a stream is named by `(model_id, stage, β, chain)` and **never by when it
+ran**, so scheduling cannot move a draw — asserted at M=2 in `test_overlapping_the_strains_does_not_
+move_a_single_draw`. `_prepare_one` **returns** its failure rather than raising: preparation now sits
+next to *another* model's in-flight units, and a raise would sink work that has nothing to do with the
+bad strain.
+
+**A timing claim cannot be a test, so what is tested is the shape that produces it** — that `prepare(b)`
+precedes `drain(a)`. Both overlap tests were **run against the serial order and fail there** (M10.2e's
+lesson: 4 silent skips read exactly like 4 passes). That probe earned its keep immediately: the first
+version of the lookahead-depth test **passed on the serial code**, because with two specs depth-1 and
+depth-2 emit identical event orders. It takes **three** specs to see the difference, and a two-spec
+version of that test asserted nothing at all.
+
+### 1.6.10 (M10.2c) 🔴 The span certificate refuses **12.5% of valid strains**, and only the seed decides
+
+**Found while measuring M10.2c, caused by none of it.** A 3-strain batch over the *same model file*
+came back `['complete', 'failed', 'complete']`. The failure reproduces with **no batch, no pool, no
+cache and no overlap** — `prepare_model` alone, one `model_id` at a time — so it is a **v1 defect**,
+open since M4:
+
+```
+GeometryError: the span certificate is not exhaustive
+(214/214 probes, 2 inconclusive, complement complete=True)
+```
+
+**The only thing that varies is `model_id`, and it varies nothing but the RNG stream.** Measured over
+16 ids on one unchanged file: **14 certify, 2 do not — 12.5%.** Every run agrees on the answer:
+`d = 46`, `max_width ≈ 1.85e-12` (i.e. the complement is flat to 12 digits, every time). The
+certificate **computes the right geometry and then declines to say so**, because 1–2 probes of 214
+were noise-swamped.
+
+| `model_id` | exhaustive | inconclusive / 214 | d | max_width |
+|---|---|---|---|---|
+| 14 of 16 | ✅ | 0 | 46 | ~1.85e-12 |
+| `strain_1` | 🔴 | **2** | 46 | 1.869e-12 |
+| `strain_11` | 🔴 | **1** | 46 | 1.838e-12 |
+
+**This is M9's lesson for the fourth time, and the first time it is load-bearing for the package's
+purpose**: *a bar a valid input clears only 7 times in 8 is not a tolerance, it is a coin flip.* The
+other three instances were a test bar (§1.6.8), an R̂ bar (§1.6.8), and `certify_reachable_mass_balance`
+(the standing *Carried, not chased* item). **This one is different in kind: it is not a flaky test, it
+is a batch of 100 strains silently returning 88.** `metabolicSubcommunities` is exactly that batch.
+
+**What is *not* yet known — and the arithmetic that would settle it is not done.** `exhaustive` is
+`failing is None and complete and not capped and n_inconclusive == 0`. A probe is inconclusive when its
+noise swamps the configured tolerance (`NOISE_SAFETY`, §1.6). So the open question is whether an
+inconclusive probe on a complement direction that **every other seed measures at ~1e-12** is evidence
+of anything at all, or whether the gate is conflating *"this probe was uninformative"* with *"the span
+may be incomplete"* — those are different propositions, and `complement complete=True` says the sweep
+was not truncated. **Do not "fix" this by widening the tolerance or by retrying the probe until it
+passes** — that is choosing the bar to get the verdict, which §1.6.7's fourth review round already
+rejected once. Per this plan's own rule, the remedy here is a **hypothesis**: measure whether an
+inconclusive probe ever coincides with a genuinely incomplete span before touching the gate.
+Deliberately **not chased in M10.2c** — one milestone at a time — but it outranks the remaining M10
+extensions, and `geometry.exhaustive_span_certificate=false` is a *workaround that disables the
+check*, not a fix.
+
 ### 1.7 λ is scale-referenced: `λ = λ̃ · λ*`  *(M3 finding; decision SETTLED)*
 
 `J(v) = μ(v) − λ·C(v)` compares a **biomass flux** with a **sum of hundreds of absolute fluxes**.
@@ -909,7 +1029,7 @@ step that rescaled the pressure by an arbitrary median every iteration. Recorded
 | **M7** ✅ | Reweighted-L1 (frozen weights) | iterative reweighting `w_r ← w_base/(\|v_r\|+ε)` with clipping + median-renormalization, save every weight vector + LP solution, **freeze final weights before sampling**, rebuild objective/LP-optimum/`s_J` (L2 cache) from frozen weights. **λ re-resolved each iteration** (`λ_k = λ̃·λ*(w_k)`, §1.7); every `s_J` input keyed on objective+polytope (§1.6.5) | deterministic weights for fixed seed; active-set + **weight fixed point** converge; weights frozen ⇒ objective `J` unchanged during MCMC (reweighter cannot import sampler); labeled experimental (not exact cardinality); sampler reproduces analytic targets under the reweighted `J`. **PASSED 2026-07-16** (733 tests; `/collab` 5 rounds AGREE) |
 | **M8** ✅ | Cache, restart, batch orchestration & production | 4-layer cache, per-chain markers + writer-claim locking, atomic rename + fsync, **batch runner over a models manifest**, one global process pool over `(model, β, chain)`, worker thread-limit env, per-model run dirs + **cross-model aggregation**, manifests + diagnostics + `COMPLETE` | kill-and-resume resumes only missing `(model,chain)` units; partial batch yields valid cross-model tables; concurrent-writer safe; corrupted-artifact rejected; same-env deterministic traces; full batch runs on ≥2 strains with documented resources. **PASSED 2026-07-16** (content-addressed cache store with atomic-mkdir writer claim; `spawn` pool workers import no solver; serial==pool byte-identical; L0 key made content-addressed) |
 | **M9** | Performance & GSMM hardening | `benchmark.py` (new module) + `maxent benchmark` CLI → [benchmarks/M9_REPORT.md](benchmarks/M9_REPORT.md); worker-count sweep {1,2,4,7,14} by **ESS(J)/wall-sec**; allocation + sort profiling; `reduced` storage-mode validation; **the reachable-state mass-balance certificate (§1.4.2)** — scope added mid-milestone when the benchmark's own worker sweep could not run | benchmark report produced; all performance assertions hold (no per-step HiGHS, no scipy, no Python loop in chord, no element-wise highspy extraction, no full reconstruction every step) |
-| **M10** | Deferred extensions | **(1) pilot rerounding + pilot-based `s_J` — DONE**, as one DAG (bootstrap `T₀` → geometry pilot → `T₁` → scale pilot → `σ̂₀`), `energy_scale="pilot_sd"` additive beside `warmup_range` (§1.6.6). **(2a) wire the DAG into `batch`/CLI — DONE**; the recorded "fork §1.1 does not settle" was plain/code drift (§1.6.7). **(2b) key the pilots into the cache — DONE** (§1.6.6b, §1.6.7): the pilots are the DAG's only expensive node (19.3 s vs geometry's 1.17 s). **(2c) overlap `prepare_model` with sampling across models — NEXT, and §1.2 already mandates it**: the pool is global ✓ but `run_batch` is `for spec in specs: _run_one_model(...)` and blocks on every future, so no overlap exists. The tracker's recorded "two-phase pool dispatch" (parallelise a pilot's 4 chains) is the **weaker** remedy. Also open, same family: `ArtifactCache` has only `L3` + `pilot` live — L0/L1/L2 are documented and stored by nothing, so warm `prepare_model`'s remaining 1.17 s is all cobra parsing. Then: β→performance calibration (spec §22.3, now cheap — `q(β)` and `r_eff(κ)` are already computed); parallel tempering; slice line kernel; downstream mode-feature extraction | each behind its own tests; none alters the validated v1 target distribution. **(1) PASSED 2026-07-16** (37 new tests; `/collab` 4 rounds AGREE; ladder closes 75.8% of the gap at β=16 vs 13% before, cond(C_q) 2.57× better — *see §1.6.6b: the 2.87× recorded here was pre-M10.2a and stale*). **(2b) PASSED 2026-07-17** (18 new tests; `/collab` 3 rounds — round 1 refuted my payload design, round 3 found a hit/miss asymmetry **inside my own repair**; `prepare_model` 22.9 s → 1.2 s warm, `T₁`/`s_J` bit-identical) |
+| **M10** | Deferred extensions | **(1) pilot rerounding + pilot-based `s_J` — DONE**, as one DAG (bootstrap `T₀` → geometry pilot → `T₁` → scale pilot → `σ̂₀`), `energy_scale="pilot_sd"` additive beside `warmup_range` (§1.6.6). **(2a) wire the DAG into `batch`/CLI — DONE**; the recorded "fork §1.1 does not settle" was plain/code drift (§1.6.7). **(2b) key the pilots into the cache — DONE** (§1.6.6b, §1.6.7): the pilots are the DAG's only expensive node (19.3 s vs geometry's 1.17 s). **(2c) overlap `prepare_model` with sampling across models — DONE** (§1.6.9): §1.2 did mandate it *and* the arithmetic backed it, but only at a real ladder — at the `betas=(0.0,)` default the same overlap is worth ~5%, and the default is what a reader would have measured. A one-model lookahead (submit `i` → prepare `i+1` → drain `i`); measured A/B at M=3 **131.6 s → 93.1 s (1.41×**, 96% of the 1.47× achievable at that M; asymptote 1.93×). The recorded "two-phase pool dispatch" was indeed the **weaker** remedy — but for an unstated reason: once prepare overlaps sampling the pilots are *free*, so pooling them adds **0.7%**. **(2d) L0 cached — DONE** (M10.2d): warm `prepare_model` 1.21 s → 0.645 s, and a warm run never imports cobra. Then: β→performance calibration (spec §22.3, now cheap — `q(β)` and `r_eff(κ)` are already computed); parallel tempering; slice line kernel; downstream mode-feature extraction | each behind its own tests; none alters the validated v1 target distribution. **(1) PASSED 2026-07-16** (37 new tests; `/collab` 4 rounds AGREE; ladder closes 75.8% of the gap at β=16 vs 13% before, cond(C_q) 2.57× better — *see §1.6.6b: the 2.87× recorded here was pre-M10.2a and stale*). **(2b) PASSED 2026-07-17** (18 new tests; `/collab` 3 rounds — round 1 refuted my payload design, round 3 found a hit/miss asymmetry **inside my own repair**; `prepare_model` 22.9 s → 1.2 s warm, `T₁`/`s_J` bit-identical). **(2c) PASSED 2026-07-17** (4 new tests, both overlap tests proved non-vacuous against the serial order; 1.41× at M=3, draws bit-identical to the un-overlapped path). 🔴 **(2c) also measured a live defect it did not cause: the span certificate refuses 12.5% of valid strains (2 of 16 `model_id`s) — see §1.6.10** |
 
 ### 2.1 What M6 ships, and what it does not  *(M6 finding; SETTLED — and it constrains M10)*
 

@@ -14,6 +14,7 @@ that the pool and the in-process path produce byte-identical draws.
 from __future__ import annotations
 
 import shutil
+from concurrent.futures import Future
 from pathlib import Path
 
 import numpy as np
@@ -102,6 +103,34 @@ class TestDeterminism:
                 b = load_chain(pool.chain_dir("toy", beta_index, chain_index)).fluxes
                 np.testing.assert_array_equal(a, b)
 
+    def test_overlapping_the_strains_does_not_move_a_single_draw(
+        self, tmp_path: Path, toy_path: Path
+    ) -> None:
+        """M10.2c: the pipeline reorders *when* work runs; it must not change *what* is drawn.
+
+        The test above uses one spec, so it cannot see cross-model scheduling at all — the
+        overlap only exists from the second strain on. Two strains at ``n_workers=2`` run the
+        pipelined path; ``n_workers=1`` has no pool, so it is the un-overlapped control. They
+        agree because a stream is named by ``(model_id, stage, β, chain)`` and never by when it
+        ran, which is the property §1.2 relies on to schedule freely.
+        """
+        config = _config()
+        specs = [
+            ModelSpec(model_path=str(toy_path), model_id="one"),
+            ModelSpec(model_path=str(toy_path), model_id="two"),
+        ]
+        run_batch(specs, config, batch_name="s", output_root=tmp_path / "s", n_workers=1)
+        run_batch(specs, config, batch_name="p", output_root=tmp_path / "p", n_workers=2)
+
+        serial = RunLayout(root=tmp_path / "s", batch="s")
+        pool = RunLayout(root=tmp_path / "p", batch="p")
+        for model_id in ("one", "two"):
+            for beta_index in range(len(config.sampler.betas)):
+                for chain_index in range(config.sampler.n_chains):
+                    a = load_chain(serial.chain_dir(model_id, beta_index, chain_index)).fluxes
+                    b = load_chain(pool.chain_dir(model_id, beta_index, chain_index)).fluxes
+                    np.testing.assert_array_equal(a, b)
+
 
 class TestKillAndResume:
     def test_resume_recomputes_only_the_missing_unit(
@@ -149,12 +178,135 @@ class TestPartialBatch:
         summary = read_json(result.batch_dir / "cross_model" / "beta_summary.json")
         assert [row["model_id"] for row in summary] == ["good"]
 
+    def test_a_strain_that_fails_to_prepare_mid_pipeline_does_not_sink_the_one_in_flight(
+        self, tmp_path: Path, toy_path: Path
+    ) -> None:
+        """M10.2c moved preparation *next to* another model's in-flight units.
+
+        The broken strain is prepared while ``good_a``'s units are running, so a raise there would
+        now abort a different model's work — which is why `_prepare_one` returns its failure
+        instead of raising. Order matters: broken sits between two healthy strains, and the
+        outcomes must still come back one-per-spec, in spec order.
+        """
+        specs = [
+            ModelSpec(model_path=str(toy_path), model_id="good_a"),
+            ModelSpec(model_path="/does/not/exist.json", model_id="broken"),
+            ModelSpec(model_path=str(toy_path), model_id="good_b"),
+        ]
+        result = run_batch(
+            specs, _config(betas=(0.0,)), batch_name="b",
+            output_root=tmp_path / "r", n_workers=2,
+        )
+
+        assert [(o.model_id, o.status) for o in result.outcomes] == [
+            ("good_a", "complete"),
+            ("broken", "failed"),
+            ("good_b", "complete"),
+        ]
+
     def test_a_broken_strain_records_its_error(self, tmp_path: Path, toy_path: Path) -> None:
         specs = [ModelSpec(model_path="/nope.json", model_id="broken")]
         result = run_batch(specs, _config(betas=(0.0,)), batch_name="b", output_root=tmp_path / "r")
         (broken,) = result.outcomes
         assert broken.status == "failed"
         assert broken.error is not None and "FileNotFoundError" in broken.error
+
+
+class TestCrossModelOverlap:
+    """M10.2c — §1.2's "process models so their per-model geometry can overlap the *sampling* of
+    earlier models". Measured on the example model at the 8-rung ladder, the parent's prepare
+    (23.1 s, one core) and the pool's sampling (21.5 s, fourteen cores) are near-equal, so the
+    overlap is worth 1.93× — against a 23.2 s/model theoretical floor it leaves nothing on the
+    table (BUILD_PLAN §1.6.9).
+
+    Timing cannot be asserted in a test, so what is asserted is the **shape that produces it**:
+    that model B's prepare happens before model A's units are drained. That ordering is false on
+    the serial code and true on the pipelined code, which is what makes the test non-vacuous —
+    M10.2e shipped four silent skips that read exactly like passes.
+    """
+
+    def _pipeline_events(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        toy_path: Path,
+        model_ids: tuple[str, ...] = ("a", "b"),
+    ) -> list[tuple[str, str]]:
+        from gsmm_compiler import batch as batch_mod
+
+        events: list[tuple[str, str]] = []
+
+        real_prepare = batch_mod.prepare_model
+
+        def watched_prepare(spec: ModelSpec, config: Config, **kwargs: object) -> object:
+            events.append(("prepare", spec.model_id or "?"))
+            return real_prepare(spec, config, **kwargs)  # type: ignore[arg-type]
+
+        class WatchedFuture(Future):  # type: ignore[type-arg]
+            def __init__(self, model_id: str) -> None:
+                super().__init__()
+                self._model_id = model_id
+
+            def result(self, timeout: float | None = None) -> object:
+                events.append(("drain", self._model_id))
+                return super().result(timeout)
+
+        class RecordingExecutor:
+            """Stands in for the pool: runs each unit eagerly, but records *when it is waited on*.
+
+            Eager execution is what makes the test deterministic — the assertion is about the
+            order of the parent's own calls, which is exactly what the pipeline changes.
+            """
+
+            def __init__(self, **kwargs: object) -> None:
+                pass
+
+            def submit(self, fn: object, job: object) -> Future:  # type: ignore[type-arg]
+                model_id = job.model_id  # type: ignore[attr-defined]
+                events.append(("submit", model_id))
+                future: Future = WatchedFuture(model_id)  # type: ignore[type-arg]
+                future.set_result(fn(job))  # type: ignore[operator]
+                return future
+
+            def shutdown(self, *args: object, **kwargs: object) -> None:
+                pass
+
+        monkeypatch.setattr(batch_mod, "prepare_model", watched_prepare)
+        monkeypatch.setattr(batch_mod, "ProcessPoolExecutor", RecordingExecutor)
+
+        specs = [ModelSpec(model_path=str(toy_path), model_id=m) for m in model_ids]
+        run_batch(
+            specs, _config(betas=(0.0,)), batch_name="b",
+            output_root=tmp_path / "r", n_workers=2,
+        )
+        return events
+
+    def test_the_next_model_is_prepared_before_this_one_is_drained(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, toy_path: Path
+    ) -> None:
+        events = self._pipeline_events(monkeypatch, tmp_path, toy_path)
+
+        # The claim, stated as an order: b's geometry+pilots run while a's units are in flight.
+        assert events.index(("prepare", "b")) < events.index(("drain", "a"))
+        # ... and they are in flight — submitted before b was prepared, not merely queued after.
+        assert events.index(("submit", "a")) < events.index(("prepare", "b"))
+
+    def test_the_lookahead_is_exactly_one_model_deep(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, toy_path: Path
+    ) -> None:
+        """One ahead, never two — a deeper lookahead buys nothing and costs memory.
+
+        After the fix the *parent* is the bottleneck (23.1 s prepare vs 21.5 s sampling), so a
+        second lookahead would queue rather than overlap, while holding a third strain's frozen
+        arrays live. Three specs are the minimum that can see this: with two, depth-1 and depth-2
+        produce identical event orders, so a two-spec version of this test would assert nothing.
+        """
+        events = self._pipeline_events(monkeypatch, tmp_path, toy_path, ("a", "b", "c"))
+
+        # The overlap: b is prepared while a is in flight.
+        assert events.index(("prepare", "b")) < events.index(("drain", "a"))
+        # The bound: c is *not* — it waits until a has been drained and settled.
+        assert events.index(("drain", "a")) < events.index(("prepare", "c"))
 
 
 class TestCorruptedArtifactRejection:
