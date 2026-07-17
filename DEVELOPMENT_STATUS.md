@@ -785,11 +785,26 @@ its base-weight value through the reweighting loop or is re-resolved from the fr
 
 ## Verify current state
 
+> 🔴 **Read the Blockers row first.** `maxent sample` **fails from a clean cache unless BLAS threads
+> are pinned** — so the pilot-DAG command below is written with `OMP_NUM_THREADS=1`, and **that is a
+> workaround, not the expected state** (M10.2e fixes it). Confirm the bug in one command:
+>
+> ```bash
+> M=models/GCF_000010425_1_ASM1042v1_protein_non_gapfilled_latest_gapfilled_noO2.json
+> rm -rf /tmp/thr && env OMP_NUM_THREADS= .venv/bin/gsmm-compiler maxent sample $M \
+>   --out /tmp/thr/out --cache-dir /tmp/thr/cache --set sampler.energy_scale=pilot_sd \
+>   --set sampler.pilot_reround=true --set sampler.betas=[0.0] \
+>   --set sampler.n_samples=50 --set sampler.burn_in=50
+> # -> failed ... LPNotOptimalError: LP 'reachable_mass_balance' ... kUnknown
+> # The same command with OMP_NUM_THREADS=1 and a fresh --cache-dir completes (1/1 units).
+> ```
+
 ```bash
 cd /home/mcpu/GitHub/gsmm_compiler_maxent_sampling
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1   # ⚠️ M10.2e workaround, see above
 .venv/bin/python -V                                    # expect 3.11.15
-.venv/bin/python -m pytest -q | tail -3                # expect 907 passed
-.venv/bin/python -m pytest -q -m "not slow" | tail -3  # the fast subset (799)
+.venv/bin/python -m pytest -q | tail -3                # expect 938 passed
+.venv/bin/python -m pytest -q -m "not slow" | tail -3  # the fast subset (830)
 .venv/bin/ruff check . && .venv/bin/mypy               # expect clean
 .venv/bin/gsmm-compiler model inspect examples/toy_network.json     # affine RHS: nonzero
 M=models/GCF_000010425_1_ASM1042v1_protein_non_gapfilled_latest_gapfilled_noO2.json
@@ -797,8 +812,9 @@ M=models/GCF_000010425_1_ASM1042v1_protein_non_gapfilled_latest_gapfilled_noO2.j
 .venv/bin/gsmm-compiler maxent build-geometry $M       # d=46; reachable ‖Sv−b‖ CERTIFIED ~3.8e-11
 .venv/bin/gsmm-compiler maxent benchmark $M --repeats 1 --sweeps 100   # regenerate the M9 report
 
-# M10.2a: the pilot DAG from the CLI. Expect "re-rounded: cond(C_q) 1.54e+04 → …;
-# T₁ reachable ‖Sv−b‖ 3.86e-11 (certified, 26× inside contract)" and 4/4 units.
+# M10.2a/b/d: the pilot DAG from the CLI, with L0 + geometry + pilots all cached.
+# Expect "re-rounded: cond(C_q) 1.54e+04 → 5.97e+03 (2.57×); T₁ reachable ‖Sv−b‖ 3.87e-11
+# (certified, 26× inside contract)" and 4/4 units. NEEDS the OMP_NUM_THREADS=1 above.
 .venv/bin/gsmm-compiler maxent sample $M --out /tmp/m102 --cache-dir /tmp/m102/cache --workers 2 \
   --set sampler.energy_scale=pilot_sd --set sampler.pilot_reround=true \
   --set sampler.pilot_chains=2 --set sampler.pilot_burn_in=300 --set sampler.pilot_samples=300 \
@@ -806,6 +822,11 @@ M=models/GCF_000010425_1_ASM1042v1_protein_non_gapfilled_latest_gapfilled_noO2.j
   --set sampler.burn_in=300 --set sampler.n_samples=300
 # Re-run it verbatim → resumes (4/4, ~4 s). Re-run with --set sampler.n_samples=400 → REFUSES
 # ("marked COMPLETE but was sampled by a different recipe"), which is the §1.1 restart guard.
+
+# M10.2b/d: the cache is the milestone. Re-run against a WARM --cache-dir and watch
+# `prepare_model` fall 22.9 s → 0.645 s (35×) with T₁ and s_J bit-identical:
+#   "geometry_pilot: loaded from cache (…)"  — not "running 4 chains × …"
+# and no "parsing … (cobra; not cached)" line at all — a warm run never imports cobra.
 ```
 
 ---
