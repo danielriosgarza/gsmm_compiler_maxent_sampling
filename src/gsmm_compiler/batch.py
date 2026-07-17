@@ -47,11 +47,16 @@ from gsmm_compiler.cache import ArtifactCache
 from gsmm_compiler.calibration import calibrate
 from gsmm_compiler.config import Config
 from gsmm_compiler.flux_polytope import ReducedPolytope
+from gsmm_compiler.logging_utils import get_logger
 from gsmm_compiler.maxent_sampler import (
     SAMPLER_IMPL_VERSION,
     movable_reactions,
     run_chain,
     trace_objective,
+)
+from gsmm_compiler.numerics import (
+    DETERMINISM_POLICY_VERSION,
+    effective_runtime_profile,
 )
 from gsmm_compiler.output import (
     OUTPUT_IMPL_VERSION,
@@ -61,7 +66,7 @@ from gsmm_compiler.output import (
     read_json,
     write_json,
 )
-from gsmm_compiler.provenance import Provenance, content_key
+from gsmm_compiler.provenance import Provenance, content_key, hash_array
 from gsmm_compiler.rounding import (
     ROUNDING_IMPL_VERSION,
     ReachabilityCertificate,
@@ -101,6 +106,8 @@ store**, on purpose: measured warm, `.reduce()` is **1 ms** and the objective + 
 against `load_canonical_model`'s 1.157 s and the pilots' 19.3 s. *Cache what is expensive, derive
 what is cheap, key everything.*
 """
+
+_log = get_logger(__name__)
 
 _WORKER_THREAD_ENV = (
     "OPENBLAS_NUM_THREADS",
@@ -409,6 +416,15 @@ def geometry_cache_key(reduced: ReducedPolytope, config: Config, *, model_id: st
     two strains that happen to share a polytope still get their *own* geometry bytes — a cached
     artifact must reproduce a fresh build exactly, and a false miss only recomputes (a false hit
     corrupts, §1.1).
+
+    ``determinism_policy_version`` is folded in because until M10.2e **this key was a lie**: the
+    ambient BLAS thread count picked between two bases under one key, so the artifact was not a
+    function of the key naming it. `numerics.deterministic_blas` removes the thread count as an
+    input; the version is what makes the removal reach caches that were warmed *before* it, which
+    hold an ambient-thread basis this policy will not reproduce. What it still cannot promise is
+    byte equality across **machines** — OpenBLAS selects kernels by runtime CPU detection — so the
+    honest reading of this key is "the same inputs under the same numerical-runtime profile",
+    recorded beside the artifact by `numerical_runtime_profile`.
     """
     return content_key(
         layer=GEOMETRY_CACHE_LAYER,
@@ -418,6 +434,7 @@ def geometry_cache_key(reduced: ReducedPolytope, config: Config, *, model_id: st
         seed=int(config.sampler.seed),
         geometry_impl_version=GEOMETRY_IMPL_VERSION,
         rounding_impl_version=ROUNDING_IMPL_VERSION,
+        determinism_policy_version=DETERMINISM_POLICY_VERSION,
         numpy_version=np.__version__,
     )
 
@@ -438,6 +455,12 @@ def build_l3_bundle(
     The certificate is computed here rather than inside `build_transform` for the reason M4's span
     certificate is its own step: it costs LPs, and `rounding` stays solver-free so a worker can
     import it (BUILD_PLAN §1.2, §1.4.2).
+
+    The two constructors carry their own `numerics.deterministic_blas` scope rather than being
+    wrapped here, because this is not the only entrance to them (M10.2e) — the M5 fixtures call
+    both directly. What *this* function adds is the ``numerical_identity`` block: the question
+    "did one recipe key produce two different artifacts?" was unanswerable for ten milestones, and
+    it is answerable by reading two manifests.
     """
     geometry = build_geometry(reduced, model_id=model_id, config=config.geometry)
     transform = build_transform(geometry, reduced, config=config.geometry)
@@ -446,6 +469,9 @@ def build_l3_bundle(
 
     geometry_arrays, geometry_meta = geometry.to_bundle()
     transform_arrays, transform_meta = transform.to_bundle()
+    identity = _numerical_identity(
+        reduced, config, model_id=model_id, geometry=geometry, transform=transform
+    )
     return (
         # Namespaced, because both artifacts have a `center` and a flat merge would silently keep
         # one of them. Each is then rebuilt and re-keyed by its own class, so a divergence between
@@ -459,8 +485,105 @@ def build_l3_bundle(
             "transform": transform_meta,
             "geometry_manifest": geometry.manifest(),
             "reachability_certificate": certificate.to_cache(),
+            "numerical_identity": identity,
         },
     )
+
+
+def _numerical_identity(
+    reduced: ReducedPolytope,
+    config: Config,
+    *,
+    model_id: str,
+    geometry: ReducedGeometry,
+    transform: RoundedTransform,
+) -> dict[str, Any]:
+    """What built these bytes, recorded so that a divergence is *readable* rather than inferred.
+
+    M10.2e's own history is the argument for it. One recipe key produced two bases for ten
+    milestones; the way it finally surfaced was a certificate LP returning ``kUnknown`` in a CLI
+    run, three layers downstream and looking nothing like its cause. Every fact needed to see it
+    directly — same ``recipe_key``, different ``basis_hash``, different ``num_threads`` — existed at
+    build time and was thrown away.
+
+    ``recipe_key`` is recomputed here rather than passed in: the bundle should say which key it
+    *believes* it answers to, so a hit can check that belief against the key it was fetched under
+    (`_load_or_build_geometry`). The runtime is captured **inside** a `deterministic_blas` scope on
+    purpose — read outside it, ``num_threads`` would report the ambient 14 and describe a build that
+    did not happen. A manifest that describes work that did not happen is this package's signature
+    bug (M10.2b), so this one reports the pools as the constructors actually saw them.
+
+    None of this is a gate, and deliberately so: refusing a bundle whose profile differs would make
+    caches unshareable across machines, which is the cost that ruled out keying the thread count in
+    the first place. It is evidence, placed where somebody can read it.
+    """
+    return {
+        "recipe_key": geometry_cache_key(reduced, config, model_id=model_id),
+        "basis_hash": hash_array(geometry.basis),
+        "transform_hash": hash_array(transform.transform),
+        "support_points_hash": hash_array(geometry.support_points),
+        "runtime": effective_runtime_profile(),
+    }
+
+
+def _report_numerical_identity(meta: dict[str, Any], *, key: str) -> None:
+    """Check a fetched bundle's own account of itself, and say when it came from another runtime.
+
+    Two different strengths, on purpose, because the two facts have different standing.
+
+    **The recipe key is a gate.** A bundle records the key it believes it answers to; if it is found
+    under a different one, then either two writers disagree about the schema (M10.2a's defect, which
+    `build_l3_bundle` exists to prevent) or the store is damaged. Neither is a thing to sample from,
+    and §1.1's asymmetry decides the response: a false miss only recomputes, a false hit corrupts.
+
+    **The runtime profile is a warning.** A bundle built under a different BLAS build is not wrong —
+    it is what an honest cross-machine cache *looks like*, and refusing it would make caches
+    unshareable, which is the cost that ruled out putting the thread count in the key. But it is
+    also the exact condition under which this key's promise thins from "these bytes" to "these
+    bytes, on the profile that wrote them", so the user hears it rather than infers it. Had this
+    line existed, M10.2e's ten-milestone defect would have read *"one recipe key, two contents"* on
+    the second run instead of surfacing as a certificate LP failing closed three layers downstream.
+    """
+    identity = meta.get("numerical_identity")
+    if identity is None:  # pragma: no cover - the L3 key bump makes a pre-M10.2e hit unreachable
+        raise BatchError(
+            f"the cached L3 bundle {key[:16]}… carries no `numerical_identity`. Every bundle "
+            "written since M10.2e records one, and the determinism-policy version is part of this "
+            "key — so a bundle without it cannot be under this key unless the store was written by "
+            "something that is not `build_l3_bundle`."
+        )
+
+    stored_key = identity["recipe_key"]
+    if stored_key != key:
+        raise BatchError(
+            f"the cached L3 bundle found under {key[:16]}… says it was built for "
+            f"{stored_key[:16]}…. A bundle must answer to the key it is stored under; refusing "
+            "rather than sampling a geometry that belongs to another recipe (§1.1)."
+        )
+
+    current = effective_runtime_profile()
+    if identity["runtime"] != current:
+        _log.warning(
+            "the cached geometry %s… was built under a different numerical runtime than this one "
+            "(%s vs %s). Both may be valid — this key promises reproducibility within a numerical "
+            "profile, not byte equality across BLAS builds or CPUs — but a local rebuild need not "
+            "reproduce these bytes, and the pilot amplifies a last-bit difference to O(1) draws. "
+            "basis %s…",
+            key[:16],
+            _profile_summary(identity["runtime"]),
+            _profile_summary(current),
+            identity["basis_hash"][:10],
+        )
+
+
+def _profile_summary(profile: dict[str, Any]) -> str:
+    """The runtime facts that decide the last bit, short enough for a log line."""
+    pools = ", ".join(
+        f"{pool.get('internal_api')} {pool.get('version')} {pool.get('architecture')}"
+        f" ×{pool.get('num_threads')}"
+        for pool in profile.get("blas_pools", ())
+    )
+    return f"policy v{profile.get('determinism_policy_version')} [{pools or 'no BLAS pool found'}]"
 
 
 def _load_or_build_geometry(
@@ -480,6 +603,7 @@ def _load_or_build_geometry(
             GEOMETRY_CACHE_LAYER, key, lambda: build_l3_bundle(reduced, config, model_id=model_id)
         )
         arrays, meta = artifact.arrays, artifact.meta
+        _report_numerical_identity(meta, key=key)
 
     geometry = ReducedGeometry.from_bundle(
         {name: arrays[f"geometry_{name}"] for name in _GEOMETRY_ARRAY_NAMES},
@@ -853,6 +977,17 @@ def _mark_model_complete(model_id: str, layout: RunLayout) -> None:
 def _limit_thread_env() -> None:
     """Pin BLAS/OpenMP to one thread. Set in the parent *before* the spawn pool starts, so the
     freshly-imported NumPy in each spawned worker inherits it — the real oversubscription risk in
-    solver-free workers is nested BLAS threads, not HiGHS (§1.2)."""
+    solver-free workers is nested BLAS threads, not HiGHS (§1.2).
+
+    **This is the performance policy, and it is not the determinism policy** — the distinction cost
+    ten milestones to notice (M10.2e). Both pin threads; they are still two requirements. This one
+    stops 14 workers from each starting a nested pool, it is about the *machine*, and `setdefault`
+    is right for it: a user who exports ``OMP_NUM_THREADS=4`` has said something, and a resource
+    hint may be overridden. Reproducibility of a keyed artifact may not, so
+    `numerics.deterministic_blas` **forces** its limit and scopes it to the L3 build. Conflating
+    them is what let the second requirement go unstated: this function is called before the pool
+    exists, so the parent's own geometry build — which is where the nondeterminism actually was —
+    was never covered by it, and nothing here was ever meant to cover it.
+    """
     for name in _WORKER_THREAD_ENV:
         os.environ.setdefault(name, "1")

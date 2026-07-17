@@ -14,6 +14,11 @@ dependencies = [
     "numpy>=1.26",
     "highspy>=1.7",
     "cobra>=0.29",
+    # Not optional, and not a convenience: `numerics.deterministic_blas` is what makes an L3
+    # artifact a function of its L3 key (§1.1), and the key says so via the determinism-policy
+    # version. A soft import with a silent fallback would leave the key promising a build the
+    # environment might not have produced. Pure-Python wheel, no build step (§1 wheel-only).
+    "threadpoolctl>=3.1",
 ]
 
 [project.optional-dependencies]
@@ -51,5 +56,5 @@ strict = true
 warn_unreachable = true
 
 [[tool.mypy.overrides]]
-module = ["cobra.*", "highspy.*"]
+module = ["cobra.*", "highspy.*", "threadpoolctl.*"]
 ignore_missing_imports = true

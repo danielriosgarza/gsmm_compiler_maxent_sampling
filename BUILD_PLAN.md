@@ -88,6 +88,37 @@ source file ──sha256──┐
   points, while the stated L2 key omits L3. `pilot_sd` makes the edge explicit. The numeric labels are
   becoming less useful than named immutable nodes; recorded, not yet acted on.
 
+**M10.2e correction — what a key may promise** (§1.6.8 has the reasoning). Everything above assumes
+that fixing a key fixes the bytes. **It does not, and it cannot.** The ambient BLAS thread count
+selected between two valid bases under one L3 key for ten milestones, because multi-threaded OpenBLAS
+reduces in a different order. `numerics.deterministic_blas` removes the thread count as an input, and
+`DETERMINISM_POLICY_VERSION` is in the L3 key so caches warmed before it miss. But this NumPy ships
+OpenBLAS `DYNAMIC_ARCH`, which picks kernels by **runtime CPU detection**, so a different machine can
+still differ in the last bit at the same thread count. So the honest statement of the rule is:
+
+> **Within a declared numerical-runtime profile**, a recipe key rebuilds deterministically. **Across
+> profiles, byte equality is not promised.** Unrestricted cross-machine cache sharing and strict byte
+> identity cannot both be had from ordinary floating-point libraries — this is a choice about which
+> to give up, not a defect to fix.
+
+And one more precision, because M10.2e's own test tripped on it: *"an artifact is a function of its
+key"* is a claim about an artifact's **numbers**, not about every byte of its manifest. The L3 meta
+embeds `ReachabilityCertificate.to_cache()`, which carries `elapsed_seconds` — a **wall clock**. Two
+builds of one key therefore write different bundle bytes however deterministic the arithmetic is, and
+that is correct: the timing is provenance. Read the rule as *the arrays and the numbers derived from
+them*, which is what a false hit would corrupt; a stopwatch in a manifest corrupts nothing.
+
+The profile is *recorded* rather than keyed (`numerical_identity` in every L3 bundle: the recipe key,
+the basis/`T₀`/support hashes, the policy version, and the BLAS vendor/version/architecture/threads).
+Keying it would make caches unshareable across machines; recording it makes a divergence readable —
+which is precisely what nobody could do when one recipe key quietly produced two contents. The basis
+hash belongs to **content identity and manifests, never to the pre-build lookup key**: hashing the
+artifact to decide whether to build the artifact is circular.
+
+This does not weaken the sampled law. `s_J = σ̂₀` is reproducible **in distribution** across machines,
+not bit-for-bit, and M10 already reports that as calibration uncertainty (±2.6% relative SE, §1.6.6):
+another machine's σ̂₀ is another honest draw from the same pilot law.
+
 Rules (all adopted from the collaboration):
 - **L0 is content-addressed, not file-hash-addressed** *(M8; refines the original `sha256(file)`
   key)*. `build_canonical_model` accepts a cobra `Model` that may have been assembled or mutated in
@@ -124,11 +155,26 @@ Rules (all adopted from the collaboration):
   `threads=1`. A **batched-LP** variant (solve K random-objective LPs concurrently, one rank-revealing
   QR on the differences) stays behind a benchmark gate — adopt only if it gives ≥1.5× wall-clock at
   the *same validated dimension*. At d≤55 here, sequential wins by default.
+  - **Geometry (L3): BLAS pinned to 1 thread, forced and scoped** *(M10.2e — a requirement this plan
+    did not state for ten milestones; §1.6.8)*. `threads=1` above pins **HiGHS**, so the support
+    points were always reproducible; the **basis** is NumPy, and the ambient thread count silently
+    chose between two of them under one L3 key. `numerics.deterministic_blas` wraps `build_geometry`,
+    `build_transform` and `reround_transform` — the three constructors of thread-sensitive keyed
+    artifacts, each verified to need it and the sampler verified not to. **This is a different policy
+    from the worker thread limit below**, sharing only a mechanism (see §1.6.8): it is *forced*
+    (a keyed artifact may not depend on what the caller exported) and *scoped* (a library does not
+    seize its caller's process). It is also free — measured, pinning is **21% faster** here, because
+    a 260×46 Gram-Schmidt is far too small for 14 threads to repay their dispatch overhead.
 - **Sampling: process pool over `(β, chain)` units.** Given frozen geometry these are independent.
   A worker receives **only** frozen NumPy arrays (`T_active`, `center_active`, bounds, objective
   arrays, index maps) + a semantic RNG seed. A worker **never imports cobra or HiGHS**.
   - Set `OPENBLAS_NUM_THREADS=OMP_NUM_THREADS=MKL_NUM_THREADS=1` **before** NumPy import (the real
-    oversubscription risk in solver-free workers is BLAS/OpenMP, not HiGHS).
+    oversubscription risk in solver-free workers is BLAS/OpenMP, not HiGHS). *This bullet is a
+    **performance** policy and is implemented and working — `run_batch` pins the env before creating
+    the spawn pool, so each worker's freshly-imported NumPy inherits it. M10.2e initially misread it
+    as also mandating geometry determinism; it does not, and reading it that way is what hid the real
+    gap for ten milestones (§1.6.8). `setdefault` is correct **here** — a resource hint may yield to
+    a user who exports 4 — and wrong for a keyed artifact, which is why L3's policy is separate.*
   - Workers **write their own** `.npy` files; never ship flux matrices back through IPC.
   - **Benchmark worker count {1, 2, 4, 7, 14}** on the Jetson by ESS-per-wall-second. 14 can lose to
     4–7 under memory-bandwidth/thermal limits; pick empirically.
@@ -702,6 +748,78 @@ having just fixed the identical defect for the pilots. Codex's refutation is dec
 recipe key already hashes `seed`, `chain_index`, `schedule` and `storage_mode`, **none of which define
 the stationary law**. Both keys are right; they answer different questions. `movable` is the one
 exclusion that survives, being an exact function of a transform already hashed.
+
+### 1.6.8 (M10.2e) Two requirements that share a mechanism are still **two requirements**
+
+§1.6.7 asked "is this artifact a function of its key?" of four things and got **no** four times. Asked
+of v1's own geometry, the answer was also no — and this one had been shipping since M4.
+
+**The defect.** One L3 key (`e9d6fc28673a`), two bases, selected by an environment variable nobody
+set. The support points are identical — §1.2 pins HiGHS to `threads=1` — but the basis is NumPy:
+`residual -= basis @ (basis.T @ residual)`, and multi-threaded OpenBLAS reduces in a different order.
+
+| `OMP_NUM_THREADS` | basis | Δ | `T₁` cond | `certify(T₁)` |
+|---|---|---|---|---|
+| **1** | `d35fe4fccf` | — | 5969 | **3.873e-11 OK** |
+| unset / 2 / 4 / 8 | `970f8dddac` | **2.7e-15** | **5352** | 🔴 **kUnknown** |
+
+Four separate findings, and only the first is fixed here:
+
+1. **The artifact was not a function of its key.** §1.1's rule, violated in the geometry it describes.
+2. **The two bases are the same basis** — 2.7e-15 apart, a few ULPs, identical span certificates
+   (`max_width` 1.80e-12, 0 inconclusive), same d = 46, both `T₀` certify. *Nothing here is wrong.*
+3. **The pilot amplifies 2.7e-15 to 2.601** — O(1) on a coordinate range of [−2.48, 1.95]. Not a bug;
+   an MCMC being chaotic, at a gain of ~10¹⁵. But it makes geometry reproducibility the precondition
+   for the pilot DAG meaning anything twice.
+4. 🔴 **The `T₁` that fails `certify` is *better* conditioned than the one that passes** (5352 vs
+   5969), so the failure cannot be blamed on unlucky geometry: `certify_reachable_mass_balance` is
+   **fragile**. Pinning the threads makes that basis unreachable by default and **hides** this rather
+   than fixing it — any model or seed can still land on it. Recorded, deliberately not chased; it
+   needs the certificate's LP formulation looked at, not the thread count. Reproduction: build with
+   `OMP_NUM_THREADS` unset (basis `970f8dddac`), then `certify_reachable_mass_balance(T₁, reduced)`.
+
+**The lesson, and it is not the one I first wrote down.** The tracker's first draft of this section
+claimed *"§1.2 already mandates the fix and the code drifted — the fourth time this session"*. That is
+**false**, and Codex refused it. §1.2's thread rule is a sub-bullet of *"Sampling: process pool"*
+whose own parenthetical names its purpose — oversubscription "in solver-free workers" — and it is
+**implemented and works**: `run_batch` pins the env before the spawn pool exists, so each worker's
+fresh NumPy inherits it. There was no drift. **There was a gap**: nothing ever asked for *parent-side
+geometry determinism*, because worker oversubscription (performance) and geometry reproducibility
+(correctness) are **two requirements that happen to share one mechanism**, and treating them as one
+is what let the second go unstated for ten milestones. *I pattern-matched a rule onto a case it does
+not cover, in the session where that rule had just paid off three times* — which is this repo's own
+recorded failure mode about confident prose, committed while recording it. **Corollary: a rule that
+has just paid off three times is exactly the rule you will over-apply next.**
+
+Being two policies, they are implemented as two, and differ where the requirements differ:
+`_limit_thread_env` **defaults** (a resource hint yields to a user who exports 4) and is applied
+pre-spawn; `numerics.deterministic_blas` **forces** (a keyed artifact may not depend on the caller's
+environment) and is **scoped** to the L3 constructors (a library does not seize its caller's process,
+and could not fix this by mutating `os.environ` anyway — BLAS reads those at load time, so a
+`setdefault` after NumPy is imported changes nothing).
+
+**Building it moved two of the design's own premises**, both by measurement:
+
+- **The scope was wrong in the spec, in both directions.** The collab framing named *the basis* as the
+  sensitive artifact. But hold the basis fixed and `T₀` **still** moves (`8e587b6ad5` pinned vs
+  `9d334b3f31` ambient) — the covariance and Cholesky are BLAS in their own right, so scoping the
+  basis alone would have left half the defect in place. Conversely the **sampler needs no scope**:
+  hold the geometry and `T₀` fixed and the draws are bit-identical at 1 thread and 14, its inner loop
+  being chord arithmetic on short vectors. Three constructors, verified individually.
+- **The policy is free — it *pays*.** `build_geometry` is **1.170 s pinned vs 1.488 s at 14 threads
+  (0.79×, 21% faster)**; L3 total −0.317 s. A 260×46 Gram-Schmidt is far too small for 14 threads to
+  repay dispatch overhead. The nondeterminism bought nothing and cost 0.3 s.
+
+**And the R̂ bar it exposed was never a threading problem at all.** Pinning the threads made
+`test_the_chains_mix_and_the_diagnostics_say_so` fail (R̂ 1.1654 vs a 1.15 bar), which looked like the
+fix breaking a test. Measured across 8 seeds at the fixture's own 1500 draws, the truth is worse and
+simpler: **R̂ spans 1.089–1.177 and min ESS spans 10.2–50.7** — the bars sit *inside* the distribution
+of valid runs, 2 of 8 seeds fail, and the fixture's own seed 0 fails **both**. The thread count was
+never the cause; it was one way to toss a coin that seeds toss just as well. This is M9's *a bar a
+valid input clears only 2 times in 3 is not a tolerance, it is a coin flip*, for the third time.
+R̂ → 1 as the chain grows is a theorem, so the **schedule** is the honest lever, not the bar: at 4000
+draws R̂ is 1.033–1.059 and min ESS 59.7–155.0 across 5 seeds — the same bars, now with 2.5× and 3×
+margin, catching a regression that breaks mixing instead of sampling the noise.
 
 ### 1.7 λ is scale-referenced: `λ = λ̃ · λ*`  *(M3 finding; decision SETTLED)*
 

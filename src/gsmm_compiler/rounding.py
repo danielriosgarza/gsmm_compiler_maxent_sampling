@@ -85,6 +85,7 @@ from gsmm_compiler.config import GeometryConfig
 from gsmm_compiler.flux_polytope import ReducedPolytope
 from gsmm_compiler.line_geometry import feasible_chord
 from gsmm_compiler.native_csc import NativeCSC
+from gsmm_compiler.numerics import under_deterministic_blas
 from gsmm_compiler.provenance import content_key
 
 _ArrayT = TypeVar("_ArrayT", bound=np.ndarray[Any, Any])
@@ -523,6 +524,7 @@ class RoundedTransform:
         return rebuilt
 
 
+@under_deterministic_blas
 def build_transform(
     geometry: ReducedGeometry,
     reduced: ReducedPolytope,
@@ -534,6 +536,12 @@ def build_transform(
     Every check here is one the sampler would otherwise discover the hard way, thousands of steps
     in: a zero column it can never move along, a chord at the centre excluding ``t = 0``, a ``T``
     whose columns have drifted off the mass-balance manifold.
+
+    The decorator is **separately** load-bearing from `build_geometry`'s, and that was measured
+    rather than assumed (M10.2e): hold the basis fixed and ``T₀`` *still* moves with the ambient
+    thread count (``8e587b6ad5`` pinned vs ``9d334b3f31`` ambient). The covariance and the Cholesky
+    are BLAS in their own right, so a policy scoped to the basis alone would have left half the
+    nondeterminism in place.
     """
     config = config or GeometryConfig()
 
@@ -565,6 +573,7 @@ def build_transform(
     )
 
 
+@under_deterministic_blas
 def reround_transform(
     geometry: ReducedGeometry,
     reduced: ReducedPolytope,

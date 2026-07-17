@@ -1378,3 +1378,63 @@ thread count into the L3 key, (D) make the basis construction thread-invariant.
 **The lesson:** *two requirements that share a mechanism are still two requirements* — and the one
 nobody wrote down is the one that goes unmet. Corollary, learned the hard way here: **a rule that has
 just paid off three times is exactly the rule you will over-apply next.**
+
+### M10.2e — what the *build* then found (recorded because it moved the agreed design)
+
+The design above was adopted. Building it under measurement changed two of its own premises, which is
+worth recording separately: **an agreed design is still a claim with a premise.**
+
+1. 🔴 **The agreed scope was wrong in both directions.** Round 1 framed the basis as the
+   BLAS-sensitive artifact (its measurements only ever varied the basis). Measured with the basis
+   **held fixed**, `build_transform` moves on its own — `8e587b6ad5` pinned vs `9d334b3f31` ambient —
+   because the covariance and Cholesky are BLAS in their own right. A policy scoped to the basis
+   would have passed its own tests and left half the defect live. Conversely the **sampler needs no
+   scope**: with geometry and `T₀` frozen, 2 chains × 200 draws are bit-identical at 1 and 14 threads
+   (`2b13baec26`). Final scope: three constructors, each verified, and the chains inherit determinism
+   from their inputs.
+2. **A runtime limit reproduces an env-pin bit-for-bit** (`55d39f6b87` both ways), which is what made
+   option B real rather than theoretical — and option A impossible: BLAS reads `*_NUM_THREADS` when
+   it loads, so a `setdefault` after NumPy is imported changes nothing at all.
+3. **The fix is free — it pays.** `build_geometry` is **21% faster** pinned (1.170 s vs 1.488 s at 14
+   threads). The nondeterminism bought nothing; a 260×46 Gram-Schmidt cannot repay 14 threads'
+   dispatch overhead. Nobody had priced it, including me — I had it filed as an acceptable cost.
+4. 🔴 **The R̂ test the fix "broke" was never a threading problem**, and the round-1 spec inherited my
+   wrong framing of it. Across 8 seeds at 1500 draws, R̂ spans **1.089–1.177** against a 1.15 bar and
+   min ESS **10.2–50.7** against 20 — the bars are inside the distribution of *valid* runs, and the
+   thread count was one way to toss a coin that seeds toss just as well. Fixed by the **schedule**
+   (4000 draws: R̂ 1.033–1.059, ESS 59.7–155.0), not by the bar.
+
+**The build's own lesson, and it is the round-3 pattern from M10.2b without a round 3 to catch it:**
+two of my own edits reproduced this package's signature bugs and were caught only by writing down
+*why* they were correct. The runtime profile read outside its own scope would have warned on **every**
+cache hit (a manifest describing a build that did not happen — M10.2b's defect); and the poisoned-cache
+regression test, once my identity gate ran ahead of the certificate gate, would have passed while
+proving nothing — it would have survived deleting `require_certified_transform` from the hit path,
+the single thing it exists to catch. **A new gate placed in front of an old one can defang the test
+that guards the old one, silently.**
+
+### M10.2e round 2 — ⚠️ ABORTED, and the abort is worth recording
+
+A round-2 review of the **built** diff was attempted (`.collab/specs/m102e-round2.md`) on the M10.2a/
+M10.2b precedent that rounds 3–4 each found a defect inside the repair. **It did not produce a
+verdict, and its findings must not be read as one.** Two environment failures, both instructive:
+
+1. **Codex's bubblewrap sandbox could not create user namespaces on this machine**, so its local file
+   reads failed and it **fell back to fetching the repo from GitHub — at commit `07a8a4f` (M10.2a)**.
+   It was reviewing code three milestones stale.
+2. **`numerics.py` is a new, untracked file, so it appears in no `git diff`** — the single most
+   important file in the milestone was invisible to a diff-based review by construction.
+
+*A reviewer reading the wrong code returns confident findings about code that does not exist* — which
+is this repo's own failure mode wearing a reviewer's hat. **If round 2 is re-run, inline the code in
+the prompt rather than pointing at the tree.**
+
+**Its one substantive lead was taken, and it converged with my own probe** — that the scopes cover
+`T₀`/`T₁` *construction* but not the **keyed chains that consume them** (`to_fluxes` produces pilot
+and production sample bytes), and that `certify_reachable_mass_balance` runs *after* the decorator
+exits while its numbers are stored in the L3 meta. Both are the right places to look; both are
+measured **invariant** (fluxes `e1ee88278c` at 1 and 14 threads; the certificate bit-identical across
+4 calls *and* across thread counts, its work being 334 already-pinned HiGHS LPs). The tests now pin
+both, because the original only hashed `coordinates` — **it was defending a claim broader than the one
+it checked.** Writing that test surfaced the manifest/timing precision now in §1.1: `to_cache()`
+carries `elapsed_seconds`, so the *bundle's bytes* are never reproducible and were never the claim.

@@ -325,7 +325,16 @@ class TestNoTransformIsSampledUncertified:
         This is what two CLI commands could do before M10.2: put a bundle in the store whose
         certificate does not hold, and let the reader trust the key. The reader now re-derives the
         verdict on **every** path, so the hit is refused exactly like the miss would have been.
+
+        **The bundle carries a valid `numerical_identity` (M10.2e), and that is load-bearing to
+        this test rather than incidental.** M10.2e added an identity gate that runs *before* the
+        certificate is read, and a bundle missing that block is refused for a reason that has
+        nothing to do with the poisoning. Left that way, this test would pass while proving
+        nothing — it would go on passing if `require_certified_transform` were deleted from the hit
+        path, which is the single thing it exists to catch. So the poisoned certificate is made the
+        **only** thing wrong with this bundle.
         """
+        from gsmm_compiler.batch import _numerical_identity
         from gsmm_compiler.config import Config
 
         config = Config()
@@ -352,6 +361,14 @@ class TestNoTransformIsSampledUncertified:
                 "transform": transform_meta,
                 "geometry_manifest": simplex_geometry.manifest(),
                 "reachability_certificate": poisoned.to_cache(),
+                # Valid, so the certificate is the only lie in this bundle — see the docstring.
+                "numerical_identity": _numerical_identity(
+                    simplex_polytope,
+                    config,
+                    model_id="simplex",
+                    geometry=simplex_geometry,
+                    transform=transform,
+                ),
             },
         )
 

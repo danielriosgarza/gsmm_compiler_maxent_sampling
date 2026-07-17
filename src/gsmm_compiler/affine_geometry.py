@@ -151,6 +151,7 @@ from gsmm_compiler.highs_backend import (
     LPSolution,
 )
 from gsmm_compiler.native_csc import VALUE_DTYPE
+from gsmm_compiler.numerics import under_deterministic_blas
 from gsmm_compiler.provenance import content_key, stream_seed
 from gsmm_compiler.sparse_objective import build_flux_lp
 
@@ -1340,6 +1341,7 @@ class ReducedGeometry:
 # ---- discovery (spec §15.3, §15.6) --------------------------------------------------------------
 
 
+@under_deterministic_blas
 def build_geometry(
     reduced: ReducedPolytope,
     *,
@@ -1352,6 +1354,11 @@ def build_geometry(
     sweep that *fails* hands discovery back the direction it was missing. Every failure raises the
     dimension by one, so the loop runs at most ``n_free`` times — and it can only exit through a
     clean sweep.
+
+    The decorator is load-bearing (M10.2e): the re-orthogonalization below is a BLAS matmul, and
+    multi-threaded OpenBLAS reduces in a different order — so the *ambient thread count* used to
+    pick between two valid bases under one L3 key, and the pilot amplified the 2.7e-15 between them
+    to O(1). See `numerics` for the measurements.
     """
     cfg = config if config is not None else GeometryConfig()
     memory_limit_bytes = int(cfg.max_geometry_memory_gb * 2**30)

@@ -48,8 +48,27 @@ def transform(geometry, reduced: ReducedPolytope):  # type: ignore[no-untyped-de
 
 @pytest.fixture(scope="module")
 def samples(transform, reduced: ReducedPolytope):  # type: ignore[no-untyped-def]
+    """4000 draws, not 1500, and the difference is a measurement rather than a preference.
+
+    M5 recorded that this model mixes slowly. At 1500 draws it mixes *so* slowly that the
+    diagnostics land on both sides of their own bars: across 8 seeds R̂ spans **1.089 – 1.177**
+    against a 1.15 bar and min ESS spans **10.2 – 50.7** against a 20 bar, so two of eight seeds
+    failed — including seed 0, this fixture's own, on **both** assertions. That is not a flaky
+    test, it is a bar inside the distribution of the thing it judges: M9's *a bar a valid input
+    clears only 2 times in 3 is not a tolerance, it is a coin flip*, for the third time in this
+    package.
+
+    It surfaced as a threading bug (M10.2e — the ambient BLAS thread count picked the basis, and
+    R̂ with it), and that framing was wrong: the thread count was one way to toss the coin, and
+    **seeds toss it just as well**. Pinning the threads only fixes which way it lands.
+
+    R̂ → 1 as the chain grows is a theorem, so the schedule is the honest lever. Measured across 5
+    seeds at 4000 draws: R̂ **1.033 – 1.059** (2.5× margin on the bar's excess) and min ESS
+    **59.7 – 155.0** (3×). The bars now catch a regression that breaks mixing instead of sampling
+    the noise. Costs 19.5 s against 7.4 s, once, for the whole module.
+    """
     config = SamplerConfig(
-        n_chains=4, n_samples=1500, burn_in=1500, thin=1, refresh_interval=250
+        n_chains=4, n_samples=4000, burn_in=4000, thin=1, refresh_interval=250
     )
     return run_chains(transform, reduced, config=config, model_id="bifido", beta=0.0)
 
@@ -141,7 +160,10 @@ class TestEverySampleIsAFeasibleFlux:
     def test_the_reduced_samples_are_feasible(self, samples, reduced) -> None:
         report = feasibility_report(samples.fluxes, reduced)
 
-        assert report.n_samples == 4 * 1500
+        # Counted from the chains, not typed as a literal. This read `4 * 1500` — a copy of the
+        # fixture's schedule that broke the moment M10.2e changed it, while what the assertion is
+        # actually for is that the report judged **every** draw rather than a subset of them.
+        assert report.n_samples == sum(chain.coordinates.shape[0] for chain in samples.chains)
         assert report.is_feasible
         assert report.n_bound_violations == 0
         assert report.max_bound_violation == 0.0
@@ -248,7 +270,13 @@ class TestTransformInvarianceOfMoments:
 class TestConvergence:
     def test_the_chains_mix_and_the_diagnostics_say_so(self, samples) -> None:
         """Not a correctness claim — a *reported* one. R̂ and ESS are how a user learns that this
-        model needs a long chain, and the honest number for it is recorded in DEVELOPMENT_STATUS."""
+        model needs a long chain, and the honest number for it is recorded in DEVELOPMENT_STATUS.
+
+        Both bars are judged at the `samples` fixture's schedule, which was chosen *so that* they
+        have margin — see its docstring. Measured across 5 seeds there: R̂ ≤ 1.059 against 1.15,
+        min ESS ≥ 59.7 against 20. What they now catch is a change that breaks mixing; what they
+        no longer do is fail for a seed.
+        """
         report = convergence_report(samples.coordinates)
 
         assert report.n_parameters == DIMENSION
