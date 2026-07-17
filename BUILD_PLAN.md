@@ -941,6 +941,142 @@ Deliberately **not chased in M10.2c** — one milestone at a time — but it out
 extensions, and `geometry.exhaustive_span_certificate=false` is a *workaround that disables the
 check*, not a fix.
 
+### 1.6.11 (M11) 🔴 The package runs on **4 of the 40 strains it exists for** — and §1.6.10 was the *smallest* of four failures
+
+**Every measured premise in this plan is a claim about one anaerobe.** `models/` holds one file.
+*Bifidobacterium adolescentis* is the **only anaerobe of the 40** curated strains in
+`metabolicSubcommunities/models/gapfilled/method_3_curated`; the other 39 are aerobes, and the first
+one measured has **479 free reactions to Bifido's 260**. d = 46, n_free = 260, 214 probes, the "12.5%
+of strains" of §1.6.10, the worker sweep, §1.2's "at d≤55 sequential wins by default" — all of it is
+one organism. The gate-fragility *pattern* was diagnosed with real precision (§1.6.8, §1.6.10) and its
+*incidence* was measured on a sample of one.
+
+Swept `build-geometry` over all 40 with the default config — verified to be the intended input: the
+repo's example model is **byte-identical** to the curated one, and `ModelSpec` carries only
+path/biomass/id, so there is no medium to apply.
+
+| outcome | strains | recorded? |
+|---|---|---|
+| ✅ succeeds | **4** (10%) | — |
+| 🔴 `blocked/moving split is ambiguous` | **24** (60%) | **nowhere** |
+| 🔴 `kUnknown` on the `flux_only` LP | **9** (22.5%) | **nowhere** |
+| 🔴 span certificate not exhaustive | **2** (5%) | ranked **#1** (§1.6.10) |
+| 🔴 `kUnknown` on `reachable_mass_balance` | **1** (2.5%) | *Carried, not chased* |
+
+**The tracker's #1 was the smallest of four, and the two largest were unrecorded.**
+
+#### The mechanism, after three `/collab` rounds (13 points conceded, two of my remedies killed)
+
+> **Primal quality is history-sensitive under warm starts, while these dual constructions stay sound
+> independently of it — but their *tightness* varies, and must be judged by the resulting bound.**
+
+That is Codex's wording and it is narrower than mine. My "chaotic primal, *good duals*" is falsified
+by this milestone's own FVA data, which shows duals that are sound but **loose**. Measured
+(*B. pumilus*, n_free = 479): the FVA sweep dies at column 468 after **938 warm-started solves**,
+while the *identical* LP on a fresh instance returns `kOptimal` in 117 iterations. Measured
+(*E. gilvus*, n_free = 446), decomposing `dual_upper_bound` into raw + allowance, warm vs cold:
+
+| idx | WARM `U` | raw | COLD `U` | raw | warm/cold |
+|---|---|---|---|---|---|
+| 260 — the "narrowest **moving**" | 3.3811e-09 | **3.3358e-09** | **4.5297e-11** | **0.0** | **74.6×** |
+| 307 — genuinely moving | 5.1093e-01 | 5.1093e-01 | 5.1093e-01 | 5.1093e-01 | **1.000×** |
+
+**Two necessary causes, not one** (Codex, r2 — and this is why the fix is not "fix the solver"):
+
+1. **Warm reuse supplies a loose certificate.** Weak duality is sound for *any* multipliers, so a
+   stale-for-this-objective `π` gives a true but slack bound.
+2. **The classifier turns absence of a proof into proof of the opposite.** `dual_upper_bound`
+   *deliberately* promises soundness for arbitrary duals — so a loose certificate is an
+   **anticipated input**, not a solver violation. But `blocked_reactions` reads `U > blocked_tol` as
+   **"moving"**, when it licenses only *"not certified blocked by this dual."* Two states where three
+   exist. **A perfect solver would not fix this.**
+
+**The guard was right to refuse.** Cold, *L. lactis* finds **4 more** blocked reactions (126 → 130)
+and *Latilactobacillus* **8 more** (92 → 100): warm was about to admit noise directions into the
+basis — §1.4.1's recorded disaster, where a ~1e-15 basis row "divides into a chord limit of order
+0.03–0.5, squarely inside the legitimate chord". It failed closed and protected the distribution; it
+merely blamed the tolerance instead of the instrument.
+
+#### The paired census (Codex refused to let one model generalise, and was right)
+
+40 models, warm vs cold FVA, controls included:
+
+| warm → cold | count |
+|---|---|
+| AMBIGUOUS → **OK** | **22** |
+| `kUnknown` → **OK** | **9** |
+| OK → OK (controls) | 7 |
+| AMBIGUOUS → AMBIGUOUS | **2** |
+| **regressions (OK → not-OK)** | **0** |
+
+So: **the mechanism explains 22 of 24**, not "all". The residue is both *Hafnia alvei* strains — the
+two largest models, `n_blocked` **identical** warm and cold, `U ≈ 2e-9` against a 1e-9 bar. Cold
+cannot help them: they are **genuinely unresolved**, which is exactly what the third state is for.
+**And that is the acceptance criterion**: the disease was *a gate whose verdict depends on the RNG
+stream rather than on the input*; after the fix the only refusals are two strains of one species,
+**deterministically** — a property of the model, which is what a gate is supposed to test.
+
+#### The design (Codex's, adopted verbatim — mine was unsound)
+
+> **Use primal signals for primal witnesses, dual bounds for upper-bound claims, and achieved bound
+> tightness for acceptance.**
+
+- **`blocked_reactions` gets a third state**, because a sound loose bound cannot decide "moving".
+  `kUnknown` yields *no witness*, so the crash (9) and the misclassification (22) are **the same
+  case**: unresolved → escalate to one cold solve → if still unresolved, **report the resolution
+  rather than choose a class**. Not "retry until it passes": the acceptance criterion never moves,
+  and the retry is a *declared different computation* (the inherited basis is removed), bounded at
+  one. Fixed-period `clearSolver` is **rejected** — there is no justified `K`, and reaction 380 is
+  tight *after* loose predecessors, so this is path sensitivity, not age.
+- **Span gates on `resolution ≤ span_tol`**, replacing `n_inconclusive == 0`. See §1.6.10's open
+  question: the answer is **no**, an inconclusive probe is evidence of nothing about the span.
+  Measured — the two failing directions are **conclusive** when re-probed cold *and* when re-probed
+  after 30 unrelated solves, same basis and direction; and across 46 constructed truncations,
+  detection was 46/46 on **conclusive** probes with `n_inconclusive == 0` in every sweep. The two
+  signals are **disjoint by ~4.8e4×**. ⚠️ **Dropping the clause alone would be unsound**, and this
+  is Codex's best catch: `exhaustive` bounds the resolution **nowhere**, so `n_inconclusive` is all
+  that stands between a terrible dual vector's sound-but-enormous bound and a certificate calling
+  itself exhaustive. Measured: all 12 seeds — **including both that fail today** — have
+  `resolution` 2.6e-11…3.1e-11 against `span_tol` 1e-9, a 37× margin, and the failing seeds sit
+  *inside* the passing range. The resolution gate is **stronger** than today's rule and it closes
+  the marginal-truncation hole automatically: a missed direction wider than `span_tol` forces
+  `resolution > span_tol`. `SpanCertificate.resolution` is currently read by **no gate in `src/`** —
+  only by `tests/integration/test_m4_geometry.py:116`. The suite already asserts the bar the code
+  never enforced.
+- **Reachability gets a caller-specific dual-witness path.** `_reachable_extreme`'s docstring says
+  "Weak duality assumes nothing about the returned point: not optimality, not even feasibility", and
+  it obeys — reading **only** `row_duals` — then routes through a backend gate that raises before
+  `getSolution()`. **It refuses on the one output it never reads.** Measured: HiGHS reports
+  `primal_solution_status=INFEASIBLE` but `dual_solution_status=FEASIBLE`,
+  `max_dual_infeasibility=0.0`; the bound from those discarded duals is **1.2836396355893382e-12** vs
+  **1.2836396131404284e-12** optimal — 8 digits, and *larger* (the sound direction) — and the full
+  replay is **CERTIFIED at 3.677e-11, 27× inside the contract**, inside the band of the 15 passing
+  streams. ⚠️ **Do not loosen `HighsLinearProgram.solve()`**: `sparse_objective.critical_l1_penalty`
+  needs `LPNotOptimalError` to detect a genuinely unbounded `J*`. One caller earns an exemption its
+  own math proves. Premises get asserted *before* the solve (finite `Ω`; `row_lower ≤ 0 ≤ row_upper`,
+  so `y = 0 ∈ Y`); `kInfeasible`/`kUnbounded` contradict the constructed compact LP and stay hard
+  failures. **Refuted as causes, each by measurement**: normalization (`max|E_i|`=5.4e-14, normalized
+  nonzeros span 0.0209…1.0), unboundedness, cycling (30 iterations), the fresh `T⁺`, conditioning
+  (s6 fails at cond 5643 *and* 5849 while s5 at 6120 passes), and the tolerance — which is
+  **non-monotone**: 1 failure at 1e-9, **0 at 1e-8, 3 at 1e-10, 0 at 1e-12**. `simplex_scale_strategy=0`,
+  `presolve=off` and `solver=ipm` each clear it, and **reaching for any of them would be choosing the
+  option that gives the verdict, on n=1** — the thing this plan has rejected four times.
+
+#### Two process notes
+
+**A remedy is a hypothesis until measured — mine died twice.** (1) I proposed deriving `blocked_tol`
+from `dual_upper_bound`'s rounding allowance, on the claim that the 3.38e-9 *was* that allowance. It
+is **1.3%** allowance and 98.7% raw bound: the derived bar would sit at ~4.5e-11 and 3.38e-9 would
+**still** classify as moving. **The remedy would have failed outright.** (2) I proposed simply
+dropping `n_inconclusive`, which would have made the certificate **unsound**. Both were caught by
+review, not by me — and (1) died on a measurement I ran only because Codex refused the claim.
+
+**And the primal-lower-bound error is in this file already.** I argued reaction 260 "does not move"
+from a primal width of −2.9e-12. `blocked_reactions`' own comment says an LP that stopped short
+reports zero for a wide-open reaction; §1.4.2 records M9 walking into the same trap after M4 wrote
+the warning. All the measurement licensed was `0 ≤ W₂₆₀ ≤ 3.381e-9`. **Third instance, and this time
+against a warning printed ten lines above the code I was reading.**
+
 ### 1.7 λ is scale-referenced: `λ = λ̃ · λ*`  *(M3 finding; decision SETTLED)*
 
 `J(v) = μ(v) − λ·C(v)` compares a **biomass flux** with a **sum of hundreds of absolute fluxes**.
@@ -1030,6 +1166,8 @@ step that rescaled the pressure by an arbitrary median every iteration. Recorded
 | **M8** ✅ | Cache, restart, batch orchestration & production | 4-layer cache, per-chain markers + writer-claim locking, atomic rename + fsync, **batch runner over a models manifest**, one global process pool over `(model, β, chain)`, worker thread-limit env, per-model run dirs + **cross-model aggregation**, manifests + diagnostics + `COMPLETE` | kill-and-resume resumes only missing `(model,chain)` units; partial batch yields valid cross-model tables; concurrent-writer safe; corrupted-artifact rejected; same-env deterministic traces; full batch runs on ≥2 strains with documented resources. **PASSED 2026-07-16** (content-addressed cache store with atomic-mkdir writer claim; `spawn` pool workers import no solver; serial==pool byte-identical; L0 key made content-addressed) |
 | **M9** | Performance & GSMM hardening | `benchmark.py` (new module) + `maxent benchmark` CLI → [benchmarks/M9_REPORT.md](benchmarks/M9_REPORT.md); worker-count sweep {1,2,4,7,14} by **ESS(J)/wall-sec**; allocation + sort profiling; `reduced` storage-mode validation; **the reachable-state mass-balance certificate (§1.4.2)** — scope added mid-milestone when the benchmark's own worker sweep could not run | benchmark report produced; all performance assertions hold (no per-step HiGHS, no scipy, no Python loop in chord, no element-wise highspy extraction, no full reconstruction every step) |
 | **M10** | Deferred extensions | **(1) pilot rerounding + pilot-based `s_J` — DONE**, as one DAG (bootstrap `T₀` → geometry pilot → `T₁` → scale pilot → `σ̂₀`), `energy_scale="pilot_sd"` additive beside `warmup_range` (§1.6.6). **(2a) wire the DAG into `batch`/CLI — DONE**; the recorded "fork §1.1 does not settle" was plain/code drift (§1.6.7). **(2b) key the pilots into the cache — DONE** (§1.6.6b, §1.6.7): the pilots are the DAG's only expensive node (19.3 s vs geometry's 1.17 s). **(2c) overlap `prepare_model` with sampling across models — DONE** (§1.6.9): §1.2 did mandate it *and* the arithmetic backed it, but only at a real ladder — at the `betas=(0.0,)` default the same overlap is worth ~5%, and the default is what a reader would have measured. A one-model lookahead (submit `i` → prepare `i+1` → drain `i`); measured A/B at M=3 **131.6 s → 93.1 s (1.41×**, 96% of the 1.47× achievable at that M; asymptote 1.93×). The recorded "two-phase pool dispatch" was indeed the **weaker** remedy — but for an unstated reason: once prepare overlaps sampling the pilots are *free*, so pooling them adds **0.7%**. **(2d) L0 cached — DONE** (M10.2d): warm `prepare_model` 1.21 s → 0.645 s, and a warm run never imports cobra. Then: β→performance calibration (spec §22.3, now cheap — `q(β)` and `r_eff(κ)` are already computed); parallel tempering; slice line kernel; downstream mode-feature extraction | each behind its own tests; none alters the validated v1 target distribution. **(1) PASSED 2026-07-16** (37 new tests; `/collab` 4 rounds AGREE; ladder closes 75.8% of the gap at β=16 vs 13% before, cond(C_q) 2.57× better — *see §1.6.6b: the 2.87× recorded here was pre-M10.2a and stale*). **(2b) PASSED 2026-07-17** (18 new tests; `/collab` 3 rounds — round 1 refuted my payload design, round 3 found a hit/miss asymmetry **inside my own repair**; `prepare_model` 22.9 s → 1.2 s warm, `T₁`/`s_J` bit-identical). **(2c) PASSED 2026-07-17** (4 new tests, both overlap tests proved non-vacuous against the serial order; 1.41× at M=3, draws bit-identical to the un-overlapped path). 🔴 **(2c) also measured a live defect it did not cause: the span certificate refuses 12.5% of valid strains (2 of 16 `model_id`s) — see §1.6.10** |
+
+| **M11** | 🔴 **v1 on the real batch** — the 40 curated strains the package exists for (§1.6.11) | **(0) the L3 lookup key names its solver — DONE** (M11.0): `highs_backend.solver_identity` (`BACKEND_IMPL_VERSION` + the installed HiGHS version, read from `importlib.metadata` so the key never imports the solver) folded into `batch.geometry_cache_key`. **Forced first**: every remaining item changes solve bytes, and without this a bumped backend was a *hit* that then died on the content key (§1.1 wants a miss), while the HiGHS version was in **neither** identity — a `uv sync` silently reused another solver's geometry. Then: **(1)** `blocked_reactions`' third state + one bounded cold escalation (22 + 9 strains); **(2)** span gates on `resolution ≤ span_tol` (2 strains, and the ~12% seed lottery); **(3)** reachability's caller-specific dual-witness path (1 strain); **(4)** re-run the 40-strain census; **(5)** release: LICENSE, README/docs, a manifest that reads the real `strains.tsv` | `build-geometry` succeeds on the curated 40, or refuses for a reason that is a property of the **model** rather than of the RNG stream — the disease being a gate whose verdict the seed decides. Every remedy names the measurement that confirms its premise *first*. **(0) PASSED 2026-07-17** (962 tests, +4; the two key tests fail on the shipped code with an identical digest, and the subprocess isolation test is proved non-vacuous by sabotage). ⚠️ **The census measures `blocked_reactions` only** — rounding, the pilot DAG and the sampler have **never run on an aerobe**, and §1.2's "at d≤55 sequential wins" is a claim about the one anaerobe |
 
 ### 2.1 What M6 ships, and what it does not  *(M6 finding; SETTLED — and it constrains M10)*
 

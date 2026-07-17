@@ -43,11 +43,45 @@ from gsmm_compiler.native_csc import INDEX_DTYPE, VALUE_DTYPE, NativeCSC
 if TYPE_CHECKING:  # pragma: no cover - typing only
     pass
 
-BACKEND_IMPL_VERSION: Final = 1
-"""Bumped when a change here can alter the bytes of a solve. Feeds the L2/L3 cache keys (§1.1)."""
+BACKEND_IMPL_VERSION: Final = 2
+"""Bumped when a change here can alter the bytes of a solve. Feeds the L2/L3 cache keys (§1.1).
+
+2 (M11.0): the sentence above was **false for the pre-build lookup key** from v1 until now, which is
+why `solver_identity` exists. This bump is also the first live exercise of that fix: it must reach
+warm L3 caches as a *miss*, and before M11.0 it would have reached them as a hit whose bundle then
+failed its content-key check — an error where §1.1 requires a rebuild.
+"""
 
 DEFAULT_PRIMAL_FEASIBILITY_TOL: Final = 1e-9
 """What we *demand* of a returned solution. HiGHS's tolerance is set to match (see `_OPTIONS`)."""
+
+
+def solver_identity() -> dict[str, Any]:
+    """Everything about the solver that can move a solve's bytes, knowable **before** the solve.
+
+    This exists because of the asymmetry between the two keys an artifact has. `content_key` is
+    computed *from* a built artifact, so it can hash the artifact's own bytes; the **lookup** key
+    must decide whether to build at all, so it may only hash *inputs* — §1.1: "hashing the artifact
+    to decide whether to build the artifact is circular." `ReducedGeometry.content_key` therefore
+    folded in `BACKEND_IMPL_VERSION` while `batch.geometry_cache_key` did not, and the constant's
+    own docstring claimed both.
+
+    **The HiGHS version is the half that was silent.** `BACKEND_IMPL_VERSION` is ours and a
+    reviewer can bump it; the solver's version is not, and nothing bumps on a ``uv sync``. It was
+    absent from the content key *and* the lookup key, so upgrading highspy served a cache warmed by
+    the previous solver under an unchanged name. The geometry's support points are LP outputs — a
+    different HiGHS can move them.
+
+    Read via `importlib.metadata`, never ``highspy.__version__``: a warm run must be able to key the
+    cache **without importing the solver**, which is the same property M10.2d bought for cobra at
+    L0, and which `HighsLinearProgram`'s constructor-scoped import exists to protect.
+    """
+    from gsmm_compiler.provenance import _installed_version
+
+    return {
+        "backend_impl_version": BACKEND_IMPL_VERSION,
+        "highs_version": _installed_version("highspy"),
+    }
 
 
 class HighsBackendError(RuntimeError):

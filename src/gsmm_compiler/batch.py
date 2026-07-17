@@ -38,6 +38,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from gsmm_compiler import highs_backend
 from gsmm_compiler.affine_geometry import (
     GEOMETRY_IMPL_VERSION,
     ReducedGeometry,
@@ -425,6 +426,17 @@ def geometry_cache_key(reduced: ReducedPolytope, config: Config, *, model_id: st
     byte equality across **machines** — OpenBLAS selects kernels by runtime CPU detection — so the
     honest reading of this key is "the same inputs under the same numerical-runtime profile",
     recorded beside the artifact by `numerical_runtime_profile`.
+
+    ``solver_identity`` is folded in for the same reason as ``determinism_policy_version``, and it
+    was missing for the same ten milestones (M11.0). Every support point in L3 is an LP output, so
+    the solver is as much an input to these bytes as NumPy is — yet this key named NumPy and not
+    HiGHS. `highs_backend.BACKEND_IMPL_VERSION`'s docstring said it fed "the L2/L3 cache keys"; it
+    fed `ReducedGeometry.content_key`, which is computed *after* the build and so cannot decide
+    whether to build. The two failures are asymmetric and only one is silent: a bumped
+    `BACKEND_IMPL_VERSION` was found here as a **hit** and then died on the content-key check
+    (§1.1 requires a miss, never an error on stale bytes — `GEOMETRY_IMPL_VERSION`'s own docstring
+    records that mechanism for its bump and it applies verbatim here), while the **HiGHS version
+    was in neither identity**, so a `uv sync` silently reused another solver's geometry.
     """
     return content_key(
         layer=GEOMETRY_CACHE_LAYER,
@@ -436,6 +448,7 @@ def geometry_cache_key(reduced: ReducedPolytope, config: Config, *, model_id: st
         rounding_impl_version=ROUNDING_IMPL_VERSION,
         determinism_policy_version=DETERMINISM_POLICY_VERSION,
         numpy_version=np.__version__,
+        solver=highs_backend.solver_identity(),
     )
 
 
