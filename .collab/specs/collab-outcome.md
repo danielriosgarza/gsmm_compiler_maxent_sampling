@@ -1276,3 +1276,59 @@ reveals the next one.* Don't trust the claim → check the evidence. Don't trust
 it. Don't trust the validation → own the bar it is judged against. Four rounds, each finding the hole
 behind the previous repair — which is exactly what M2 recorded ("the first fix for a numerical bug is
 often itself buggy") generalized from arithmetic to authority.
+
+---
+
+## M10.2b — pilot caching (3 rounds, converged after Codex refuted my design and my repair)
+
+**Round 1 killed my position outright, and it was the good kind of kill.** I opposed the recorded
+payload split (geometry pilot → coordinates, scale pilot → fluxes) because it destroys both tests
+that "prove the pilots are independent streams". Codex:
+
+1. **`not np.allclose(a, b)` proves NON-IDENTITY, not independence.** The tests' names overclaimed
+   what they checked.
+2. **The property they name is not even true.** `T₁` is *derived from* the geometry pilot and the
+   scale pilot runs under `T₁`, so the two pilots are **causally dependent**. What is independent is
+   each pilot's **RNG stream given its inputs**.
+3. The direct evidence is the **spawn key**, which `run_chain` already records and `NeutralPilot`
+   **discarded wholesale** — so BUILD_PLAN §1.2's "…and store the spawn keys" was unmet.
+
+I conceded all four contested points. **Settled:** stage-specific artifact types (`GeometryPilot` /
+`ScalePilot`), `STAGE` as a `ClassVar`, separate builders with **no `stage` parameter**, public
+`run_neutral_pilot` retired, spawn keys stored as a **cache-hashed array** and **recomputed** on every
+construction.
+
+**Round 2: Codex refused its own round-1 proposal.** It had suggested storing a SHA-256 flux
+fingerprint; it then argued against it — for `GeometryPilot` the source fluxes are *deliberately
+discarded*, so the digest would be an **unrederivable assertion in trusted metadata**, and comparing
+two digests re-runs the very proxy round 1 rejected. **Evidence you recompute is evidence; evidence
+you store and read back is a claim.** Also settled: the gate goes **before** the cache dispatch (not
+in `compute()`, which runs only on a miss); no certificate inside the pilot artifact (it certifies the
+`(polytope, transform, policy)` edge, not the pilot); and the `feasibility_tol` fix is **in scope**,
+because M10.2b creates the cache identity that would otherwise preserve the inconsistency
+indefinitely.
+
+**Round 3 — review the BUILT diff — found the hole inside the repair.** Opened DISAGREE. Hoisting the
+*certificate* gate out of `compute()` left the **polytope relation** in `_run_pilot_chains`, on the
+miss path only. My own probe for this passed, because an *honest* wrong polytope changes the keys and
+is caught three other ways. Codex's attack: `dataclasses.replace(transform, polytope_key=<a lie>)` —
+`RoundedTransform.content_key` hashes `geometry_key`/`transform`/`center`/`ridge` and **not the
+transform's own `polytope_key`** — so the lie keys identically and a **hit serves what a miss
+refuses**. Executed and confirmed. Fixed via `require_pilot_inputs`, the one place both paths ask.
+Three overclaims of mine also refused and narrowed: the spawn-key guard proves the four *semantic
+coordinates* only (`seed` lives in the `SeedSequence` **entropy**, absent from `spawn_key`);
+`_frozen` was **not** the only array constructor (plain dataclass construction produced a mutable
+pilot, so freezing was a convention, not a class invariant); and the `IMPL_VERSION = 3` rationale was
+**wrong** (a named `feasibility_tol` component already separates v2 from v3 keys, and no v2 pilot was
+ever stored) — kept as bookkeeping with an honest reason.
+
+**The lesson:** *hoisting one of two checks is how a fix closes an asymmetry while claiming to have
+closed the asymmetry.* A precondition a cache lookup can skip is not a precondition — and two call
+sites checking **different subsets** is how one of them ends up checking none. Sibling to M10.2a's
+"a guard is only as total as its weakest entrance", now applied to the guard's own repair.
+
+**And a second, unrelated lesson from the same milestone:** *a recorded **measurement** is a claim
+with a premise, and it expires silently when the premise moves.* §1.6.6 recorded `cond(C_q)` 5.36e3
+(2.87×); the shipped code gives 5.97e3 (2.57×) and has since M10.2a removed the pilots' start hint —
+whose own version-bump note **says** it changes every draw. The bell was rung and not heard. See
+BUILD_PLAN §1.6.6b.

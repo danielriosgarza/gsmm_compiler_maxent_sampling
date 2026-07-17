@@ -259,6 +259,10 @@ def prepare_model(
         # In T₀'s frame; `calibrate` returns it in the final transform's frame. Production only —
         # it never reaches a pilot (`calibration.NeutralPilot`).
         optimum_coordinates=bootstrap.to_coordinates(reduced.to_reduced(solution.optimum.v_full)),
+        # The same store the geometry came from. The pilots are the expensive node in the DAG —
+        # 19.3 s measured against geometry's 1.17 s — so a `--cache-dir` run that cached the cheap
+        # stage and recomputed the expensive one was 16.4× upside-down (§1.6.7, M10.2b).
+        cache=cache,
     )
     transform = calibration.transform
     scale = calibration.energy_scale

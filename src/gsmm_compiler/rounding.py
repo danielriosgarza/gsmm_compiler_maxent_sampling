@@ -578,7 +578,11 @@ def reround_transform(
     `build_transform` estimates ``C_q`` from M4's **support-LP vertices**, which are extreme points:
     they describe the polytope's *outline*, not the uniform measure living inside it. Spec §17.4
     says to re-round from a pilot chain instead, and it is worth having — measured on the example
-    model, ``cond(C_q)`` falls 1.54e4 → 5.11e3 and ESS rises ~2.5×.
+    model, ``cond(C_q)`` falls **1.54e4 → 5.97e3 (2.57×)** and `step_scale_ratio` rises 0.0081 →
+    0.0129, the M5 lever that raises ESS ~2.5×. *(The cond figure is M10.2b's; the 5.11e3 recorded
+    here before was pre-M10.2a, which removed the pilots' start hint and so changed every pilot's
+    draws — see `calibration`'s module docstring. The ESS multiple is M5's own measurement of the
+    same lever and is not re-measured here.)*
 
     **This cannot move the target, and that is a theorem.** ``L`` is ``d×d`` and invertible, so
     ``range(T₁) = range(diag(s)·B·L₁) = range(diag(s)·B) = range(T₀)`` *exactly*, and

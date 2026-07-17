@@ -39,9 +39,9 @@ from gsmm_compiler.batch import (
 )
 from gsmm_compiler.cache import ArtifactCache
 from gsmm_compiler.calibration import (
-    GEOMETRY_PILOT_STAGE,
-    NeutralPilot,
-    run_neutral_pilot,
+    GeometryPilot,
+    run_geometry_pilot,
+    run_scale_pilot,
 )
 from gsmm_compiler.config import SamplerConfig
 from gsmm_compiler.flux_polytope import ReducedPolytope
@@ -77,10 +77,10 @@ def simplex_certificate(simplex_transform, simplex_polytope: ReducedPolytope):  
 @pytest.fixture(scope="module")
 def simplex_pilot(  # type: ignore[no-untyped-def]
     simplex_transform, simplex_polytope: ReducedPolytope, simplex_certificate
-) -> NeutralPilot:
-    return run_neutral_pilot(
+) -> GeometryPilot:
+    return run_geometry_pilot(
         simplex_transform, simplex_polytope, config=PILOT, model_id="simplex",
-        stage=GEOMETRY_PILOT_STAGE, certificate=simplex_certificate,
+        certificate=simplex_certificate,
     )
 
 
@@ -109,10 +109,13 @@ class TestTheNeutralPilotIsAFunctionOfItsKey:
         thing a caller cannot get wrong. Same guard shape M7 uses to keep reweighting out of the
         sampler and M10.1 uses to keep `calibration` out of `maxent_sampler`.
         """
-        parameters = inspect.signature(run_neutral_pilot).parameters
-        assert "optimum_coordinates" not in parameters
-        assert "objective" not in parameters
-        assert "optimum" not in parameters
+        for builder in (run_geometry_pilot, run_scale_pilot):
+            parameters = inspect.signature(builder).parameters
+            assert "optimum_coordinates" not in parameters
+            assert "objective" not in parameters
+            assert "optimum" not in parameters
+            # M10.2b: nor a `stage`, which is what let a class and its key disagree.
+            assert "stage" not in parameters
 
     def test_the_key_separates_pilots_that_draw_different_numbers(
         self, simplex_transform, simplex_polytope: ReducedPolytope,  # type: ignore[no-untyped-def]
@@ -124,20 +127,27 @@ class TestTheNeutralPilotIsAFunctionOfItsKey:
         the float64 refresh phase, which M5 settled is part of this chain's state. Both change the
         bytes; neither was in the key.
         """
-        base = run_neutral_pilot(
+        base = run_geometry_pilot(
             simplex_transform, simplex_polytope, config=PILOT, model_id="simplex",
-            stage=GEOMETRY_PILOT_STAGE, certificate=simplex_certificate,
+            certificate=simplex_certificate,
         )
         for field, value in (("seed", PILOT.seed + 1), ("refresh_interval", 7)):
-            moved = run_neutral_pilot(
+            moved = run_geometry_pilot(
                 simplex_transform, simplex_polytope,
                 config=dataclasses.replace(PILOT, **{field: value}),
-                model_id="simplex", stage=GEOMETRY_PILOT_STAGE,
+                model_id="simplex",
                 certificate=simplex_certificate,
             )
-            assert moved.content_key() != base.content_key(), (
+            assert moved.recipe.content_key() != base.recipe.content_key(), (
                 f"moving {field} changed the draws but not the key — a false cache hit"
             )
+        # M10.2b: the tolerance reaches start selection, chord construction and refresh validation,
+        # so it moves the draws. It was not a parameter at all until this milestone.
+        retoleranced = run_geometry_pilot(
+            simplex_transform, simplex_polytope, config=PILOT, model_id="simplex",
+            certificate=simplex_certificate, feasibility_tol=1e-7,
+        )
+        assert retoleranced.recipe.content_key() != base.recipe.content_key()
 
     def test_the_premise_that_moving_those_fields_moves_the_draws(
         self, simplex_transform, simplex_polytope: ReducedPolytope,  # type: ignore[no-untyped-def]
@@ -150,19 +160,19 @@ class TestTheNeutralPilotIsAFunctionOfItsKey:
         regression test that could not fail on its own bug before (M6's `s_J` floor). So: prove the
         premise.
         """
-        base = run_neutral_pilot(
+        base = run_geometry_pilot(
             simplex_transform, simplex_polytope, config=PILOT, model_id="simplex",
-            stage=GEOMETRY_PILOT_STAGE, certificate=simplex_certificate,
+            certificate=simplex_certificate,
         )
-        reseeded = run_neutral_pilot(
+        reseeded = run_geometry_pilot(
             simplex_transform, simplex_polytope,
             config=dataclasses.replace(PILOT, seed=PILOT.seed + 1),
-            model_id="simplex", stage=GEOMETRY_PILOT_STAGE,
+            model_id="simplex",
             certificate=simplex_certificate,
         )
         assert not np.array_equal(base.coordinates, reseeded.coordinates)
 
-    def test_the_pilot_carries_no_objective_key(self, simplex_pilot: NeutralPilot) -> None:
+    def test_the_pilot_carries_no_objective_key(self, simplex_pilot: GeometryPilot) -> None:
         """The independence is the *point*, once it is true.
 
         M7 puts a base and a reweighted objective on one polytope; they must be calibrated against
@@ -428,7 +438,7 @@ class TestNoTransformIsSampledUncertified:
     def test_a_pilot_cannot_be_run_on_an_uncertified_transform(
         self, simplex_transform, simplex_polytope: ReducedPolytope, simplex_certificate  # type: ignore[no-untyped-def]
     ) -> None:
-        """Gating `calibrate` alone left `run_neutral_pilot` — public, and the same chain — open.
+        """Gating `calibrate` alone left the public pilot builder — the same chain — open.
 
         A caller could step past the guard without fabricating anything (Codex, round 4). A pilot is
         not a lesser chain: every artifact the DAG freezes descends from its draws, so it takes the
@@ -437,11 +447,12 @@ class TestNoTransformIsSampledUncertified:
         failed = dataclasses.replace(
             simplex_certificate, worst_absolute=simplex_certificate.contract * 1.001
         )
-        with pytest.raises(RoundingError, match="must not be sampled"):
-            run_neutral_pilot(
-                simplex_transform, simplex_polytope, config=PILOT, model_id="simplex",
-                stage=GEOMETRY_PILOT_STAGE, certificate=failed,
-            )
+        for builder in (run_geometry_pilot, run_scale_pilot):
+            with pytest.raises(RoundingError, match="must not be sampled"):
+                builder(
+                    simplex_transform, simplex_polytope, config=PILOT, model_id="simplex",
+                    certificate=failed,
+                )
 
     def test_a_certificate_cannot_relax_its_own_bar(
         self, simplex_geometry: ReducedGeometry, simplex_polytope: ReducedPolytope

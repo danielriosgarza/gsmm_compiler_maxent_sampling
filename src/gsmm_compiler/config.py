@@ -384,7 +384,8 @@ class SamplerConfig:
 
     Off by default: it changes no distribution — the transform is a preconditioner and provably
     cannot move the target (§1.6.1) — but it costs a pilot chain, and v1's validated numbers were
-    produced without it. On the example model it buys ``cond(C_q)`` 1.54e4 → 5.11e3 and ~2.5× ESS,
+    produced without it. On the example model it buys ``cond(C_q)`` 1.54e4 → 5.97e3 (2.57×, M10.2b)
+    and the `step_scale_ratio` lever M5 measured at ~2.5× ESS,
     which is the lever to pull when wall-clock binds. See `calibration.calibrate`.
     """
     pilot_chains: int = 4

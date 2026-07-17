@@ -30,12 +30,15 @@ from gsmm_compiler.calibration import (
     GEOMETRY_PILOT_STAGE,
     SCALE_PILOT_STAGE,
     CalibrationError,
-    NeutralPilot,
+    GeometryPilot,
+    ScalePilot,
     calibrate,
-    run_neutral_pilot,
+    run_geometry_pilot,
+    run_scale_pilot,
 )
 from gsmm_compiler.config import SamplerConfig
 from gsmm_compiler.flux_polytope import FluxPolytope, ReducedPolytope
+from gsmm_compiler.maxent_sampler import run_chains
 from gsmm_compiler.native_csc import NativeCSC
 from gsmm_compiler.rounding import (
     RoundingError,
@@ -127,11 +130,22 @@ def simplex_certificate(simplex_setup, simplex_polytope: ReducedPolytope):  # ty
 @pytest.fixture(scope="module")
 def simplex_pilot(  # type: ignore[no-untyped-def]
     simplex_setup, simplex_polytope: ReducedPolytope, simplex_certificate
-) -> NeutralPilot:
+) -> GeometryPilot:
     geometry, transform = simplex_setup
-    return run_neutral_pilot(
+    return run_geometry_pilot(
         transform, simplex_polytope, config=PILOT, model_id="simplex",
-        stage=GEOMETRY_PILOT_STAGE, certificate=simplex_certificate,
+        certificate=simplex_certificate,
+    )
+
+
+@pytest.fixture(scope="module")
+def simplex_scale_pilot(  # type: ignore[no-untyped-def]
+    simplex_setup, simplex_polytope: ReducedPolytope, simplex_certificate
+) -> ScalePilot:
+    geometry, transform = simplex_setup
+    return run_scale_pilot(
+        transform, simplex_polytope, config=PILOT, model_id="simplex",
+        certificate=simplex_certificate,
     )
 
 
@@ -139,7 +153,7 @@ class TestRerounDingPreservesTheDirectionSpace:
     """The theorem, and then the implementation risks Codex named as the real failure modes."""
 
     def test_range_of_T1_equals_range_of_T0(
-        self, simplex_setup, simplex_pilot: NeutralPilot, simplex_polytope: ReducedPolytope
+        self, simplex_setup, simplex_pilot: GeometryPilot, simplex_polytope: ReducedPolytope
     ) -> None:
         """``L₁`` is invertible, so ``T₁`` spans exactly what ``T₀`` spans — no more, no less.
 
@@ -162,7 +176,7 @@ class TestRerounDingPreservesTheDirectionSpace:
             assert np.abs(residual).max() < 1e-10
 
     def test_the_rerounded_transform_has_full_column_rank(
-        self, simplex_setup, simplex_pilot: NeutralPilot, simplex_polytope: ReducedPolytope
+        self, simplex_setup, simplex_pilot: GeometryPilot, simplex_polytope: ReducedPolytope
     ) -> None:
         """Rank loss is Codex's named failure mode, and it is silent: a ``T`` that dropped a column
         still produces feasible samples, positive chords and exact mass balance — of a
@@ -176,25 +190,33 @@ class TestRerounDingPreservesTheDirectionSpace:
         assert np.count_nonzero(singular > singular[0] * 1e-10) == geometry.dimension
 
     def test_q_equals_L0_times_y_is_an_identity_not_a_projection(
-        self, simplex_setup, simplex_pilot: NeutralPilot
+        self, simplex_setup, simplex_polytope: ReducedPolytope
     ) -> None:
         """``q = L₀·y`` must reproduce the geometry coordinates the fluxes independently give.
 
         Two routes to ``q`` that share no arithmetic: the algebraic identity this module uses, and
-        a projection of the pilot's *fluxes* through the geometry. They agree only if the identity
-        is real.
+        a projection of the same states' *fluxes* through the geometry. They agree only if the
+        identity is real.
+
+        Driven straight off `run_chains` rather than off a pilot (M10.2b). The identity is a fact
+        about ``L₀`` and the geometry — no pilot appears in it — and a `GeometryPilot` keeps only
+        coordinates, so reaching for one here would need a *second* pilot whose fluxes are draws
+        from a different stream: the two sides would then disagree for a reason that has nothing to
+        do with the identity under test.
         """
         geometry, bootstrap = simplex_setup
-        y = simplex_pilot.pooled_coordinates()
-        via_identity = y @ bootstrap.cholesky.T
-
-        fluxes = simplex_pilot.fluxes.reshape(-1, simplex_pilot.fluxes.shape[2])
-        via_geometry = geometry.to_coordinates(fluxes)
+        result = run_chains(
+            bootstrap, simplex_polytope, config=PILOT, model_id="simplex", beta=0.0,
+            stage=GEOMETRY_PILOT_STAGE,
+        )
+        chain = result.chains[0]
+        via_identity = chain.coordinates @ bootstrap.cholesky.T
+        via_geometry = geometry.to_coordinates(chain.fluxes)
 
         assert np.abs(via_identity - via_geometry).max() < 1e-9
 
     def test_support_coordinates_stay_the_support_hull_not_the_pilot_draws(
-        self, simplex_setup, simplex_pilot: NeutralPilot, simplex_polytope: ReducedPolytope
+        self, simplex_setup, simplex_pilot: GeometryPilot, simplex_polytope: ReducedPolytope
     ) -> None:
         """Chain starts must stay dispersed over the **vertices**, not over interior pilot points.
 
@@ -209,15 +231,15 @@ class TestRerounDingPreservesTheDirectionSpace:
             pilot_coordinates=simplex_pilot.pooled_coordinates(),
         )
         assert rerounded.support_coordinates.shape[0] == geometry.support_points.shape[0]
-        assert rerounded.support_coordinates.shape[0] != simplex_pilot.n_chains * (
-            simplex_pilot.n_draws
+        assert rerounded.support_coordinates.shape[0] != simplex_pilot.recipe.n_chains * (
+            simplex_pilot.recipe.n_draws
         )
         # and they really are the support vertices, in the new frame
         lifted = rerounded.to_flux(rerounded.support_coordinates)
         assert np.abs(lifted - geometry.support_points).max() < 1e-8
 
     def test_the_rerounded_transform_records_its_estimator(
-        self, simplex_setup, simplex_pilot: NeutralPilot, simplex_polytope: ReducedPolytope
+        self, simplex_setup, simplex_pilot: GeometryPilot, simplex_polytope: ReducedPolytope
     ) -> None:
         geometry, bootstrap = simplex_setup
         rerounded = reround_transform(
@@ -233,7 +255,7 @@ class TestRerounDingRefusesArtifactsThatNeverMet:
     """M6's bug class, at the one new join M10 introduces."""
 
     def test_a_bootstrap_from_another_geometry_is_refused(
-        self, simplex_setup, simplex_pilot: NeutralPilot, simplex_polytope: ReducedPolytope,
+        self, simplex_setup, simplex_pilot: GeometryPilot, simplex_polytope: ReducedPolytope,
         coupled_box_polytope: ReducedPolytope,
     ) -> None:
         """``q = L₀·y`` is the right change of coordinates only for *this* geometry's ``L₀``."""
@@ -282,12 +304,17 @@ class TestRerounDingRefusesArtifactsThatNeverMet:
 class TestThePilotIsFrozen:
     """Spec §17.4/§18.3: an adaptive ``T`` makes the kernel depend on the chain's own history."""
 
-    def test_pilot_arrays_are_physically_read_only(self, simplex_pilot: NeutralPilot) -> None:
+    def test_pilot_arrays_are_physically_read_only(
+        self, simplex_pilot: GeometryPilot, simplex_scale_pilot: ScalePilot
+    ) -> None:
         """`@dataclass(frozen=True)` freezes the binding, not the buffer (M5's lesson)."""
         with pytest.raises(ValueError):
             simplex_pilot.coordinates[0, 0, 0] = 1.0
         with pytest.raises(ValueError):
-            simplex_pilot.fluxes[0, 0, 0] = 1.0
+            simplex_scale_pilot.fluxes[0, 0, 0] = 1.0
+        # The spawn keys are evidence, so they are frozen for the same reason the draws are.
+        with pytest.raises(ValueError):
+            simplex_pilot.spawn_keys[0, 0] = 1
 
     def test_the_sampler_cannot_import_calibration(self) -> None:
         """The structural guard, mirroring M7's reweighting↔sampler separation.
@@ -309,82 +336,138 @@ class TestThePilotIsFrozen:
         assert result.returncode == 0, result.stderr
         assert "ok" in result.stdout
 
-    def test_the_two_pilot_stages_draw_different_numbers(
+    def test_the_two_pilot_stages_draw_from_different_streams(
         self, simplex_setup, simplex_polytope: ReducedPolytope, simplex_certificate
     ) -> None:
-        """Independence is what makes pilot-seed sensitivity attributable (Codex, M10 r2).
+        """Stream separation is what makes pilot-seed sensitivity attributable (Codex, M10 r2).
 
         The RNG is keyed on ``(model_id, stage, β_index, chain_index)``, so the stage *name* is the
         only thing separating the geometry pilot from the scale pilot. If they shared a name they
         would share their draws, and "the rounding got unlucky" could never be told apart from "the
-        scale got unlucky".
+        scale got unlucky" — which is exactly what M10.2a found, `run_chain` having keyed every
+        stream on a hardcoded ``"sample"``.
+
+        🔴 **M10.2b rewrote this test, and the rewrite is the finding.** It used to assert
+        ``not np.allclose(geometry_pilot.coordinates, scale_pilot.coordinates)``, which proves
+        **non-identity**, not independence — and its name claimed independence. Worse, the property
+        it named is not even true of the artifacts: ``T₁`` is derived from the geometry pilot and
+        the scale pilot runs under ``T₁``, so the two pilots are *causally dependent*. What is
+        independent is each pilot's **RNG stream given its inputs**, and the spawn key is the direct
+        evidence for it rather than a downstream shadow of it. (Codex, M10.2b review round 1.)
         """
         _, transform = simplex_setup
-        geometry_pilot = run_neutral_pilot(
+        geometry_pilot = run_geometry_pilot(
             transform, simplex_polytope, config=PILOT, model_id="m",
-            stage=GEOMETRY_PILOT_STAGE, certificate=simplex_certificate,
-        )
-        scale_pilot = run_neutral_pilot(
-            transform, simplex_polytope, config=PILOT, model_id="m", stage=SCALE_PILOT_STAGE,
             certificate=simplex_certificate,
         )
-        assert not np.allclose(geometry_pilot.coordinates, scale_pilot.coordinates)
+        scale_pilot = run_scale_pilot(
+            transform, simplex_polytope, config=PILOT, model_id="m",
+            certificate=simplex_certificate,
+        )
+        # The stage coordinate — spawn key column 1 — is what separates them, chain for chain.
+        assert not np.array_equal(geometry_pilot.spawn_keys, scale_pilot.spawn_keys)
+        assert np.array_equal(geometry_pilot.spawn_keys[:, 0], scale_pilot.spawn_keys[:, 0]), (
+            "same model, so the model coordinate must agree — otherwise this test would pass for "
+            "the wrong reason"
+        )
+        assert not np.array_equal(geometry_pilot.spawn_keys[:, 1], scale_pilot.spawn_keys[:, 1])
 
     def test_a_pilot_is_reproducible_from_its_semantic_key(
         self, simplex_setup, simplex_polytope: ReducedPolytope, simplex_certificate
     ) -> None:
         """Same coordinates ⇒ same draws, bit for bit. The RNG is named, not positional."""
         _, transform = simplex_setup
-        first = run_neutral_pilot(
-            transform, simplex_polytope, config=PILOT, model_id="m", stage=SCALE_PILOT_STAGE,
+        first = run_scale_pilot(
+            transform, simplex_polytope, config=PILOT, model_id="m",
             certificate=simplex_certificate,
         )
-        second = run_neutral_pilot(
-            transform, simplex_polytope, config=PILOT, model_id="m", stage=SCALE_PILOT_STAGE,
+        second = run_scale_pilot(
+            transform, simplex_polytope, config=PILOT, model_id="m",
             certificate=simplex_certificate,
         )
-        assert np.array_equal(first.coordinates, second.coordinates)
-        assert first.content_key() == second.content_key()
+        assert np.array_equal(first.fluxes, second.fluxes)
+        assert first.recipe.content_key() == second.recipe.content_key()
 
-    def test_an_unknown_stage_is_refused(
-        self, simplex_setup, simplex_polytope: ReducedPolytope, simplex_certificate
+    def test_a_pilot_whose_stage_disagrees_with_its_class_is_inexpressible(
+        self, simplex_pilot: GeometryPilot
     ) -> None:
-        _, transform = simplex_setup
-        with pytest.raises(CalibrationError, match="unknown pilot stage"):
-            run_neutral_pilot(
-                transform, simplex_polytope, config=PILOT, model_id="m", stage="typo",
-                certificate=simplex_certificate,
+        """The stage is a `ClassVar`, and the recipe's stage must match it.
+
+        M10.2a's `run_neutral_pilot` took a ``stage`` argument, so the caller chose the RNG stream
+        *and* the key while the payload came from somewhere else entirely. Under M10.2b's split a
+        `GeometryPilot` keyed as a scale pilot would hold coordinates under a key naming fluxes —
+        the artifact would stop being a function of its key, in the milestone about that. There is
+        no ``stage`` parameter to get wrong any more; this pins the one remaining way to state the
+        contradiction. (Codex, M10.2b review round 2.)
+        """
+        with pytest.raises(CalibrationError, match="would be keyed as"):
+            dataclasses.replace(
+                simplex_pilot,
+                recipe=dataclasses.replace(simplex_pilot.recipe, stage=SCALE_PILOT_STAGE),
             )
+
+    def test_a_pilot_that_drew_from_streams_its_recipe_does_not_name_is_refused(
+        self, simplex_pilot: GeometryPilot
+    ) -> None:
+        """The M10.2a defect, caught by construction rather than by a statistical test.
+
+        `run_chain` keyed every stream on a hardcoded ``"sample"``, so the two pilots drew identical
+        numbers. The spawn keys a pilot's chains *actually consumed* are stored; the keys its recipe
+        *names* are recomputed here from ``(model_id, STAGE, 0, chain_index)``; they must agree. Had
+        this guard existed, M10.2a's bug would have raised on the first pilot ever built — the
+        stored keys would have carried ``hash("sample")`` where the recipe names
+        ``hash("geometry_pilot")``.
+
+        This is why there is no stored flux fingerprint: evidence you **recompute** is evidence,
+        evidence you store and read back is a claim. (Codex, M10.2b review round 2, refusing its own
+        round-1 proposal.)
+        """
+        foreign = np.array(simplex_pilot.spawn_keys, dtype=np.int64)
+        foreign[:, 1] += 1  # as if the stage had not reached `run_chain`
+        with pytest.raises(CalibrationError, match="streams its recipe does not name"):
+            dataclasses.replace(simplex_pilot, spawn_keys=foreign)
 
 
 class TestThePilotKeyCoversWhatCanChangeItsBytes:
     """BUILD_PLAN §1.1 — and Codex's round-3 catch that polytope+objective+stream is not enough."""
 
-    def test_the_key_covers_the_input_transform(self, simplex_pilot: NeutralPilot) -> None:
+    def test_the_key_covers_the_input_transform(self, simplex_pilot: GeometryPilot) -> None:
         """A pilot run under one ``T`` must not be reusable under another: its coordinates are only
         meaningful in the frame that produced them."""
-        other = dataclasses.replace(simplex_pilot, transform_key="a-different-transform")
-        assert other.content_key() != simplex_pilot.content_key()
+        recipe = simplex_pilot.recipe
+        other = dataclasses.replace(recipe, transform_key="a-different-transform")
+        assert other.content_key() != recipe.content_key()
 
-    def test_the_key_covers_the_schedule(self, simplex_pilot: NeutralPilot) -> None:
+    def test_the_key_covers_the_schedule(self, simplex_pilot: GeometryPilot) -> None:
+        recipe = simplex_pilot.recipe
         assert (
-            dataclasses.replace(simplex_pilot, burn_in=simplex_pilot.burn_in + 1).content_key()
-            != simplex_pilot.content_key()
+            dataclasses.replace(recipe, burn_in=recipe.burn_in + 1).content_key()
+            != recipe.content_key()
         )
         assert (
-            dataclasses.replace(simplex_pilot, n_chains=simplex_pilot.n_chains + 1).content_key()
-            != simplex_pilot.content_key()
+            dataclasses.replace(recipe, n_chains=recipe.n_chains + 1).content_key()
+            != recipe.content_key()
         )
 
-    def test_the_key_covers_the_stage(self, simplex_pilot: NeutralPilot) -> None:
-        other = dataclasses.replace(simplex_pilot, stage=SCALE_PILOT_STAGE)
-        assert other.content_key() != simplex_pilot.content_key()
+    def test_the_key_covers_the_stage(self, simplex_pilot: GeometryPilot) -> None:
+        recipe = simplex_pilot.recipe
+        other = dataclasses.replace(recipe, stage=SCALE_PILOT_STAGE)
+        assert other.content_key() != recipe.content_key()
 
-    def test_the_pilot_carries_no_objective_key(self, simplex_pilot: NeutralPilot) -> None:
+    def test_the_key_covers_the_feasibility_tolerance(self, simplex_pilot: GeometryPilot) -> None:
+        """M10.2b: the pilots did not honour ``geometry.feasibility_tol`` at all — they silently
+        took `run_chains`' 1e-9 default while production used the configured value. It reaches start
+        selection, chord construction and refresh validation, so it moves the draws; the moment the
+        pilot honours it, an unhashed tolerance is a false-hit generator."""
+        recipe = simplex_pilot.recipe
+        other = dataclasses.replace(recipe, feasibility_tol=recipe.feasibility_tol * 100.0)
+        assert other.content_key() != recipe.content_key()
+
+    def test_the_pilot_carries_no_objective_key(self, simplex_pilot: GeometryPilot) -> None:
         """The β=0 law is objective-independent, so **one pilot serves every objective** on a
         polytope — which is what lets M7's base and reweighted objectives be calibrated against the
         *same* neutral ensemble. An objective key here would be a lie about the dependency."""
-        assert not any("objective" in f.name for f in dataclasses.fields(simplex_pilot))
+        assert not any("objective" in f.name for f in dataclasses.fields(simplex_pilot.recipe))
         assert "objective_key" not in simplex_pilot.manifest()
 
 
@@ -691,17 +774,28 @@ class TestCalibrateRunsOnlyThePilotsItWasAsked:
         )
         assert result.scale_pilot is not None
         assert result.geometry_pilot is not None
-        assert result.scale_pilot.transform_key == result.transform.content_key()
-        assert result.geometry_pilot.transform_key == bootstrap.content_key()
-        assert result.scale_pilot.transform_key != result.geometry_pilot.transform_key
+        assert result.scale_pilot.recipe.transform_key == result.transform.content_key()
+        assert result.geometry_pilot.recipe.transform_key == bootstrap.content_key()
+        assert (
+            result.scale_pilot.recipe.transform_key
+            != result.geometry_pilot.recipe.transform_key
+        )
         assert result.energy_scale.mode == "pilot_sd"
         assert result.energy_scale.pilot is not None
 
-    def test_the_two_pilots_are_independent_streams(
+    def test_the_two_pilots_run_on_different_streams(
         self, fork_setup, fork_reduced: ReducedPolytope, fork_lowered, fork_certificate
     ) -> None:  # type: ignore[no-untyped-def]
-        """Even were they run under the same transform, they must not share draws — otherwise
-        "the rounding got unlucky" and "the scale got unlucky" are indistinguishable."""
+        """The shipped orchestration must give its two pilots different streams — checked on the
+        **minimal-payload path production actually takes**, not on a test-only variant of it.
+
+        🔴 **M10.2b rewrote this too.** It asserted ``not np.allclose(geometry.fluxes,
+        scale.fluxes)``, which (a) proves non-identity rather than independence and (b) was
+        comparing two pilots run under **different transforms**, so it would have passed on a shared
+        stream anyway — the frames alone move the numbers. The stage coordinate of the spawn key is
+        the thing that actually separates them, and `NeutralPilot.__post_init__` has already proved
+        those keys are the ones each recipe names. (Codex, M10.2b review round 1.)
+        """
         geometry, bootstrap = fork_setup
         result = calibrate(
             geometry, fork_reduced, bootstrap, fork_lowered,
@@ -711,9 +805,9 @@ class TestCalibrateRunsOnlyThePilotsItWasAsked:
             sampler=dataclasses.replace(PILOT, pilot_reround=True, energy_scale="pilot_sd"),
         )
         assert result.geometry_pilot is not None and result.scale_pilot is not None
-        assert result.geometry_pilot.stage != result.scale_pilot.stage
-        assert not np.allclose(
-            result.geometry_pilot.fluxes, result.scale_pilot.fluxes
+        assert result.geometry_pilot.recipe.stage != result.scale_pilot.recipe.stage
+        assert not np.array_equal(
+            result.geometry_pilot.spawn_keys[:, 1], result.scale_pilot.spawn_keys[:, 1]
         )
 
     def test_the_reround_improves_conditioning(

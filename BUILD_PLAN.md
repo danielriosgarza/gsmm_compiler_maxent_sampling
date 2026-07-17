@@ -533,7 +533,7 @@ baked into the x-axis, where it would hide the very cross-strain quantity §1.1 
 
 ```
 1. geometry pilot at β=0 under T₀   (OBJECTIVE-INDEPENDENT)
-2. freeze its covariance → build T₁   (spec §17.4; measured cond(C_q) 1.54e4 → 5.36e3, 2.87×)
+2. freeze its covariance → build T₁   (spec §17.4; measured cond(C_q) 1.54e4 → 5.97e3, 2.57×)
 3. INDEPENDENT scale pilot at β=0 under T₁   (better mixing → better ESS for σ̂₀)
 4. freeze σ̂₀ → production chains on independent streams
 ```
@@ -596,6 +596,24 @@ fires there — and is **unattributable**, because the diagnostic's precondition
 **Practical consequence: under `pilot_sd`, β = 16 is the working top rung at a 4×(2000+2000)
 schedule** (q = 0.76, R̂ = 1.06); β ≥ 32 needs a far longer one, because the tilted chain concentrates
 and its chords shorten.
+
+### 1.6.6b (M10.2b) A recorded **measurement** goes stale when a later milestone moves its premise
+
+§1.6.6 and three docstrings recorded re-rounding's gain as `cond(C_q)` 1.54e4 → **5.36e3 (2.87×)**
+(and 5.11e3 elsewhere). The shipped code produces **5.97e3 (2.57×)**, and has since M10.2a. The cause
+is M10.2a's own fix: removing the objective's `optimum_coordinates` start hint from the pilots
+**changes every pilot's draws** — its `CALIBRATION_IMPL_VERSION = 2` note says exactly that, in order
+to justify a cache-invalidating version bump — and `cond(C_q)` is a *function of those draws*. Nobody
+re-measured. Confirmed by re-running the old path: **with the hint, 5304; without it, as shipped,
+5969.**
+
+Nothing is wrong with the code, and the *finding* is intact: re-rounding really does improve
+conditioning, by 2.57× rather than 2.87×. What was wrong is the **status of a number**. This repo
+already knows that a tracker's *forward-looking remedies* are conjecture until measured (§1.6.6, M6's
+"12×"). This is the sharper sibling: **a recorded measurement is a claim with a premise, and it
+expires silently when the premise moves.** A version bump that announces "this changes every draw" is
+a bell that should ring for every derived number in the docs — the bump was made and the bell was not
+heard, in the milestone whose whole subject was artifacts drifting from their keys.
 
 ### 1.6.7 (M10.2) An artifact must be a **function of its key** — and §1.1's L3/samples were not
 
@@ -773,7 +791,7 @@ step that rescaled the pressure by an arbitrary median every iteration. Recorded
 | **M7** ✅ | Reweighted-L1 (frozen weights) | iterative reweighting `w_r ← w_base/(\|v_r\|+ε)` with clipping + median-renormalization, save every weight vector + LP solution, **freeze final weights before sampling**, rebuild objective/LP-optimum/`s_J` (L2 cache) from frozen weights. **λ re-resolved each iteration** (`λ_k = λ̃·λ*(w_k)`, §1.7); every `s_J` input keyed on objective+polytope (§1.6.5) | deterministic weights for fixed seed; active-set + **weight fixed point** converge; weights frozen ⇒ objective `J` unchanged during MCMC (reweighter cannot import sampler); labeled experimental (not exact cardinality); sampler reproduces analytic targets under the reweighted `J`. **PASSED 2026-07-16** (733 tests; `/collab` 5 rounds AGREE) |
 | **M8** ✅ | Cache, restart, batch orchestration & production | 4-layer cache, per-chain markers + writer-claim locking, atomic rename + fsync, **batch runner over a models manifest**, one global process pool over `(model, β, chain)`, worker thread-limit env, per-model run dirs + **cross-model aggregation**, manifests + diagnostics + `COMPLETE` | kill-and-resume resumes only missing `(model,chain)` units; partial batch yields valid cross-model tables; concurrent-writer safe; corrupted-artifact rejected; same-env deterministic traces; full batch runs on ≥2 strains with documented resources. **PASSED 2026-07-16** (content-addressed cache store with atomic-mkdir writer claim; `spawn` pool workers import no solver; serial==pool byte-identical; L0 key made content-addressed) |
 | **M9** | Performance & GSMM hardening | `benchmark.py` (new module) + `maxent benchmark` CLI → [benchmarks/M9_REPORT.md](benchmarks/M9_REPORT.md); worker-count sweep {1,2,4,7,14} by **ESS(J)/wall-sec**; allocation + sort profiling; `reduced` storage-mode validation; **the reachable-state mass-balance certificate (§1.4.2)** — scope added mid-milestone when the benchmark's own worker sweep could not run | benchmark report produced; all performance assertions hold (no per-step HiGHS, no scipy, no Python loop in chord, no element-wise highspy extraction, no full reconstruction every step) |
-| **M10** | Deferred extensions | **(1) pilot rerounding + pilot-based `s_J` — DONE**, as one DAG (bootstrap `T₀` → geometry pilot → `T₁` → scale pilot → `σ̂₀`), `energy_scale="pilot_sd"` additive beside `warmup_range` (§1.6.6). **(2) wire the DAG into `batch`/CLI + decide whether the pilot and `T₁` enter §1.1's cache DAG as a new layer — NEXT, and a real fork §1.1 does not settle.** Then: β→performance calibration (spec §22.3, now cheap — `q(β)` and `r_eff(κ)` are already computed); parallel tempering; slice line kernel; downstream mode-feature extraction | each behind its own tests; none alters the validated v1 target distribution. **(1) PASSED 2026-07-16** (37 new tests; `/collab` 4 rounds AGREE; ladder closes 75.8% of the gap at β=16 vs 13% before, cond(C_q) 2.87× better) |
+| **M10** | Deferred extensions | **(1) pilot rerounding + pilot-based `s_J` — DONE**, as one DAG (bootstrap `T₀` → geometry pilot → `T₁` → scale pilot → `σ̂₀`), `energy_scale="pilot_sd"` additive beside `warmup_range` (§1.6.6). **(2a) wire the DAG into `batch`/CLI — DONE**; the recorded "fork §1.1 does not settle" was plain/code drift (§1.6.7). **(2b) key the pilots into the cache — DONE** (§1.6.6b, §1.6.7): the pilots are the DAG's only expensive node (19.3 s vs geometry's 1.17 s). **(2c) overlap `prepare_model` with sampling across models — NEXT, and §1.2 already mandates it**: the pool is global ✓ but `run_batch` is `for spec in specs: _run_one_model(...)` and blocks on every future, so no overlap exists. The tracker's recorded "two-phase pool dispatch" (parallelise a pilot's 4 chains) is the **weaker** remedy. Also open, same family: `ArtifactCache` has only `L3` + `pilot` live — L0/L1/L2 are documented and stored by nothing, so warm `prepare_model`'s remaining 1.17 s is all cobra parsing. Then: β→performance calibration (spec §22.3, now cheap — `q(β)` and `r_eff(κ)` are already computed); parallel tempering; slice line kernel; downstream mode-feature extraction | each behind its own tests; none alters the validated v1 target distribution. **(1) PASSED 2026-07-16** (37 new tests; `/collab` 4 rounds AGREE; ladder closes 75.8% of the gap at β=16 vs 13% before, cond(C_q) 2.57× better — *see §1.6.6b: the 2.87× recorded here was pre-M10.2a and stale*). **(2b) PASSED 2026-07-17** (18 new tests; `/collab` 3 rounds — round 1 refuted my payload design, round 3 found a hit/miss asymmetry **inside my own repair**; `prepare_model` 22.9 s → 1.2 s warm, `T₁`/`s_J` bit-identical) |
 
 ### 2.1 What M6 ships, and what it does not  *(M6 finding; SETTLED — and it constrains M10)*
 
