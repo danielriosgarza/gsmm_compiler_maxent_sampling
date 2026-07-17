@@ -92,6 +92,16 @@ _TRANSFORM_ARRAY_NAMES = (
     "support_coordinates",
 )
 
+GEOMETRY_CACHE_LAYER = "L3"
+"""The geometry bundle's layer in `cache.ArtifactCache` (BUILD_PLAN §1.1).
+
+Named rather than inlined (M10.2d), so the three live layers — `model_input.MODEL_CACHE_LAYER`,
+this, and `calibration.PILOT_CACHE_LAYER` — are countable. §1.1's L1 and L2 have keys and **no
+store**, on purpose: measured warm, `.reduce()` is **1 ms** and the objective + LP **45 ms**,
+against `load_canonical_model`'s 1.157 s and the pilots' 19.3 s. *Cache what is expensive, derive
+what is cheap, key everything.*
+"""
+
 _WORKER_THREAD_ENV = (
     "OPENBLAS_NUM_THREADS",
     "OMP_NUM_THREADS",
@@ -230,7 +240,10 @@ def prepare_model(
     from gsmm_compiler.model_input import load_canonical_model  # cobra; parent-only
 
     biomass_id = spec.biomass_id or config.model.biomass_id
-    canonical = load_canonical_model(spec.model_path, biomass_id)
+    # L0 (M10.2d). Measured warm, this was the whole remaining serial term: 1.157 s, of which 0.65 s
+    # is cobra's *import* — which a hit skips too, because `load_model` imports it lazily and the
+    # lookup key reads cobra's version from package metadata.
+    canonical = load_canonical_model(spec.model_path, biomass_id, cache=cache)
     model_id = spec.model_id or canonical.model_id
     reduced = canonical.polytope.reduce()
 
@@ -398,7 +411,7 @@ def geometry_cache_key(reduced: ReducedPolytope, config: Config, *, model_id: st
     corrupts, §1.1).
     """
     return content_key(
-        layer="L3",
+        layer=GEOMETRY_CACHE_LAYER,
         polytope_key=reduced.content_key(),
         model_id=model_id,
         geometry_config=asdict(config.geometry),
@@ -464,7 +477,7 @@ def _load_or_build_geometry(
     else:
         key = geometry_cache_key(reduced, config, model_id=model_id)
         artifact = cache.get_or_compute(
-            "L3", key, lambda: build_l3_bundle(reduced, config, model_id=model_id)
+            GEOMETRY_CACHE_LAYER, key, lambda: build_l3_bundle(reduced, config, model_id=model_id)
         )
         arrays, meta = artifact.arrays, artifact.meta
 
