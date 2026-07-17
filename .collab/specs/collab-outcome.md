@@ -1332,3 +1332,49 @@ with a premise, and it expires silently when the premise moves.* §1.6.6 recorde
 (2.87×); the shipped code gives 5.97e3 (2.57×) and has since M10.2a removed the pilots' start hint —
 whose own version-bump note **says** it changes every draw. The bell was rung and not heard. See
 BUILD_PLAN §1.6.6b.
+
+---
+
+## M10.2e — geometry determinism (1 round, AGREE with 2 corrections to *my* claims)
+
+**The fork:** the ambient BLAS thread count changes the basis under one L3 key, so the L3 artifact is
+not a function of its key — and one of the two bases yields a `T₁` whose certificate LP returns
+`kUnknown`, so the CLI fails from a clean cache under default threading. Options weighed: (A) force
+the thread env before NumPy import, (B) `threadpoolctl` scoped around the geometry build, (C) hash the
+thread count into the L3 key, (D) make the basis construction thread-invariant.
+
+**Codex AGREEd the fix but refused two of my claims, and the first is the important one.**
+
+1. 🔴 **"§1.2 already mandates this and the code drifted" is FALSE.** §1.2's thread rule is a
+   sub-bullet of *"Sampling: process pool over (β, chain) units"*, and its own parenthetical states
+   its purpose: "the real oversubscription risk **in solver-free workers**". It is a **worker
+   resource-control** policy, and it **works** — `run_batch` pins the env *before* creating the spawn
+   pool, so each worker's freshly-imported NumPy inherits it (the pool `initializer=` is the
+   redundant part, not the parent call). There is no drift; **there is a gap in the plan**: nothing
+   ever required *parent-side geometry determinism*. **Worker oversubscription (performance) and
+   geometry reproducibility (correctness) are two requirements sharing one mechanism**, and
+   conflating them is why the second went unstated for ten milestones. *I pattern-matched a rule onto
+   a case it does not cover, in the session where that rule had paid off three times.*
+2. **One BLAS thread does not buy cross-machine byte reproducibility.** Confirmed independently: this
+   NumPy ships OpenBLAS `0.3.31 DYNAMIC_ARCH … neoversev2`, which selects kernels at **runtime by CPU
+   detection**. Strict byte identity and unrestricted cross-machine cache sharing **cannot both** be
+   promised with ordinary floating-point libraries.
+
+**The design (adopted):**
+- Keep the two policies **separate and separately named**: the worker thread limit is performance,
+  applied pre-spawn; an **L3 BLAS limit** is a *forced reproducibility* policy, **scoped** around L3
+  construction and **cache-versioned**. (`_limit_thread_env`'s real nit is `setdefault`, which does
+  not enforce 1 when the caller exported 4.)
+- **Any fix must bump the L3 key**, or caches already holding the ambient-thread basis remain valid
+  hits.
+- **Visibility beside elimination, not instead of it**: record the L3 recipe key, the L3 **content**
+  key, the basis and `T₀` hashes, the determinism-policy version, the effective thread limit and the
+  BLAS vendor/version/architecture. That alone would have made *"one recipe key produced two content
+  keys"* visible immediately, while the certificate went on failing closed. The basis hash belongs in
+  **content identity and manifests, never in the pre-build lookup key** — that is circular.
+- **Restate §1.1's promise**: *within a declared numerical-runtime compatibility profile* a recipe key
+  rebuilds deterministically; **across profiles byte equality is not promised**.
+
+**The lesson:** *two requirements that share a mechanism are still two requirements* — and the one
+nobody wrote down is the one that goes unmet. Corollary, learned the hard way here: **a rule that has
+just paid off three times is exactly the rule you will over-apply next.**
