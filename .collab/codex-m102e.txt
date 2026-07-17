@@ -1,0 +1,1928 @@
+Reading additional input from stdin...
+OpenAI Codex v0.144.1
+--------
+workdir: /home/mcpu/GitHub/gsmm_compiler_maxent_sampling
+model: gpt-5.6-sol
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: high
+reasoning summaries: none
+session id: 019f6e87-c5a0-77d0-8967-e89e20914b67
+--------
+user
+# M10.2e — the L3 artifact is not a function of its key: BLAS threads pick the basis
+
+Read `src/gsmm_compiler/affine_geometry.py` (basis construction) and `src/gsmm_compiler/batch.py`
+(`_limit_thread_env`, `geometry_cache_key`, `run_batch`). Do **not** read anything under `.claude/`.
+Focus: pick the fix. This is geometry, which BUILD_PLAN makes math-critical.
+
+## Measured, reproducible, on the example model (Bifido, d=46)
+
+Same polytope, same `model_id`, same seed, same config — **one L3 cache key `e9d6fc28673a`**:
+
+| OMP/OPENBLAS/MKL_NUM_THREADS | support points | basis | T0 |
+|---|---|---|---|
+| 1 | `a0d32f1c02` | **`d35fe4fccf`** | `539da9cfc640` |
+| unset | `a0d32f1c02` | **`970f8dddac`** | `d0f3bee2ce8f` |
+| 4 | `a0d32f1c02` | **`970f8dddac`** | `d0f3bee2ce8f` |
+
+Deterministic per setting; reproducible across processes. Support points come from HiGHS, which
+`build_geometry` pins to `threads=1` — identical. The **basis** is NumPy/BLAS
+(`residual -= basis @ (basis.T @ residual)`, Gram-Schmidt re-orthogonalization at
+`affine_geometry.py:483`, also 350/991/994), and multi-threaded BLAS reduces in a different order.
+
+**Both bases are valid.** Identical M4 span certificates (exhaustive=True, complement_complete=True,
+`max_width` 1.808e-12 vs 1.804e-12, 0 inconclusive, leakage ~6e-16), same dimension 46, same
+`cond(C_q)` 1.537e4, and both T0 pass `certify_reachable_mass_balance` (3.93e-11 / 4.06e-11). This is
+a **reproducibility** defect, not a wrong-answer one.
+
+**But it decides whether the package runs.** Basis `970f8dddac` yields a T1 (after the M10 pilot
+re-rounding) whose `certify_reachable_mass_balance` LP returns **kUnknown**, so the run refuses:
+
+    CLI, fresh cache, OMP_NUM_THREADS=1   -> complete (4/4 units), T1 certified 3.87e-11
+    CLI, fresh cache, ambient threads     -> failed: LPNotOptimalError ... kUnknown
+
+Present at HEAD before this milestone. It **fails closed** (M9's certificate refuses rather than
+sampling something wrong), so no incorrect numbers were ever produced. Nobody noticed because every
+recorded CLI verification reused a cache warmed by a threads-pinned probe.
+
+**Agreed scope:** fix the *reproducibility*. The certify-kUnknown fragility is recorded, not chased.
+
+## The plan already mandates a fix, and the code disagrees
+
+BUILD_PLAN §1.2: "Set `OPENBLAS_NUM_THREADS=OMP_NUM_THREADS=MKL_NUM_THREADS=1` **before** NumPy
+import". `batch._limit_thread_env` does `os.environ.setdefault(...)` **inside `run_batch`**, i.e.
+after numpy is imported at module scope, and its own docstring says it exists so "the
+freshly-imported NumPy in each **spawned worker** inherits it". The parent's geometry build was never
+covered. (This is the 4th "BUILD_PLAN settles it and the code drifted" this session.)
+
+## The fork — which, and why?
+
+**A. Force the env in `gsmm_compiler/__init__.py` before numpy is imported.** Literally what §1.2
+says. Costs: importing a *library* mutates the user's `os.environ` process-wide; and `setdefault`
+would not give determinism at all (a user with `OMP_NUM_THREADS=8` still gets basis `970f8dddac`),
+so it must *force*, overriding an explicit user choice.
+
+**B. `threadpoolctl` around the geometry build only.** Scoped, no global mutation, deterministic
+regardless of the caller's env. Costs: a new runtime dependency (wheel-only is fine here), and it
+must wrap every BLAS call that touches the basis.
+
+**C. Put the effective thread count in `geometry_cache_key`.** Honest — §1.1 says a key must hash
+everything that changes the bytes. Does **not** fix the CLI failure (the default path still builds
+the unlucky basis) and makes caches non-shareable across machines.
+
+**D. Make the basis construction itself thread-invariant** (e.g. deterministic reduction). Is this
+achievable at acceptable cost for a 260x46 Gram-Schmidt, or is it a fantasy?
+
+**E. Something I have not thought of.**
+
+## Attack
+
+1. Which option, and what does it cost that I have not priced?
+2. Is pinning to 1 thread even *sufficient* for determinism, or does BLAS remain non-reproducible
+   across machines/versions at fixed thread count (different SIMD kernels, different blocking)? If it
+   is not sufficient, is "the L3 artifact is a function of its key" achievable at all — and if not,
+   what should the key *promise*, and what should §1.1 say instead?
+3. Does A/B contradict §1.2's own reasoning that thread pinning exists to prevent worker
+   oversubscription (a *performance* concern) rather than to make geometry reproducible (a
+   *correctness* concern)? Are these two different requirements that happen to share a mechanism —
+   and does treating them as one hide something?
+4. Is there a case for making the geometry's nondeterminism *visible* (e.g. hashing the basis into
+   the run manifest) rather than eliminated?
+
+End with exactly:
+VERDICT: AGREE | DISAGREE
+CONTESTED: <numbered list of points you dispute, or 'none'>
+warning: Codex's Linux sandbox uses bubblewrap and needs access to create user namespaces.
+codex
+I’ll inspect only the requested source files and the relevant plan text, avoiding `.claude/`. I’m using the explore skill because this is a codebase-backed design review; it will keep the conclusions tied to the actual call graph and cache semantics.
+exec
+/bin/bash -lc "sed -n '1,240p' /home/mcpu/.agents/skills/explore/SKILL.md" in /home/mcpu/GitHub/gsmm_compiler_maxent_sampling
+ succeeded in 0ms:
+---
+name: explore
+description: Use this skill when the user asks you something that requires searching a code base
+metadata:
+  author: morph
+  version: "0.1.0"
+  argument-hint: <question>
+---
+
+# Explore
+
+Use the codebase_search tool to explore a codebase, this saves time and tokens.
+
+## When To Use
+
+- The user asks "how does this work?" or "where is X implemented?", anything that involves reading/tracing code
+- You need entry points, data flow, or ownership of a behavior.
+- Keyword grep is likely to miss the relevant files.
+
+## Steps
+
+1. Translate the user question into a tight natural language question, or description of the functionality you're looking for.
+2. Run 2-3 instances of the `codebase_search` tool against the repo root, for each use a different search_string so you can explore the codebase from multiple angles
+3. Read the returned files/sections.
+4. Summarize the flow with concrete file paths.
+
+## Query Template
+
+"Find the entry points and data flow for <X>. Include router/handlers, config, and tests."
+
+codex
+The exploration instructions call for semantic code search, but that helper is not exposed in this session. I’ll use narrow `rg`/`sed` reads of the two named files plus `BUILD_PLAN`, with path exclusions so `.claude/` remains untouched.
+mcp: morph-mcp/codebase_search started
+mcp: morph-mcp/codebase_search (failed)
+user cancelled MCP tool call
+mcp: morph-mcp/codebase_search started
+mcp: morph-mcp/codebase_search (failed)
+user cancelled MCP tool call
+mcp: morph-mcp/codebase_search started
+mcp: morph-mcp/codebase_search (failed)
+user cancelled MCP tool call
+exec
+/bin/bash -lc "rg --files -g '"'!.claude/**'"' | rg '("'^|/)(BUILD_PLAN|BUILD_PLAN'"\\.["'^/]*)$|src/gsmm_compiler/(affine_geometry|batch)'"\\.py"'$'"'" in /home/mcpu/GitHub/gsmm_compiler_maxent_sampling
+ succeeded in 0ms:
+BUILD_PLAN.md
+src/gsmm_compiler/batch.py
+src/gsmm_compiler/affine_geometry.py
+
+exec
+/bin/bash -lc "rg -n -g '"'!.claude/**'"' \""'^##? 1'"\\.|OPENBLAS|OMP_NUM_THREADS|MKL_NUM_THREADS|cache key|function of|reproduc|oversub|geometry_cache_key|_limit_thread_env|def run_batch|def build_geometry|basis @|basis.T|Gram|orthogonal|linalg|thread\" BUILD_PLAN.md src/gsmm_compiler/batch.py src/gsmm_compiler/affine_geometry.py" in /home/mcpu/GitHub/gsmm_compiler_maxent_sampling
+ succeeded in 0ms:
+src/gsmm_compiler/batch.py:106:    "OPENBLAS_NUM_THREADS",
+src/gsmm_compiler/batch.py:107:    "OMP_NUM_THREADS",
+src/gsmm_compiler/batch.py:108:    "MKL_NUM_THREADS",
+src/gsmm_compiler/batch.py:400:        # above: `movable_reactions(transform)` is an exact function of a transform already hashed
+src/gsmm_compiler/batch.py:405:def geometry_cache_key(reduced: ReducedPolytope, config: Config, *, model_id: str) -> str:
+src/gsmm_compiler/batch.py:410:    artifact must reproduce a fresh build exactly, and a false miss only recomputes (a false hit
+src/gsmm_compiler/batch.py:432:    `geometry_cache_key` — and the two disagreed: the CLI's meta carried no
+src/gsmm_compiler/batch.py:478:        key = geometry_cache_key(reduced, config, model_id=model_id)
+src/gsmm_compiler/batch.py:667:def run_batch(
+src/gsmm_compiler/batch.py:687:    _limit_thread_env()
+src/gsmm_compiler/batch.py:693:            initializer=_limit_thread_env,
+src/gsmm_compiler/batch.py:853:def _limit_thread_env() -> None:
+src/gsmm_compiler/batch.py:854:    """Pin BLAS/OpenMP to one thread. Set in the parent *before* the spawn pool starts, so the
+src/gsmm_compiler/batch.py:855:    freshly-imported NumPy in each spawned worker inherits it — the real oversubscription risk in
+src/gsmm_compiler/batch.py:856:    solver-free workers is nested BLAS threads, not HiGHS (§1.2)."""
+src/gsmm_compiler/affine_geometry.py:23:``pⱼᵀw ≠ 0``, so that ``pⱼ`` is not orthogonal to ``V`` and its width is positive. A missing
+src/gsmm_compiler/affine_geometry.py:113:its component orthogonal to ``range(B)`` bounded in width by `SpanCertificate.resolution`.** (If a
+src/gsmm_compiler/affine_geometry.py:158:"""Bumped when a change here can alter the bytes of a geometry. Feeds the L3 cache key (§1.1).
+src/gsmm_compiler/affine_geometry.py:162:The bump is load-bearing rather than cosmetic: `batch.geometry_cache_key` does *not* fold in
+src/gsmm_compiler/affine_geometry.py:302:    column is a Gram-Schmidt residual ``r = Δx − B(BᵀΔx)``, so
+src/gsmm_compiler/affine_geometry.py:327:    null space is its orthogonal complement, so projecting is ``x -= Q(Qᵀx)`` — no null-space basis
+src/gsmm_compiler/affine_geometry.py:392:    _, singular, right = np.linalg.svd(matrix, full_matrices=False)
+src/gsmm_compiler/affine_geometry.py:455:    orthogonality when the vector being projected lies nearly inside the current span — which is
+src/gsmm_compiler/affine_geometry.py:457:    The second pass restores orthogonality to machine precision (spec §15.5).
+src/gsmm_compiler/affine_geometry.py:483:            residual -= basis @ (basis.T @ residual)
+src/gsmm_compiler/affine_geometry.py:487:        """Re-orthogonalize, normalize, and append. Refuses a vector the basis already spans."""
+src/gsmm_compiler/affine_geometry.py:493:        norm = float(np.linalg.norm(residual))
+src/gsmm_compiler/affine_geometry.py:516:    """One LP pair: maximize and minimize ``cᵀv`` along a direction orthogonal to the basis.
+src/gsmm_compiler/affine_geometry.py:524:    """``p``: unit norm, scaled coordinates, orthogonal to the current basis."""
+src/gsmm_compiler/affine_geometry.py:556:        contradict each other: ``p`` is a unit vector orthogonal to ``B``, so
+src/gsmm_compiler/affine_geometry.py:607:    residual_norm = float(np.linalg.norm(residual))
+src/gsmm_compiler/affine_geometry.py:734:    extent = float(np.linalg.norm(blocked.ranges[blocked.mask] / scales[blocked.mask]))
+src/gsmm_compiler/affine_geometry.py:872:    The ``√k`` argument assumes ``Q`` exactly spans ``range(B)ᗮ``. Gram-Schmidt in float64 does not,
+src/gsmm_compiler/affine_geometry.py:880:    """False when Gram-Schmidt could not produce all ``n_free − d`` complement directions."""
+src/gsmm_compiler/affine_geometry.py:959:    This is a column-pivoted QR of the projector ``I − BBᵀ``, run as Gram-Schmidt over the
+src/gsmm_compiler/affine_geometry.py:996:        norm = float(np.linalg.norm(vector))
+src/gsmm_compiler/affine_geometry.py:1020:    """Probe every direction orthogonal to the basis; stop at the first that proves a dimension.
+src/gsmm_compiler/affine_geometry.py:1048:    raw_leakage = float(np.linalg.norm(np.eye(n) - span, 2)) if complete else 1.0
+src/gsmm_compiler/affine_geometry.py:1049:    raw_diameter = float(np.linalg.norm((reduced.upper_bounds - reduced.lower_bounds) / scales))
+src/gsmm_compiler/affine_geometry.py:1050:    # `np.linalg.norm` is an ordinary float64 computation, so neither is a certified bound as it
+src/gsmm_compiler/affine_geometry.py:1228:        return self.center + (q @ self.basis.T) * self.scaling
+src/gsmm_compiler/affine_geometry.py:1238:        """The L3 cache key (§1.1): the polytope, the scaling, the basis, the code behind them.
+src/gsmm_compiler/affine_geometry.py:1296:        content-addressed, so an artifact that does not reproduce its own key is not the artifact
+src/gsmm_compiler/affine_geometry.py:1323:                "the rebuilt geometry does not reproduce its own cached content key "
+src/gsmm_compiler/affine_geometry.py:1343:def build_geometry(
+src/gsmm_compiler/affine_geometry.py:1365:    inverse_scale_norm = float(np.linalg.norm(1.0 / scales))
+src/gsmm_compiler/affine_geometry.py:1368:    program = build_flux_lp(reduced, threads=1)
+src/gsmm_compiler/affine_geometry.py:1396:        norm = float(np.linalg.norm(candidate))
+src/gsmm_compiler/affine_geometry.py:1625:        gram = basis.T @ basis
+src/gsmm_compiler/affine_geometry.py:1696:        support_rank = int(np.linalg.matrix_rank(coordinates))
+BUILD_PLAN.md:45:## 1. Cross-cutting decisions (the part that goes beyond the spec)
+BUILD_PLAN.md:122:- **Geometry (L3): sequential.** Basis discovery orthogonalizes each probe against the current
+BUILD_PLAN.md:124:  `threads=1`. A **batched-LP** variant (solve K random-objective LPs concurrently, one rank-revealing
+BUILD_PLAN.md:130:  - Set `OPENBLAS_NUM_THREADS=OMP_NUM_THREADS=MKL_NUM_THREADS=1` **before** NumPy import (the real
+BUILD_PLAN.md:131:    oversubscription risk in solver-free workers is BLAS/OpenMP, not HiGHS).
+BUILD_PLAN.md:138:  oversubscribe the 14 cores. Each model gets its own result subdir; a final aggregation stage reads
+BUILD_PLAN.md:142:  stream when task count changes — reproducibility death. Keying on `model_id` keeps each strain's
+BUILD_PLAN.md:196:    component orthogonal to `range(B)` bounded in width by `resolution`* — **not** "cannot
+BUILD_PLAN.md:606:to justify a cache-invalidating version bump — and `cond(C_q)` is a *function of those draws*. Nobody
+BUILD_PLAN.md:618:### 1.6.7 (M10.2) An artifact must be a **function of its key** — and §1.1's L3/samples were not
+BUILD_PLAN.md:650:artifact a function of its key?" of things this repo already had returned **no** four times:
+BUILD_PLAN.md:658:  Monte Carlo noise. The defect is that **the artifact was not a function of its key**, so M7's
+BUILD_PLAN.md:704:exclusion that survives, being an exact function of a transform already hashed.
+BUILD_PLAN.md:732:That is also why the toy network cannot reproduce the failure — `FIX = 2.0` keeps it alive — and why
+BUILD_PLAN.md:762:and `λ*` is a function of `w` (doubling every weight halves `λ*`), so M7 had to choose whether the raw
+BUILD_PLAN.md:784:| **M0** | Platform & packaging spike | `uv` venv, wheel-only install of highspy/cobra/numpy, `pip install -e .`, import + load example model + solve one native-array LP, verify multiprocessing + thread-limit env | Installs on aarch64/Jetson **from wheels only**; example model loads; 1 LP solves; production core imports **no scipy**; `uv tree` pinned |
+BUILD_PLAN.md:789:| **M5** | Rounding + β=0 sampler | support-covariance Cholesky rounding (ridge escalation), coordinate hit-and-run at β=0, multi-chain, feasibility + convergence diagnostics | uniform analytic targets reproduced; transform-invariance of moments; positive chords at start; ‖ST‖≈0; **zero inner-loop HiGHS solves** |
+BUILD_PLAN.md:791:| **M7** ✅ | Reweighted-L1 (frozen weights) | iterative reweighting `w_r ← w_base/(\|v_r\|+ε)` with clipping + median-renormalization, save every weight vector + LP solution, **freeze final weights before sampling**, rebuild objective/LP-optimum/`s_J` (L2 cache) from frozen weights. **λ re-resolved each iteration** (`λ_k = λ̃·λ*(w_k)`, §1.7); every `s_J` input keyed on objective+polytope (§1.6.5) | deterministic weights for fixed seed; active-set + **weight fixed point** converge; weights frozen ⇒ objective `J` unchanged during MCMC (reweighter cannot import sampler); labeled experimental (not exact cardinality); sampler reproduces analytic targets under the reweighted `J`. **PASSED 2026-07-16** (733 tests; `/collab` 5 rounds AGREE) |
+BUILD_PLAN.md:792:| **M8** ✅ | Cache, restart, batch orchestration & production | 4-layer cache, per-chain markers + writer-claim locking, atomic rename + fsync, **batch runner over a models manifest**, one global process pool over `(model, β, chain)`, worker thread-limit env, per-model run dirs + **cross-model aggregation**, manifests + diagnostics + `COMPLETE` | kill-and-resume resumes only missing `(model,chain)` units; partial batch yields valid cross-model tables; concurrent-writer safe; corrupted-artifact rejected; same-env deterministic traces; full batch runs on ≥2 strains with documented resources. **PASSED 2026-07-16** (content-addressed cache store with atomic-mkdir writer claim; `spawn` pool workers import no solver; serial==pool byte-identical; L0 key made content-addressed) |
+
+exec
+/bin/bash -lc "sed -n '45,150p' BUILD_PLAN.md
+sed -n '600,715p' BUILD_PLAN.md
+sed -n '80,125p' src/gsmm_compiler/batch.py
+sed -n '370,510p' src/gsmm_compiler/batch.py
+sed -n '650,720p' src/gsmm_compiler/batch.py
+sed -n '840,870p' src/gsmm_compiler/batch.py" in /home/mcpu/GitHub/gsmm_compiler_maxent_sampling
+ succeeded in 0ms:
+## 1. Cross-cutting decisions (the part that goes beyond the spec)
+
+### 1.1 Caching — a 4-layer content-addressed DAG
+
+Each layer is an immutable artifact keyed by the hash of everything upstream that can change its
+bytes. Geometry is β-independent, so it is computed **once** and reused across the whole β-ladder.
+
+```
+source file ──sha256──┐
+                      ▼
+[L0] Parsed model IR      key = content_key(model_id, polytope content, exchange mask,
+                                            cobra_version, parser_schema_version)   (M8: content-addressed)
+   frozen IDs, coeffs, bounds, metadata (raw file hash alone is NOT enough — parser semantics matter)
+                      ▼
+[L1] Reduced polytope IR  key = hash(canonical IDs, CSC arrays, bounds, user overrides,
+                                     fixed-var elimination, dtype/endianness, schema_version)
+   canonical S (CSC) + full→reduced map  v_full = R·v_reduced + c   (see §1.5)
+        ├────────────────────────────────────────────────┐
+        ▼                                                 ▼
+[L2] Objective + LP optimum                         [L3] Geometry
+   key = L1 + biomass_idx + λ + penalty_indices          key = L1 + scaling + tolerances
+       + weights + obj_impl_version + energy_policy           + geom_seed + discovery_algo_version
+   holds J*, v*, μ*, C*, and s_J                              + numpy_version + solver_settings
+   (s_J is objective-dependent → lives HERE, not L3)     holds B, support_points, center,
+                                                          L (Cholesky), T, dimension, span certificate
+        └───────────────────────┬────────────────────────┘
+                                ▼
+   Samples: one artifact per (β, chain) unit
+   key = L2 + L3 + β + chain_seed_coords + sampler_version + burn/thin/n_samples
+        (M10.2: `batch.sample_recipe_key` — written into every unit's manifest and matched on
+         restart. It was specified here from the start and computed nowhere; see §1.6.7.)
+```
+
+**M10.2 corrections to this diagram** (§1.6.7 has the reasoning):
+
+- **L3 stores the `ReducedGeometry`** — `s`, `B`, centre, support points, span certificate — *and* the
+  `T₀` built from it, plus `T₀`'s reachability certificate. It long stored only the transform, which
+  is why `reround_transform` (needing `B` and `s`) could not run on a cache hit. `build_l3_bundle` is
+  the **one writer** of that schema; two writers is what let the CLI cache an uncertified bundle.
+- **The pilot and `T₁` are not a new layer.** Derive `T₁` (9 ms) from L3 and a pilot; the thing worth
+  keying is the **pilot** (19.2 s), which is M10.2b. `NeutralPilot.content_key` already exists and is
+  now complete.
+- **L2 was never a strict layer**: `warmup_range`'s `s_J` is nominally L2 but reads L3's support
+  points, while the stated L2 key omits L3. `pilot_sd` makes the edge explicit. The numeric labels are
+  becoming less useful than named immutable nodes; recorded, not yet acted on.
+
+Rules (all adopted from the collaboration):
+- **L0 is content-addressed, not file-hash-addressed** *(M8; refines the original `sha256(file)`
+  key)*. `build_canonical_model` accepts a cobra `Model` that may have been assembled or mutated in
+  memory, and a file hash cannot prove such a model came from the file whose bytes it hashes — so the
+  old key let a model inherit **another file's L0 identity** (a model loaded, mutated, and re-frozen
+  against the same path would keep the pristine file's key). The L0 key now fingerprints the IR the
+  model *actually holds* (`model_id`, the polytope's `content_key`, the exchange mask) folded with the
+  cobra + parser versions. A file's `sha256` is still recorded as **provenance** on the trusted
+  `load_canonical_model` path (which both hashes and parses one file, so the correspondence is real),
+  but it is never the identity. M8's cache computes a **file-lookup key** (`sha256(file)+cobra+schema`)
+  separately, to skip re-parsing across runs, and validates the loaded artifact's content L0 key on
+  load — so a false lookup hit is caught, never trusted.
+- **Provenance in every key**: parser + code + artifact-schema versions, dtype/endianness, numpy
+  version. A refactor that changes array semantics must miss the cache, not silently load stale bytes.
+- **Validate on load**: shape, dtype, finite-check, and a stored content hash for every array.
+- **Storage format**: `.npy` (memory-mappable) for large arrays; `.npz`/JSON for small bundles +
+  manifest. Compressed `.npz` cannot be zero-copy mapped — don't use it for the big matrices.
+- **Restartability**: per-stage **and per-chain** completion markers, not one top-level `COMPLETE`.
+  A 31-of-32-chain failure resumes only the missing chain.
+- **Concurrency**: a writer-claim directory (atomic `mkdir`) so two jobs don't compute the same key;
+  write into a temp dir, `fsync` files + parent, atomic rename within one filesystem, create
+  `COMPLETE` last.
+- **Batch layout & aggregation**: `results/<batch>/<model_id>/…` per strain (full per-model run dir),
+  plus `results/<batch>/cross_model/` holding aggregated tables — β-summary, reaction-activity, and
+  exchange-conversion matrices stacked across strains. This is what powers the comparative question
+  in spec §2 ("do two species retain different amounts of metabolic flexibility at comparable
+  selection pressure"). The aggregation stage only *reads* per-model artifacts, so a partial batch
+  still yields a valid cross-model table over the strains that finished.
+
+### 1.2 Parallelization
+
+- **Geometry (L3): sequential.** Basis discovery orthogonalizes each probe against the current
+  basis, so it is inherently serial. Use one persistent HiGHS instance with simplex **warm starts**,
+  `threads=1`. A **batched-LP** variant (solve K random-objective LPs concurrently, one rank-revealing
+  QR on the differences) stays behind a benchmark gate — adopt only if it gives ≥1.5× wall-clock at
+  the *same validated dimension*. At d≤55 here, sequential wins by default.
+- **Sampling: process pool over `(β, chain)` units.** Given frozen geometry these are independent.
+  A worker receives **only** frozen NumPy arrays (`T_active`, `center_active`, bounds, objective
+  arrays, index maps) + a semantic RNG seed. A worker **never imports cobra or HiGHS**.
+  - Set `OPENBLAS_NUM_THREADS=OMP_NUM_THREADS=MKL_NUM_THREADS=1` **before** NumPy import (the real
+    oversubscription risk in solver-free workers is BLAS/OpenMP, not HiGHS).
+  - Workers **write their own** `.npy` files; never ship flux matrices back through IPC.
+  - **Benchmark worker count {1, 2, 4, 7, 14}** on the Jetson by ESS-per-wall-second. 14 can lose to
+    4–7 under memory-bandwidth/thermal limits; pick empirically.
+- **Batch scheduling.** Across many strains the unit of work is `(model, β, chain)`. Process models
+  so their per-model geometry (sequential, cached) can overlap the *sampling* of earlier models, but
+  feed **one global worker pool** sized once for the machine — never a pool per model, which would
+  oversubscribe the 14 cores. Each model gets its own result subdir; a final aggregation stage reads
+  the per-model summaries into cross-model tables (§1.1).
+- **RNG**: derive streams from stable semantic coordinates `(model_id, stage, β_index, chain_index)`
+  via `SeedSequence`, and store the spawn keys. A flat `spawn()` sequence renumbers every downstream
+  stream when task count changes — reproducibility death. Keying on `model_id` keeps each strain's
+  streams stable regardless of batch composition or ordering.
+- **Independence caveat**: "embarrassingly parallel" describes compute, not mixing. Cold high-β chains
+  can stay trapped near init. Start chains from **dispersed convex combinations** of support points and
+  `v*`. Sequential-ladder warm starts and parallel tempering are a *separate later mode* (M10), never a
+  replacement for independent-chain diagnostics.
+
+### 1.3 Inner-loop speed
+
+### 1.6.6b (M10.2b) A recorded **measurement** goes stale when a later milestone moves its premise
+
+§1.6.6 and three docstrings recorded re-rounding's gain as `cond(C_q)` 1.54e4 → **5.36e3 (2.87×)**
+(and 5.11e3 elsewhere). The shipped code produces **5.97e3 (2.57×)**, and has since M10.2a. The cause
+is M10.2a's own fix: removing the objective's `optimum_coordinates` start hint from the pilots
+**changes every pilot's draws** — its `CALIBRATION_IMPL_VERSION = 2` note says exactly that, in order
+to justify a cache-invalidating version bump — and `cond(C_q)` is a *function of those draws*. Nobody
+re-measured. Confirmed by re-running the old path: **with the hint, 5304; without it, as shipped,
+5969.**
+
+Nothing is wrong with the code, and the *finding* is intact: re-rounding really does improve
+conditioning, by 2.57× rather than 2.87×. What was wrong is the **status of a number**. This repo
+already knows that a tracker's *forward-looking remedies* are conjecture until measured (§1.6.6, M6's
+"12×"). This is the sharper sibling: **a recorded measurement is a claim with a premise, and it
+expires silently when the premise moves.** A version bump that announces "this changes every draw" is
+a bell that should ring for every derived number in the docs — the bump was made and the bell was not
+heard, in the milestone whose whole subject was artifacts drifting from their keys.
+
+### 1.6.7 (M10.2) An artifact must be a **function of its key** — and §1.1's L3/samples were not
+
+*(M10.2 collab finding, 4 rounds, converged AGREE.)* M10.1 recorded the CLI wiring as blocked on a
+**design fork §1.1 does not settle**: the cache returns a `RoundedTransform` with no `ReducedGeometry`,
+so re-rounding on a hit needs "the pilot and `T₁` to enter the DAG as a new layer". The arithmetic
+says otherwise, and it was never done:
+
+| stage | measured (Bifido, d = 46, serial) | cached before M10.2? |
+|---|---|---|
+| `build_geometry` (~1100 LPs) | **1.168 s** | yes — as `T₀`'s bundle |
+| `build_transform` → `T₀` | 0.005 s | — |
+| the two β=0 pilots | **19.202 s** | **no** |
+| `reround_transform` → `T₁` | 0.009 s | **no** |
+
+A layer for `T₁` would exist to avoid rebuilding a **1.17 s** stage while costing **19.2 s** to fill —
+16.4× upside-down. The rule is the one §1.1 already implies: **cache what is expensive, derive what is
+cheap, key everything.** `prepare_model` goes 2.388 s → 21.6 s of *serial parent* work, which is
+Amdahl's term, not a cache question — it is **M10.2b** (pilot caching + two-phase pool dispatch), and
+it is why restart under `pilot_reround` re-runs 19.2 s of pilots before resuming one chain.
+
+**The blocker itself was plan/code drift, not a fork.** §1.1 has always said L3 "holds B,
+support_points, center, L (Cholesky), T, dimension, span certificate". `RoundedTransform.to_bundle`
+holds `T`, `L`, centre and support coordinates — no `B`, no `s`, no reconstructable certificate — and
+`ReducedGeometry` had **no serializer at all**. M9's "the code never implemented its own
+documentation", one layer up. (Codex's correction, conceded: it cached a *non-reconstructible hybrid*,
+not "the transform". And repairing it does **not** dissolve the topology question — §1.1's L2 was
+already not a strict layer, since `warmup_range`'s `s_J` is nominally L2 but reads L3's support points
+while the stated L2 key omits L3. `pilot_sd` only makes that edge impossible to ignore.)
+
+**The through-line, and the reason these are correctness fixes.** §1.1's asymmetry — *a false miss only
+recomputes; a false hit corrupts* — means **an incomplete key is strictly worse than none**: absent
+means no cache, incomplete means a store that confidently returns the wrong bytes. Asking "is this
+artifact a function of its key?" of things this repo already had returned **no** four times:
+
+- **The neutral pilot was objective-dependent and said it wasn't.** `NeutralPilot`'s docstring —
+  "**objective-independent**, and that is load-bearing … one neutral pilot serves every objective on a
+  polytope" — was false when written: `calibrate` fed both β=0 pilots `optimum_coordinates`, derived
+  from the objective's own LP optimum, while `content_key` hashed no objective and no start. Measured,
+  two pilots differing in *nothing else*: **identical `content_key`**, max |Δy| = 2.79, `T₁` cond 7198
+  vs 9663, `s_J` 2.6287 vs 2.4995. Not bias — both are honest draws from one β=0 law and the gap is
+  Monte Carlo noise. The defect is that **the artifact was not a function of its key**, so M7's
+  two-objectives-on-one-polytope case takes the first hit and never knows. Codex's mechanism is
+  sharper than "a different start": the hint changes the support hull's cardinality, hence the
+  Dirichlet draw's dimension, hence **RNG consumption on every later transition** — the streams
+  desynchronise. Fixed **structurally**: `run_neutral_pilot` has no such parameter. The claim's true
+  form is "…every objective sharing this polytope, **transform and pilot recipe**".
+- **M9's mass-balance gate was bypassable through the package's own cache-warming path.** It lived in
+  the `compute()` closure of `batch._load_or_build_geometry` — which runs **only on a miss**. On a hit
+  nothing read the certificate; and `maxent build-geometry --cache-dir` assembled its *own* bundle
+  under `batch`'s key, omitted the certificate from it, and **stored it after printing `REFUSED`**.
+  Two writers of one schema is the defect. `batch.build_l3_bundle` is now the one writer, it raises
+  rather than returning an uncertified bundle, and `require_certified_transform` runs on **every**
+  load path. It checks three things, each refusing a different lie: the polytope (M6's join), the
+  **transform** (new — `T₀` and `T₁` share a `polytope_key` *exactly*, so `ReachabilityCertificate`
+  gained a `transform_key`), and the **verdict, re-derived** from `worst_absolute` vs `contract`
+  rather than read off a stored boolean. Hence `to_cache` stores the fields and `as_dict` the verdict:
+  a bundle asserting innocence beside contrary evidence is inexpressible. (M9: never trust a reading,
+  check the bound.)
+- **`T₁` was sampled uncertified — and must be certified before the *scale pilot*, not production.**
+  The scale pilot is itself a chain stepping in `T₁`'s frame; an uncertified `T₁` lets it walk off the
+  manifold and `σ̂₀` is then read off off-manifold fluxes. The exact-arithmetic theorem does **not**
+  transfer `T₀`'s certificate: `range(T₁) = range(T₀)` exactly (§1.6.1), so the true worst residual is
+  the same number, but the certificate is a *numerical* bound recomputing `E = S·T₁` and `Ω` from a
+  fresh `T₁⁺`, and `fl(B·L₀)` and `fl(B·L₁)` need not share a floating-point column space. Measured:
+  `T₁` certifies at **3.86e-11**, inside M9's independently measured `T₀` range of 3.6e-11 … 5.1e-11 —
+  two certificates, two matrices, no shared computation, agreeing where the theorem says they must.
+  Order: certify `T₀` → geometry pilot → `T₁` → **certify `T₁`** → scale pilot → production. And
+  `calibrate` takes `bootstrap_certificate` as a **required argument** rather than recomputing it: the
+  proof exists already, and demanding it makes an uncertified transform unable to enter the DAG.
+- **A `COMPLETE` marker named a chain, not an experiment.** §1.1 has always specified the sample key
+  (`L2 + L3 + β + chain seed coords + sampler_version + burn/thin/n_samples`). **Nothing computed it**:
+  restart skipped on the marker alone and `store_chain` recorded only `polytope_key`. So a results
+  directory reused after any change that moves the numbers resumed the units it had and sampled the
+  rest **from a different law** — two experiments in one tree, stacked into one cross-model table,
+  every per-chain diagnostic green *because each chain really is correct*. M10 forced this rather than
+  created it: `T` and `s_J` were once pure functions of the polytope and config; now they descend from
+  a pilot, so two runs of one unchanged config can honestly disagree. `batch.sample_recipe_key` now
+  computes it and `_already_done` **refuses** rather than recomputing — a results tree is the user's
+  output, not a cache.
+
+**The criterion, stated once because getting it wrong is easy:** an artifact key asks *"are these bytes
+the same artifact?"*, **not** *"is this the same distribution?"* M10.2 initially excluded
+`optimum_coordinates` from the sample recipe by importing §1.6.5's target-identity reasoning — while
+having just fixed the identical defect for the pilots. Codex's refutation is decisive and general: the
+recipe key already hashes `seed`, `chain_index`, `schedule` and `storage_mode`, **none of which define
+the stationary law**. Both keys are right; they answer different questions. `movable` is the one
+exclusion that survives, being an exact function of a transform already hashed.
+
+### 1.7 λ is scale-referenced: `λ = λ̃ · λ*`  *(M3 finding; decision SETTLED)*
+
+`J(v) = μ(v) − λ·C(v)` compares a **biomass flux** with a **sum of hundreds of absolute fluxes**.
+Those two quantities are not on the same scale, and their ratio is a property of each model:
+
+| | example model (Bifido) | toy network |
+|---|---|---|
+| `μ_max` | 41.63 | 10.0 |
+| `C(v)` at the growth optimum | ≈ 4.5 × 10⁴ | 4.0 |
+| **critical λ\*** | **1.89 × 10⁻³** | ∞ (cannot collapse) |
+_GEOMETRY_ARRAY_NAMES = (
+    "scaling",
+    "basis",
+    "center",
+    "support_points",
+)
+
+_TRANSFORM_ARRAY_NAMES = (
+    "transform",
+    "inverse_transform",
+    "cholesky",
+    "center",
+    "support_coordinates",
+)
+
+GEOMETRY_CACHE_LAYER = "L3"
+"""The geometry bundle's layer in `cache.ArtifactCache` (BUILD_PLAN §1.1).
+
+Named rather than inlined (M10.2d), so the three live layers — `model_input.MODEL_CACHE_LAYER`,
+this, and `calibration.PILOT_CACHE_LAYER` — are countable. §1.1's L1 and L2 have keys and **no
+store**, on purpose: measured warm, `.reduce()` is **1 ms** and the objective + LP **45 ms**,
+against `load_canonical_model`'s 1.157 s and the pilots' 19.3 s. *Cache what is expensive, derive
+what is cheap, key everything.*
+"""
+
+_WORKER_THREAD_ENV = (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+)
+
+
+class BatchError(RuntimeError):
+    """The batch manifest is malformed, or a model could not be prepared for sampling."""
+
+
+# ---- the models manifest -----------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    """One row of the models manifest: a strain to sample (mirrors ``strains.tsv``, §1.1)."""
+
+    model_path: str
+    biomass_id: str | None = None
+        beta_index=int(beta_index),
+        chain_index=int(chain_index),
+        seed=int(plan.sampler.seed),
+        # The start hint — see the note above on artifact vs target identity. It moves the draws
+        # (it changes the support hull's cardinality, so the Dirichlet dimension, so RNG
+        # consumption on every later transition), and under re-rounding it is expressed in T₁'s
+        # frame, so it is not even redundant with the transform key.
+        optimum_coordinates=plan.optimum_coordinates,
+        # Consumed by start selection and chord validation, so it can move the draws.
+        feasibility_tol=float(plan.feasibility_tol),
+        # These change the stored `trace_near_zero_counts` arrays — bytes of this artifact.
+        near_zero_thresholds=list(plan.near_zero_thresholds),
+        # The schedule — and `refresh_interval`, because M5 settled that in float64 the state is
+        # `(y, cache error, refresh phase)`, so it moves the draws, not just their bookkeeping.
+        burn_in=int(plan.sampler.burn_in),
+        n_samples=int(plan.sampler.n_samples),
+        thin=int(plan.sampler.thin),
+        refresh_interval=int(plan.sampler.refresh_interval),
+        # Storage decides the *bytes on disk*: M9 measured that `reduced` round-trips to 1.1e-13 and
+        # not bit-exactly (gemv per row vs gemm per block), so byte-identity holds within a mode and
+        # not across one — two modes in one directory are two different artifacts.
+        store_mode=plan.storage.mode,
+        store_flux_dtype=plan.storage.flux_dtype,
+        # Two versions, because two different pieces of code decide these bytes:
+        # `SAMPLER_IMPL_VERSION` covers the transition kernel that draws them (its docstring says
+        # so), `OUTPUT_IMPL_VERSION` the writer that lays them down. An output-only change moves
+        # only the second, and used to move neither.
+        sampler_impl_version=SAMPLER_IMPL_VERSION,
+        output_impl_version=OUTPUT_IMPL_VERSION,
+        # `movable` is deliberately absent, and it is the one exclusion that survives the criterion
+        # above: `movable_reactions(transform)` is an exact function of a transform already hashed
+        # here, so hashing it too would only assert the same fact twice.
+    )
+
+
+def geometry_cache_key(reduced: ReducedPolytope, config: Config, *, model_id: str) -> str:
+    """The L3 lookup key: the polytope, the geometry/rounding settings, the seed, and the code.
+
+    ``model_id`` is folded in because it seeds the geometry's RNG (the random-probe pre-pass), so
+    two strains that happen to share a polytope still get their *own* geometry bytes — a cached
+    artifact must reproduce a fresh build exactly, and a false miss only recomputes (a false hit
+    corrupts, §1.1).
+    """
+    return content_key(
+        layer=GEOMETRY_CACHE_LAYER,
+        polytope_key=reduced.content_key(),
+        model_id=model_id,
+        geometry_config=asdict(config.geometry),
+        seed=int(config.sampler.seed),
+        geometry_impl_version=GEOMETRY_IMPL_VERSION,
+        rounding_impl_version=ROUNDING_IMPL_VERSION,
+        numpy_version=np.__version__,
+    )
+
+
+def build_l3_bundle(
+    reduced: ReducedPolytope, config: Config, *, model_id: str
+) -> tuple[dict[str, NDArray[Any]], dict[str, Any]]:
+    """Build L3 from scratch and return its cache bundle: **the one writer of this schema.**
+
+    Before M10.2 there were two. This function's body lived in a closure here, while
+    `cli._cmd_maxent_build_geometry --cache-dir` assembled its *own* bundle under the *same*
+    `geometry_cache_key` — and the two disagreed: the CLI's meta carried no
+    ``reachability_certificate``, and it stored the bundle even when the certificate came back
+    **REFUSED**. Since `batch` gated only inside its miss path, warming the cache from the CLI and
+    then sampling walked M9's gate straight past. Two writers of one schema is the defect; one
+    writer is the fix, so the drift has nowhere to live.
+
+    The certificate is computed here rather than inside `build_transform` for the reason M4's span
+    certificate is its own step: it costs LPs, and `rounding` stays solver-free so a worker can
+    import it (BUILD_PLAN §1.2, §1.4.2).
+    """
+    geometry = build_geometry(reduced, model_id=model_id, config=config.geometry)
+    transform = build_transform(geometry, reduced, config=config.geometry)
+    certificate = certify_reachable_mass_balance(transform, reduced)
+    require_certified_transform(certificate, transform, reduced)
+
+    geometry_arrays, geometry_meta = geometry.to_bundle()
+    transform_arrays, transform_meta = transform.to_bundle()
+    return (
+        # Namespaced, because both artifacts have a `center` and a flat merge would silently keep
+        # one of them. Each is then rebuilt and re-keyed by its own class, so a divergence between
+        # the two centres is caught by whichever key it breaks — not hidden by a dedupe.
+        {
+            **{f"geometry_{name}": array for name, array in geometry_arrays.items()},
+            **transform_arrays,
+        },
+        {
+            "geometry": geometry_meta,
+            "transform": transform_meta,
+            "geometry_manifest": geometry.manifest(),
+            "reachability_certificate": certificate.to_cache(),
+        },
+    )
+
+
+def _load_or_build_geometry(
+    reduced: ReducedPolytope, config: Config, *, model_id: str, cache: ArtifactCache | None
+) -> tuple[ReducedGeometry, RoundedTransform, dict[str, Any]]:
+    """Return ``(geometry, T₀, meta)``, from the cache if present — certificate enforced either way.
+
+    Returns the **geometry**, not just the transform. That is M10.2's enabling change: `calibration`
+    needs ``B`` and ``s`` to re-round from a pilot, and a cache hit used to hand back a transform
+    from which they cannot be recovered without inverting ``L₀``.
+    """
+    if cache is None:
+        arrays, meta = build_l3_bundle(reduced, config, model_id=model_id)
+    else:
+        key = geometry_cache_key(reduced, config, model_id=model_id)
+        artifact = cache.get_or_compute(
+            GEOMETRY_CACHE_LAYER, key, lambda: build_l3_bundle(reduced, config, model_id=model_id)
+        )
+        arrays, meta = artifact.arrays, artifact.meta
+
+    geometry = ReducedGeometry.from_bundle(
+        {name: arrays[f"geometry_{name}"] for name in _GEOMETRY_ARRAY_NAMES},
+        meta["geometry"],
+        reduced,
+    )
+    transform = RoundedTransform.from_bundle(
+        {name: arrays[name] for name in _TRANSFORM_ARRAY_NAMES}, meta["transform"], reduced
+    )
+    # On **every** path, not just the miss. `build_l3_bundle` already gated what it built, so this
+    # line exists for the cache hit — where nothing previously looked at the certificate at all,
+    # and a bundle written by any other process was simply believed.
+    require_certified_transform(
+        ReachabilityCertificate.from_cache(meta["reachability_certificate"]), transform, reduced
+    )
+    return geometry, transform, meta
+
+
+# ---- one sampling unit (worker-side: no cobra, no HiGHS) ----------------------------------------
+
+
+@dataclass(frozen=True)
+class SampleJob:
+    """The frozen payload for one ``(model, β, chain)`` unit, pickled to a worker."""
+
+    chain_dir: Path
+    model_id: str
+    beta: float
+    model_id: str
+    status: str  # "complete" | "failed"
+    n_units: int
+    n_completed: int
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class BatchResult:
+    batch_dir: Path
+    outcomes: tuple[ModelOutcome, ...]
+
+    @property
+    def completed_model_ids(self) -> tuple[str, ...]:
+        return tuple(o.model_id for o in self.outcomes if o.status == "complete")
+
+
+def run_batch(
+    specs: Sequence[ModelSpec],
+    config: Config,
+    *,
+    batch_name: str,
+    output_root: str | Path | None = None,
+    cache_dir: str | Path | None = None,
+    n_workers: int = 1,
+) -> BatchResult:
+    """Run every strain in ``specs``, resuming any whose units already carry ``COMPLETE`` markers.
+
+    A model that fails to *prepare* (a bad file, an infeasible objective) is recorded and skipped,
+    so the batch still produces valid cross-model tables over the strains that finished (§1.1).
+    Sampling units run in one global process pool when ``n_workers > 1``; ``n_workers == 1`` runs
+    them in-process, which keeps the deterministic tests free of multiprocessing.
+    """
+    root = Path(output_root) if output_root is not None else Path(config.output.directory)
+    layout = RunLayout(root=root, batch=batch_name)
+    cache = ArtifactCache(Path(cache_dir)) if cache_dir is not None else None
+
+    _limit_thread_env()
+    executor = None
+    if n_workers > 1:
+        executor = ProcessPoolExecutor(
+            max_workers=n_workers,
+            mp_context=mp.get_context("spawn"),
+            initializer=_limit_thread_env,
+        )
+
+    outcomes: list[ModelOutcome] = []
+    try:
+        for spec in specs:
+            outcomes.append(
+                _run_one_model(spec, config, layout=layout, cache=cache, executor=executor)
+            )
+    finally:
+        if executor is not None:
+            executor.shutdown()
+
+    from gsmm_compiler.features import aggregate_cross_model  # local: avoids an import cycle
+
+    aggregate_cross_model(layout, [o.model_id for o in outcomes if o.status == "complete"])
+
+    layout.batch_dir.mkdir(parents=True, exist_ok=True)
+    write_json(
+        layout.batch_dir / "batch_manifest.json",
+        {
+            "batch": batch_name,
+            "n_models": len(specs),
+            "models": [asdict(o) for o in outcomes],
+            "provenance": Provenance.capture().as_dict(),
+        },
+    )
+    return BatchResult(batch_dir=layout.batch_dir, outcomes=tuple(outcomes))
+            **plan.reports,
+        },
+    )
+
+
+def _mark_model_complete(model_id: str, layout: RunLayout) -> None:
+    marker = layout.model_complete_marker(model_id)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    with open(marker, "wb") as handle:
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _limit_thread_env() -> None:
+    """Pin BLAS/OpenMP to one thread. Set in the parent *before* the spawn pool starts, so the
+    freshly-imported NumPy in each spawned worker inherits it — the real oversubscription risk in
+    solver-free workers is nested BLAS threads, not HiGHS (§1.2)."""
+    for name in _WORKER_THREAD_ENV:
+        os.environ.setdefault(name, "1")
+
+exec
+/bin/bash -lc "sed -n '1,90p' src/gsmm_compiler/batch.py
+sed -n '140,180p' src/gsmm_compiler/affine_geometry.py
+sed -n '285,370p' src/gsmm_compiler/affine_geometry.py
+sed -n '375,510p' src/gsmm_compiler/affine_geometry.py
+sed -n '940,1010p' src/gsmm_compiler/affine_geometry.py
+sed -n '1220,1340p' src/gsmm_compiler/affine_geometry.py
+sed -n '1340,1420p' src/gsmm_compiler/affine_geometry.py
+sed -n '1600,1710p' src/gsmm_compiler/affine_geometry.py" in /home/mcpu/GitHub/gsmm_compiler_maxent_sampling
+ succeeded in 0ms:
+"""The batch runner: a models manifest → per-model geometry (cached) → a global pool over units.
+
+This is the orchestration layer BUILD_PLAN §1.1–§1.2 asks for. It reads a *models manifest* (one row
+per strain), and for each model runs the pipeline the M6/M7 integration tests wire by hand — parse
+(L0), reduce (L1), resolve the objective + LP optimum + ``s_J`` (L2), build the geometry and rounded
+transform (L3), then sample the β-ladder — writing a per-strain result directory plus, at the end,
+the cross-model tables that answer §2's comparative question.
+
+Two properties matter and shape everything here:
+
+* **The expensive, β-independent stage is the geometry**, so it goes through the content-addressed
+  cache (`cache.ArtifactCache`): a re-run with more β rungs, or a second strain sharing a polytope,
+  reuses it, and two concurrent jobs never both compute it.
+
+* **The sampling of one ``(model, β, chain)`` unit needs no solver**, so it runs in a worker process
+  that receives only frozen NumPy arrays (a pickled `RoundedTransform` + `ReducedPolytope` + the
+  objective) and *never imports cobra or HiGHS* (§1.2). The parent does all the parsing and LP work;
+  workers only walk the chain and write their own files. Restart is per-unit: a unit whose directory
+  already carries a ``COMPLETE`` marker is skipped, so a killed batch resumes only what it lost.
+
+Nothing at module scope imports cobra or HiGHS — both are pulled lazily inside `prepare_model`,
+which runs only in the parent — so this module is safe for a ``spawn``-ed worker to import.
+
+Implemented in **M8** — see BUILD_PLAN.md.
+"""
+
+from __future__ import annotations
+
+import multiprocessing as mp
+import os
+import traceback
+from collections.abc import Iterator, Sequence
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from numpy.typing import NDArray
+
+from gsmm_compiler.affine_geometry import (
+    GEOMETRY_IMPL_VERSION,
+    ReducedGeometry,
+    build_geometry,
+)
+from gsmm_compiler.cache import ArtifactCache
+from gsmm_compiler.calibration import calibrate
+from gsmm_compiler.config import Config
+from gsmm_compiler.flux_polytope import ReducedPolytope
+from gsmm_compiler.maxent_sampler import (
+    SAMPLER_IMPL_VERSION,
+    movable_reactions,
+    run_chain,
+    trace_objective,
+)
+from gsmm_compiler.output import (
+    OUTPUT_IMPL_VERSION,
+    RunLayout,
+    SampleStorage,
+    is_complete,
+    read_json,
+    write_json,
+)
+from gsmm_compiler.provenance import Provenance, content_key
+from gsmm_compiler.rounding import (
+    ROUNDING_IMPL_VERSION,
+    ReachabilityCertificate,
+    RoundedTransform,
+    build_transform,
+    certify_reachable_mass_balance,
+    require_certified_transform,
+)
+from gsmm_compiler.sparse_objective import (
+    ReducedObjective,
+    lower_objective,
+    resolve_objective,
+    solve_sparse_objective,
+)
+
+_GEOMETRY_ARRAY_NAMES = (
+    "scaling",
+    "basis",
+    "center",
+    "support_points",
+)
+
+_TRANSFORM_ARRAY_NAMES = (
+    "transform",
+    "inverse_transform",
+    "cholesky",
+from typing import Any, Final
+
+import numpy as np
+from numpy.typing import NDArray
+
+from gsmm_compiler.config import GeometryConfig
+from gsmm_compiler.flux_polytope import ReducedPolytope
+from gsmm_compiler.highs_backend import (
+    BACKEND_IMPL_VERSION,
+    DEFAULT_PRIMAL_FEASIBILITY_TOL,
+    HighsLinearProgram,
+    LPSolution,
+)
+from gsmm_compiler.native_csc import VALUE_DTYPE
+from gsmm_compiler.provenance import content_key, stream_seed
+from gsmm_compiler.sparse_objective import build_flux_lp
+
+GEOMETRY_IMPL_VERSION: Final = 2
+"""Bumped when a change here can alter the bytes of a geometry. Feeds the L3 cache key (§1.1).
+
+2 (M10.2): L3 now stores the **geometry** (``s``, ``B``, centre, support points, certificate) and
+not only the transform built from it, and `ReducedGeometry.content_key` hashes ``support_points``.
+The bump is load-bearing rather than cosmetic: `batch.geometry_cache_key` does *not* fold in
+`ReducedGeometry.content_key`, so without it a v1 bundle — transform arrays, no ``basis`` — would
+still be a cache **hit** and `from_bundle` would die on a missing key. §1.1's rule is that a schema
+change must **miss**, never error on stale bytes.
+"""
+
+NOISE_SAFETY: Final = 10.0
+"""How far a width must clear the solver's own admitted error before we call the direction real."""
+
+BASIS_BLOCK: Final = 32
+"""Basis columns are allocated in blocks, never reallocated per append (spec §15.5)."""
+
+ORTHONORMALITY_TOL: Final = 1e-10
+"""``‖BᵀB − I‖_max``. Two-pass projection delivers ~1e-15; this is a loose alarm, not a target."""
+
+MASS_BALANCE_SAFETY: Final = 100.0
+"""Slack over the float64 evaluation floor of ``S·v`` before an endpoint's residual is a defect."""
+
+MAX_DEGENERATE_DRAWS: Final = 100
+            f"of only {separation:.1f}×, below the required {min_separation:.0f}×. The affine "
+            f"dimension depends on geometry.blocked_tol ({tol:.1e}) rather than on the polytope. "
+            "Tighten the LP feasibility tolerance, or set the blocked tolerance deliberately."
+        )
+
+    return BlockedReactions(mask=mask, ranges=ranges, separation=separation)
+
+
+# ---- the space every feasible direction must lie in ---------------------------------------------
+
+
+@dataclass(frozen=True)
+class DirectionSpace:
+    """Projector onto ``{x : x_blocked = 0, S·diag(s)·x = 0}`` — the two constraints that *every*
+    feasible direction satisfies exactly, whatever the LP's floating-point opinion of it.
+
+    **Why this is here at all.** Without it, the mass-balance error of the basis *accumulates*. Each
+    column is a Gram-Schmidt residual ``r = Δx − B(BᵀΔx)``, so
+
+        ``S·diag(s)·r = S·Δv − S·diag(s)·B·(BᵀΔx)``
+
+    — the LP's row residual (~1e-12), **plus the error already in ``B``, amplified by ‖BᵀΔx‖**. That
+    second term is a feedback loop: column 46 inherits the errors of columns 1–45. Measured on the
+    example model, it grew the worst column to 8e-10 against a 6e-12 median, within 1.25× of the
+    tolerance the basis must satisfy — and an earlier attempt to fix it by re-probing along each new
+    direction made it *worse* (1.4e-9, a hard failure), because a sharper probe drives ``Δx`` to
+    extreme vertices and so *raises* ‖BᵀΔx‖. The chain has to be cut, not managed: project each
+    candidate into this space *before* it is appended, and every column is mass-balanced to machine
+    precision, so there is nothing left to accumulate.
+
+    **This does not decide the dimension — the LP still does.** Spec §15.1 rejects computing a
+    null-space basis of ``S`` and calling it the answer, and it is right to: the null space is only
+    an *upper bound* on the affine dimension, because the bounds can flatten the polytope inside it.
+    The example model proves the point — ``dim null = 46`` here, but before the blocked reactions
+    were removed the naive count was 55, and the true dimension is what the support LPs find. This
+    class supplies a projector, not a dimension. `n_null` is retained purely as an independent
+    ceiling to check ``d`` against.
+    """
+
+    blocked: NDArray[np.bool_]
+    row_space: NDArray[np.float64]
+    """``Q``: orthonormal basis of the row space of ``S·diag(s)`` over the *moving* columns. The
+    null space is its orthogonal complement, so projecting is ``x -= Q(Qᵀx)`` — no null-space basis
+    is ever formed, and the economy SVD suffices whatever the shape of ``S``."""
+    moving: NDArray[np.intp]
+    n_null: int
+    """``n_moving − rank``: an upper bound on the affine dimension, never a claim about it."""
+    singular_gap: float
+    """Smallest **retained** singular value ÷ largest **discarded** one — a *two-sided* gap.
+
+    A one-sided margin (retained vs the cutoff) says nothing about the decision: it can be huge
+    while
+    a discarded value sits just under the bar. Only the ratio across the split says the rank was
+    read
+    off the spectrum rather than chosen from it. Ambiguity here is a hard failure — an equality
+    wrongly discarded lets the sampler walk off the exact affine hull along a near-null direction
+    whose mass-balance residual is far too small for the ``‖S·diag(s)·B‖`` check to notice.
+    """
+
+    def project(self, vector: NDArray[np.float64]) -> NDArray[np.float64]:
+        """The component of ``vector`` that is a legal feasible direction. Twice, for accuracy."""
+        out = np.zeros_like(vector)
+        moving = vector[self.moving]
+        if self.row_space.size:
+            for _ in range(2):
+                moving = moving - self.row_space @ (self.row_space.T @ moving)
+        out[self.moving] = moving
+        return out
+
+
+def direction_space(
+    reduced: ReducedPolytope,
+    scales: NDArray[np.float64],
+    blocked: NDArray[np.bool_],
+    *,
+    memory_limit_bytes: int,
+    feasibility_tol: float = 1e-9,
+    min_singular_gap: float = 1e3,
+) -> DirectionSpace:
+    """Factor ``S·diag(s)`` once, so every candidate direction can be cleaned in O(n·rank).
+
+    Dense NumPy linear algebra, which spec §7 permits for reduced-coordinate work *with an explicit
+    memory check* — so there is one. The numerical rank uses the standard machine-precision cutoff
+    (``σ_max · max(shape) · eps``), and errs safe: reading the rank too *low* merely cleans less,
+    while reading it too high would need a genuinely zero singular value to exceed a cutoff three
+    orders of magnitude above the noise floor.
+            blocked=blocked,
+            row_space=np.zeros((0, 0), dtype=VALUE_DTYPE),
+            moving=moving,
+            n_null=0,
+            singular_gap=np.inf,
+        )
+
+    n_rows = reduced.stoichiometry.n_rows
+    needed = _BYTES_PER_FLOAT64 * n_rows * moving.size * 3  # the matrix, plus SVD working copies
+    if needed > memory_limit_bytes:
+        raise GeometryError(
+            f"the direction-space factorization needs ~{needed / 2**30:.3f} GiB "
+            f"({n_rows}×{moving.size} float64), but geometry.max_geometry_memory_gb allows "
+            f"{memory_limit_bytes / 2**30:.3f} GiB"
+        )
+
+    matrix = reduced.stoichiometry.to_dense()[:, moving] * scales[moving]
+    _, singular, right = np.linalg.svd(matrix, full_matrices=False)
+
+    # The cutoff is the larger of two resolutions, and it must be, because they must agree.
+    # Machine epsilon says which singular values are indistinguishable from zero *in the
+    # arithmetic*. The LP's feasibility tolerance says which equalities it will actually
+    # *enforce*: a singular value below ε means a unit step along that right-singular vector moves
+    # the mass balance by less than the solver tolerates, so the LP treats the direction as free.
+    # Keeping such an equality while the LP ignores it is the worst of both — the support LPs hand
+    # back a moving direction and `DirectionSpace` projects it to nothing, which is a
+    # contradiction, not a geometry. Take the max and the two components describe the same
+    # polytope. (On the example model the eps-based cutoff is 1.9e-8 and already dominates, so
+    # this is a no-op there; it is the σ ≈ 1e-14 case it saves.)
+    machine_cutoff = (
+        float(singular.max(initial=0.0)) * max(matrix.shape) * float(np.finfo(VALUE_DTYPE).eps)
+    )
+    cutoff = max(machine_cutoff, feasibility_tol)
+    rank = int(np.count_nonzero(singular > cutoff))
+
+    retained = float(singular[rank - 1]) if rank > 0 else np.inf
+    discarded = float(singular[rank]) if rank < singular.size else 0.0
+    gap = np.inf if discarded <= 0.0 else retained / discarded
+    if gap < min_singular_gap:
+        raise GeometryError(
+            "the equality constraints have no clear numerical rank: the smallest "
+            f"retained singular value is {retained:.3e} and the largest discarded one is "
+            f"{discarded:.3e}, a gap of "
+            f"only {gap:.1f}× (need {min_singular_gap:.0f}×). S is near-rank-deficient, so which "
+            "equalities are real is a decision the arithmetic cannot make — and the wrong answer "
+            "samples a set the model does not describe."
+        )
+
+    return DirectionSpace(
+        blocked=blocked,
+        row_space=np.ascontiguousarray(right[:rank].T),
+        moving=moving,
+        n_null=int(moving.size - rank),
+        singular_gap=gap,
+    )
+
+
+# ---- the orthonormal basis ----------------------------------------------------------------------
+
+
+def _allocate(n: int, columns: int, memory_limit_bytes: int, what: str) -> NDArray[np.float64]:
+    """Allocate an ``(n, columns)`` float64 block — but only after checking we are allowed to.
+
+    Spec §15.5: *"Do not allow the operating system to discover the limit by crashing."* The guard
+    runs before **every** allocation rather than once up front, because ``d`` is not known in
+    advance and the complement (``n − d`` columns) is usually the larger of the two.
+    """
+    needed = _BYTES_PER_FLOAT64 * n * max(columns, 1)
+    if needed > memory_limit_bytes:
+        raise GeometryError(
+            f"{what} needs {needed / 2**30:.4f} GiB ({n}×{columns} float64), but "
+            f"geometry.max_geometry_memory_gb allows {memory_limit_bytes / 2**30:.4f} GiB"
+        )
+    return np.zeros((n, max(columns, 1)), dtype=VALUE_DTYPE, order="F")
+
+
+class OrthonormalBasis:
+    """The discovered feasible directions, orthonormal in scaled coordinates.
+
+    Projection is **two-pass** (``v -= B(Bᵀv)``, applied twice) rather than one. A single pass loses
+    orthogonality when the vector being projected lies nearly inside the current span — which is
+    exactly the situation late in discovery, when the residuals under test are close to `rank_tol`.
+    The second pass restores orthogonality to machine precision (spec §15.5).
+    """
+
+    def __init__(self, n: int, *, memory_limit_bytes: int, block: int = BASIS_BLOCK) -> None:
+        self._n = n
+        self._block = block
+        self._columns = 0
+        self._memory_limit_bytes = memory_limit_bytes
+        self._storage = _allocate(n, min(block, max(n, 1)), memory_limit_bytes, "affine basis")
+
+    @property
+    def n_columns(self) -> int:
+        return self._columns
+
+    @property
+    def matrix(self) -> NDArray[np.float64]:
+        """The ``(n, d)`` basis — a Fortran-contiguous view of the block storage (spec §15.5)."""
+        return self._storage[:, : self._columns]
+
+    def remove_components(self, vector: NDArray[np.float64]) -> NDArray[np.float64]:
+        """``v − B Bᵀ v``, twice."""
+        residual = np.array(vector, dtype=VALUE_DTYPE, copy=True)
+        if self._columns == 0:
+            return residual
+        basis = self.matrix
+        for _ in range(2):
+            residual -= basis @ (basis.T @ residual)
+        return residual
+
+    def append_normalized(self, vector: NDArray[np.float64], *, rank_tol: float) -> None:
+        """Re-orthogonalize, normalize, and append. Refuses a vector the basis already spans."""
+        if self._columns >= self._n:
+            raise GeometryError(
+                f"cannot append a {self._n + 1}-th direction to a basis of ℝ^{self._n}"
+            )
+        residual = self.remove_components(vector)
+        norm = float(np.linalg.norm(residual))
+        if norm <= rank_tol:
+            raise GeometryError(
+                f"refusing to append a direction whose residual norm is {norm:.3e} (≤ rank_tol "
+                f"{rank_tol:.3e}) — it already lies in the discovered span"
+            )
+        if self._columns == self._storage.shape[1]:
+            self._grow()
+        self._storage[:, self._columns] = residual / norm
+        self._columns += 1
+
+    def _grow(self) -> None:
+        capacity = min(self._storage.shape[1] + self._block, self._n)
+        grown = _allocate(self._n, capacity, self._memory_limit_bytes, "affine basis")
+        grown[:, : self._columns] = self._storage[:, : self._columns]
+        self._storage = grown
+
+
+    @classmethod
+    def from_cache(cls, data: dict[str, Any]) -> SpanCertificate:
+        names = {f.name for f in fields(cls)}
+        missing = names - data.keys()
+        if missing:
+            raise GeometryError(f"cached span certificate lacks fields: {sorted(missing)}")
+        return cls(**{name: data[name] for name in names})
+
+
+def complement_basis(
+    basis_matrix: NDArray[np.float64],
+    n: int,
+    *,
+    rank_tol: float,
+    max_columns: int | None,
+    memory_limit_bytes: int,
+) -> NDArray[np.float64]:
+    """An orthonormal basis of ``range(B)ᗮ``, ordered by residual norm (BUILD_PLAN §1.4).
+
+    This is a column-pivoted QR of the projector ``I − BBᵀ``, run as Gram-Schmidt over the
+    coordinate axes, pivoting on the largest remaining residual (Businger–Golub). Ordering by
+    residual norm puts the axes *least* represented in ``B`` first, so a sweep that is going to
+    fail tends to fail early. The completeness argument needs all of them, and does not care in
+    what order they come.
+
+    The residual norm of axis ``i`` against an orthonormal set ``Q`` is ``1 − Σⱼ Q[i,j]²``, so the
+    pivot scores downdate in O(n) per column instead of being recomputed from scratch.
+    """
+    d = int(basis_matrix.shape[1])
+    target = n - d
+    if max_columns is not None:
+        target = min(target, max_columns)
+    if target <= 0:
+        return np.zeros((n, 0), dtype=VALUE_DTYPE, order="F")
+
+    complement = _allocate(n, target, memory_limit_bytes, "span-certificate complement")
+
+    scores = np.ones(n, dtype=VALUE_DTYPE)
+    if d:
+        scores -= np.einsum("ij,ij->i", basis_matrix, basis_matrix)
+
+    added = 0
+    while added < target:
+        axis = int(np.argmax(scores))
+        if scores[axis] <= rank_tol**2:
+            break  # every axis is (numerically) spanned — the complement is exhausted early
+
+        vector = np.zeros(n, dtype=VALUE_DTYPE)
+        vector[axis] = 1.0
+        for _ in range(2):  # two-pass, against B and against what we have built of the complement
+            if d:
+                vector -= basis_matrix @ (basis_matrix.T @ vector)
+            if added:
+                built = complement[:, :added]
+                vector -= built @ (built.T @ vector)
+
+        norm = float(np.linalg.norm(vector))
+        if norm <= rank_tol:
+            scores[axis] = -np.inf  # spanned after all; never pick this axis again
+            continue
+
+        column = vector / norm
+        complement[:, added] = column
+        scores -= column**2
+        np.maximum(scores, 0.0, out=scores)
+        added += 1
+
+    return complement[:, :added]
+
+
+def sweep_complement(
+
+    def to_flux(self, coordinates: NDArray[np.float64]) -> NDArray[np.float64]:
+        """``v = centre + diag(s)·B·q``. Takes one ``q`` or a batch of them."""
+        q = np.asarray(coordinates, dtype=VALUE_DTYPE)
+        if q.shape[-1:] != (self.dimension,):
+            raise ValueError(
+                f"coordinates have shape {q.shape}, expected trailing dimension {self.dimension}"
+            )
+        return self.center + (q @ self.basis.T) * self.scaling
+
+    def to_coordinates(self, flux: NDArray[np.float64]) -> NDArray[np.float64]:
+        """``q = Bᵀ·diag(s)⁻¹·(v − centre)`` — the inverse of `to_flux` on the affine hull."""
+        v = np.asarray(flux, dtype=VALUE_DTYPE)
+        if v.shape[-1:] != (self.n_free,):
+            raise ValueError(f"flux has shape {v.shape}, expected trailing dimension {self.n_free}")
+        return ((v - self.center) / self.scaling) @ self.basis
+
+    def content_key(self) -> str:
+        """The L3 cache key (§1.1): the polytope, the scaling, the basis, the code behind them.
+
+        ``support_points`` is hashed too (M10.2). It is a *field of this artifact*, and it is
+        load-bearing downstream in two places that outlive the geometry: `rounding.build_transform`
+        takes ``C_q`` from it, and `sparse_objective.choose_energy_scale` reads ``warmup_range``'s
+        ``s_J`` off it. Omitting it let two geometries agreeing on ``B`` but disagreeing on their
+        support hull hash **identically** — the M6 join again, one artifact further on.
+        """
+        return content_key(
+            polytope_key=self.polytope_key,
+            scaling=self.scaling,
+            basis=self.basis,
+            center=self.center,
+            support_points=self.support_points,
+            dimension=self.dimension,
+            geometry_impl_version=GEOMETRY_IMPL_VERSION,
+            backend_impl_version=BACKEND_IMPL_VERSION,
+            numpy_version=np.__version__,
+        )
+
+    def to_bundle(self) -> tuple[dict[str, NDArray[np.float64]], dict[str, Any]]:
+        """Split into ``(arrays, meta)`` for the content-addressed cache (`cache.ArtifactCache`).
+
+        M10.2 exists because this method did not. §1.1 has always said L3 "holds B, support_points,
+        centre, L (Cholesky), T, dimension, span certificate", but the only serializer in the
+        package was `rounding.RoundedTransform.to_bundle` — which holds ``T`` and ``L`` and neither
+        ``B`` nor ``s``. So a cache **hit** returned a transform and no geometry, and
+        `rounding.reround_transform` (which needs ``B``, ``s``, and this key) could not run: M10's
+        pilot DAG was reachable from the library and unreachable from the CLI. That was recorded as
+        a design fork; it was plan/code drift.
+        """
+        return (
+            {
+                "scaling": np.ascontiguousarray(self.scaling),
+                "basis": np.ascontiguousarray(self.basis),
+                "center": np.ascontiguousarray(self.center),
+                "support_points": np.ascontiguousarray(self.support_points),
+            },
+            {
+                "content_key": self.content_key(),
+                "polytope_key": self.polytope_key,
+                "certificate": self.certificate.to_cache(),
+                "diagnostics": self.diagnostics.to_cache(),
+            },
+        )
+
+    @classmethod
+    def from_bundle(
+        cls,
+        arrays: dict[str, NDArray[Any]],
+        meta: dict[str, Any],
+        reduced: ReducedPolytope,
+    ) -> ReducedGeometry:
+        """Rebuild a geometry cached by `to_bundle`, against the polytope it was built for.
+
+        Two guards, and they catch different things. The ``polytope_key`` check refuses the M6 join
+        — a geometry rebuilt against a *different* model's bounds. The ``content_key`` round-trip
+        then proves the reconstructed object **hashes to the key it was stored under**: the cache is
+        content-addressed, so an artifact that does not reproduce its own key is not the artifact
+        the key names, whatever its arrays look like.
+
+        The arrays are left writable, matching `build_geometry` exactly — a cached geometry must be
+        indistinguishable from a fresh one, and a reconstruction that hardened them differently
+        would be its own drift (M5 left ``center`` writable for its owner on purpose).
+        """
+        if meta["polytope_key"] != reduced.content_key():
+            raise GeometryError(
+                "cached geometry was built for a different polytope "
+                f"({str(meta['polytope_key'])[:16]}…) than the one it is being rebuilt against "
+                f"({reduced.content_key()[:16]}…)"
+            )
+        geometry = cls(
+            scaling=np.asarray(arrays["scaling"], dtype=VALUE_DTYPE),
+            # `(n_free, d)`, Fortran-contiguous — the layout the dataclass documents and the column
+            # reads want. `hash_array` C-orders before hashing, so this is a performance contract,
+            # never an identity one: the key below is order-blind by construction.
+            basis=np.asfortranarray(np.asarray(arrays["basis"], dtype=VALUE_DTYPE)),
+            center=np.asarray(arrays["center"], dtype=VALUE_DTYPE),
+            support_points=np.asarray(arrays["support_points"], dtype=VALUE_DTYPE),
+            certificate=SpanCertificate.from_cache(meta["certificate"]),
+            diagnostics=GeometryDiagnostics.from_cache(meta["diagnostics"]),
+            polytope_key=str(meta["polytope_key"]),
+        )
+        if geometry.content_key() != meta["content_key"]:
+            raise GeometryError(
+                "the rebuilt geometry does not reproduce its own cached content key "
+                f"({geometry.content_key()[:16]}… vs {str(meta['content_key'])[:16]}…); the stored "
+                "bytes are not the artifact this key names, so nothing downstream may trust it"
+            )
+        return geometry
+
+    def manifest(self) -> dict[str, Any]:
+        return {
+            "dimension": self.dimension,
+            "n_free": self.n_free,
+            "geometry_impl_version": GEOMETRY_IMPL_VERSION,
+            "content_key": self.content_key(),
+            **self.certificate.as_dict(),
+            **self.diagnostics.as_dict(),
+        }
+
+
+# ---- discovery (spec §15.3, §15.6) --------------------------------------------------------------
+# ---- discovery (spec §15.3, §15.6) --------------------------------------------------------------
+
+
+def build_geometry(
+    reduced: ReducedPolytope,
+    *,
+    config: GeometryConfig | None = None,
+    model_id: str = "model",
+) -> ReducedGeometry:
+    """Discover the affine basis, certify that it spans the polytope, and build a feasible centre.
+
+    The outer loop is what makes the certificate binding: discovery hands the sweep a basis, and a
+    sweep that *fails* hands discovery back the direction it was missing. Every failure raises the
+    dimension by one, so the loop runs at most ``n_free`` times — and it can only exit through a
+    clean sweep.
+    """
+    cfg = config if config is not None else GeometryConfig()
+    memory_limit_bytes = int(cfg.max_geometry_memory_gb * 2**30)
+
+    if reduced.is_singleton:
+        return _singleton_geometry(reduced, cfg)
+
+    n = reduced.n_free
+    scales = reaction_scales(reduced, floor=cfg.scale_floor)
+    n_floored = int(np.sum(reduced.upper_bounds - reduced.lower_bounds < cfg.scale_floor))
+    inverse_scale_norm = float(np.linalg.norm(1.0 / scales))
+    noise_ceiling = probe_noise_ceiling(inverse_scale_norm)
+
+    program = build_flux_lp(reduced, threads=1)
+    solves_at_start = program.solve_count
+    basis = OrthonormalBasis(n, memory_limit_bytes=memory_limit_bytes)
+    rng = np.random.default_rng(stream_seed(model_id=model_id, stage="geometry", seed=cfg.seed))
+
+    # FVA first: the reactions that cannot move are exact zeros of every feasible direction, and a
+    # basis that carries their noise instead corrupts the chord (module docstring, point 4). Then
+    # factor the space those directions must live in, so no candidate can pollute the basis.
+    blocked = blocked_reactions(reduced, program, tol=cfg.blocked_tol)
+    space = direction_space(
+        reduced,
+        scales,
+        blocked.mask,
+        memory_limit_bytes=memory_limit_bytes,
+        feasibility_tol=cfg.feasibility_tol,
+    )
+    _check_blocked_span(blocked, scales, cfg)
+
+    # A zero objective asks HiGHS for *any* feasible point — the seed of the support set (§15.6).
+    initial = program.maximize(np.zeros(n, dtype=VALUE_DTYPE))
+    support: list[NDArray[np.float64]] = [initial.primal]
+    iterations = initial.simplex_iterations
+
+    n_random_probes = 0
+    stall = 0
+    degenerate_draws = 0
+    while stall < cfg.stall_probes and basis.n_columns < n:
+        candidate = basis.remove_components(rng.normal(size=n))
+        norm = float(np.linalg.norm(candidate))
+        if norm <= cfg.rank_tol:
+            # The draw collapsed onto the basis. With d < n that has probability zero, so a run of
+            # them means the basis is not what it claims to be — fail loudly rather than spin.
+            degenerate_draws += 1
+            if degenerate_draws > MAX_DEGENERATE_DRAWS:
+                raise GeometryError(
+                    f"{MAX_DEGENERATE_DRAWS} consecutive random probes collapsed onto a "
+                    f"{basis.n_columns}-column basis of ℝ^{n} — the basis is not orthonormal"
+                )
+            continue
+        degenerate_draws = 0
+        n_random_probes += 1
+
+        probe = probe_direction(
+            program, reduced, basis, candidate / norm, scales, inverse_scale_norm, cfg, space
+        )
+        iterations += probe.simplex_iterations
+        if probe.is_new_direction:
+            _append(basis, probe, reduced, blocked, cfg)
+            support.extend([probe.v_plus, probe.v_minus])
+            stall = 0
+        else:
+            stall += 1
+
+
+def _validate(
+    *,
+    reduced: ReducedPolytope,
+    basis: NDArray[np.float64],
+    scales: NDArray[np.float64],
+    center: NDArray[np.float64],
+    clamp: float,
+    support_points: NDArray[np.float64],
+    blocked: BlockedReactions,
+    space: DirectionSpace,
+    config: GeometryConfig,
+    n_lp_solves: int,
+    n_random_probes: int,
+    n_sweeps: int,
+    simplex_iterations: int,
+    n_floored: int,
+    inverse_scale_norm: float,
+    noise_ceiling: float,
+) -> GeometryDiagnostics:
+    """The checks spec §15.4 and §16 demand — each a hard failure, none of them a warning."""
+    d = int(basis.shape[1])
+
+    orthonormality_error = 0.0
+    if d:
+        gram = basis.T @ basis
+        orthonormality_error = float(np.max(np.abs(gram - np.eye(d))))
+        if orthonormality_error > ORTHONORMALITY_TOL:
+            raise GeometryError(
+                f"‖BᵀB − I‖_max = {orthonormality_error:.3e} exceeds {ORTHONORMALITY_TOL:.1e}"
+            )
+
+    # A blocked reaction contributes an identically zero component to every feasible direction. The
+    # projection in `probe_direction` makes that true by construction, so this is an invariant
+    # check, not a tolerance: any nonzero here means a direction escaped the projection.
+    if d and np.any(basis[blocked.mask, :] != 0.0):
+        offender = float(np.max(np.abs(basis[blocked.mask, :])))
+        raise GeometryError(
+            f"the basis is nonzero ({offender:.3e}) on a reaction FVA proved cannot move — a "
+            "candidate direction reached the basis without being projected"
+        )
+
+    # ‖S·diag(s)·B‖_max, column by column through the reference CSC matvec (spec §15.4). A basis
+    # direction that fails this is not a direction of the polytope at all: moving along it breaks
+    # the steady state — and the chord, which only ever looks at bounds, would never notice.
+    #
+    # The bar is *relative*, for the same reason `_check_mass_balance` uses one. Forming
+    # ``S·diag(s)·b``
+    # sums terms of size ‖S·diag(s)‖, so simply evaluating it costs that much times eps: ~1e-11 on
+    # the
+    # example model, but ~1e-6 on a polytope with bounds of 1e10. An absolute 1e-9 would call the
+    # second one broken while it is merely *large*, and no basis could ever pass.
+    mass_balance_error = 0.0
+    for column in range(d):
+        direction = scales * basis[:, column]
+        residual = float(
+            np.max(np.abs(reduced.stoichiometry.matvec(direction)), initial=0.0)
+        )
+        magnitude = float(
+            np.max(reduced.stoichiometry.cancellation_scale(direction), initial=0.0)
+        )
+        floor = magnitude * float(np.finfo(VALUE_DTYPE).eps) * reduced.n_free
+        if residual > max(config.feasibility_tol, MASS_BALANCE_SAFETY * floor):
+            raise GeometryError(
+                f"basis direction {column} has a mass-balance residual of {residual:.3e}, beyond "
+                f"both the feasibility tolerance ({config.feasibility_tol:.1e}) and the "
+                f"{floor:.3e} that evaluating S·diag(s)·b in float64 could account for — it is not "
+                "a direction of the polytope, and the chord would never notice"
+            )
+        mass_balance_error = max(mass_balance_error, residual)
+
+    center_residual = float(np.max(np.abs(reduced.mass_balance_residual(center)), initial=0.0))
+    if center_residual > config.feasibility_tol:
+        raise GeometryError(
+            f"the centre's mass-balance residual is {center_residual:.3e}, above the feasibility "
+            f"tolerance {config.feasibility_tol:.1e}. Re-solve the support LPs at a tighter "
+            "tolerance — do not clip the centre, which would break S·v = rhs (spec §16)"
+        )
+
+    lower_slack = float(np.min(center - reduced.lower_bounds, initial=np.inf))
+    upper_slack = float(np.min(reduced.upper_bounds - center, initial=np.inf))
+    center_bound_slack = min(lower_slack, upper_slack)
+    if center_bound_slack < 0.0:
+        raise GeometryError(
+            f"the centre violates a bound by {-center_bound_slack:.3e} after clamping — "
+            "np.clip should have made this impossible"
+        )
+
+    min_chord = _min_chord_at_center(reduced, basis, scales, center, config)
+
+    # The support points must span every discovered direction, or M5's covariance is rank-deficient
+    # and its ridge would hide the fact. Coordinates, not fluxes: the flux vectors also vary in
+    # directions the basis does not span.
+    support_rank = 0
+    if d:
+        coordinates = ((support_points - center) / scales) @ basis
+        support_rank = int(np.linalg.matrix_rank(coordinates))
+        if support_rank != d:
+            raise GeometryError(
+                f"the {support_points.shape[0]} support points span only {support_rank} of the {d} "
+                "discovered directions, so their covariance is singular — M5's rounding ridge "
+                "would conceal that rather than fail on it"
+            )
+
+    return GeometryDiagnostics(
+        n_free=reduced.n_free,
+        dimension=d,
+        n_blocked=blocked.n_blocked,
+        blocked_separation=blocked.separation,
+        n_support_points=int(support_points.shape[0]),
+        n_lp_solves=n_lp_solves,
+
+codex
+The first important split is now clear: §1.2’s text is inside the sampling-worker performance design, while the defective computation is parent-side L3 construction. They are separate requirements. I’m checking two implementation details before committing to a verdict: whether import-time environment forcing can work for callers that already loaded NumPy, and what numerical scope a scoped limiter would actually need to cover.
+exec
+/bin/bash -lc "sed -n '1,220p' src/gsmm_compiler/__init__.py" in /home/mcpu/GitHub/gsmm_compiler_maxent_sampling
+ succeeded in 0ms:
+"""GSMM-Compiler: sparse-objective maximum-entropy flux sampler for genome-scale models.
+
+Importing this package must **not** pull in the cobra/optlang parser stack or HiGHS: MCMC worker
+processes import only the numerical core (see BUILD_PLAN.md §1.2). Submodules are therefore never
+re-exported here; import them explicitly.
+"""
+
+__version__ = "0.1.0.dev0"
+
+__all__ = ["__version__"]
+
+exec
+/bin/bash -lc "rg -n -g '"'!.claude/**'"' \"threadpoolctl|dependencies|numpy|highspy\" pyproject.toml uv.lock" in /home/mcpu/GitHub/gsmm_compiler_maxent_sampling
+ succeeded in 0ms:
+pyproject.toml:13:dependencies = [
+pyproject.toml:14:    "numpy>=1.26",
+pyproject.toml:15:    "highspy>=1.7",
+pyproject.toml:19:[project.optional-dependencies]
+pyproject.toml:54:module = ["cobra.*", "highspy.*"]
+uv.lock:18:dependencies = [
+uv.lock:74:dependencies = [
+uv.lock:79:    { name = "numpy" },
+uv.lock:126:[package.optional-dependencies]
+uv.lock:153:dependencies = [
+uv.lock:155:    { name = "highspy" },
+uv.lock:156:    { name = "numpy" },
+uv.lock:159:[package.optional-dependencies]
+uv.lock:170:    { name = "highspy", specifier = ">=1.7" },
+uv.lock:172:    { name = "numpy", specifier = ">=1.26" },
+uv.lock:189:name = "highspy"
+uv.lock:192:dependencies = [
+uv.lock:193:    { name = "numpy" },
+uv.lock:195:sdist = { url = "https://files.pythonhosted.org/packages/87/02/c6b658f79911fee921721da728b9ab8f5e19ff06121fff36f90f77127f4d/highspy-1.15.1.tar.gz", hash = "sha256:20ed2fbf1cb64bf3044ee6632364b7e2653d93e6901e2b19fd3d5df10702e8c5", size = 1703256, upload-time = "2026-07-02T12:03:25.009Z" }
+uv.lock:197:    { url = "https://files.pythonhosted.org/packages/5d/69/74e9614a6e49f5e07fbb91a5cebad79bd31903888ca6b4f1c75dcf01df3b/highspy-1.15.1-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:45eb9f022f9083ef2e56d66f972d5fd40e6634f4497194b1f3f215ca0e8ea958", size = 4871151, upload-time = "2026-07-02T12:01:42.702Z" },
+uv.lock:198:    { url = "https://files.pythonhosted.org/packages/8b/5d/815b8f0488fda02e765b85e7a1ed2bf26b7d705fb1240ca842c4493d9414/highspy-1.15.1-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:4b4c7e7af8d7927ed77836e9b869cbae55d6a74b85bb90d04776440b5e14c32b", size = 4468478, upload-time = "2026-07-02T12:01:44.995Z" },
+uv.lock:199:    { url = "https://files.pythonhosted.org/packages/bb/ea/def24ab38ff3ea983eb197dcbf01ec9ad82e2aa3380b72f01792486865e1/highspy-1.15.1-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:070c1ce9238b9e8b4c273253647ab0dbafc1839c195a52c7ef1eeb7ef6976f05", size = 4634480, upload-time = "2026-07-02T12:01:46.822Z" },
+uv.lock:200:    { url = "https://files.pythonhosted.org/packages/ed/bb/0588b8137df2a0ae55a9a8ad40eff40561b60d6f76dbffd5ab4f4f6095f0/highspy-1.15.1-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a24329c328942b37a6a318ecf163d07dd387974f071b98b4498725eaea80f06f", size = 5035498, upload-time = "2026-07-02T12:01:48.717Z" },
+uv.lock:201:    { url = "https://files.pythonhosted.org/packages/f2/50/5196e807cec6847b2bee8ceefb080b8175ea81aaa673249678398cf3181c/highspy-1.15.1-cp311-cp311-manylinux_2_26_i686.manylinux_2_28_i686.whl", hash = "sha256:138506088c7f6106cbb58d1cd0ef14793dfb47477fd83a7ae0db5b104d1cf969", size = 5857714, upload-time = "2026-07-02T12:01:51.04Z" },
+uv.lock:202:    { url = "https://files.pythonhosted.org/packages/32/25/80c96a11bcf3bdf4ffaa7b1e26629b6da340703b2bbc4e0349d40d7a8aaa/highspy-1.15.1-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:00e1c13912501e96893136a1805b56b74cb4868fa04c1c2eacc5c0454304e08e", size = 6191044, upload-time = "2026-07-02T12:01:52.856Z" },
+uv.lock:203:    { url = "https://files.pythonhosted.org/packages/11/10/27a7b87dbf56ab88d223fb9f1b6917c9df259c09980460ff56731c2406ef/highspy-1.15.1-cp311-cp311-musllinux_1_2_i686.whl", hash = "sha256:0b5be1c777d0b57b6dc26e1d9754923e642a17c6313bcdf5186473644b214f0b", size = 7234613, upload-time = "2026-07-02T12:01:54.936Z" },
+uv.lock:204:    { url = "https://files.pythonhosted.org/packages/a7/1e/82159a50b8a17daf2e94453a8e0af3e381943223727fd9db6d4bebc1533a/highspy-1.15.1-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:5de2dddc554442f3572bb4a36116278bee79568fbd726a697251d2606b79a5a1", size = 6632799, upload-time = "2026-07-02T12:01:57.967Z" },
+uv.lock:205:    { url = "https://files.pythonhosted.org/packages/3c/69/59d4303d38d6c48cc6f79c12b11f756b381e8e5eed5c0733d8c82317240f/highspy-1.15.1-cp311-cp311-win32.whl", hash = "sha256:605d3204e41a465f9ce2f254571a90e8781605451a5e6a548f6b4be8988afb4f", size = 2304839, upload-time = "2026-07-02T12:01:59.752Z" },
+uv.lock:206:    { url = "https://files.pythonhosted.org/packages/48/45/6714276be39f1f0f7c2795fb466c39640bbcc541e151342f05f61d2f24a5/highspy-1.15.1-cp311-cp311-win_amd64.whl", hash = "sha256:4715fcfbcff50fdbcc288499116f7e5722a9f9d2647087d54317febb94ec2b32", size = 2709129, upload-time = "2026-07-02T12:02:01.722Z" },
+uv.lock:213:dependencies = [
+uv.lock:226:dependencies = [
+uv.lock:280:dependencies = [
+uv.lock:310:dependencies = [
+uv.lock:339:name = "numpy"
+uv.lock:342:sdist = { url = "https://files.pythonhosted.org/packages/d0/ad/fed0499ce6a338d2a03ebae59cd15093910c8875328855781952abf6c2fe/numpy-2.4.6.tar.gz", hash = "sha256:f3a3570c4a2a16746ac2c31a7c7c7b0c186b95ce902e33db6f28094ed7387dda", size = 20735807, upload-time = "2026-05-18T23:37:14.07Z" }
+uv.lock:344:    { url = "https://files.pythonhosted.org/packages/b3/49/ec46835a70be8fa6446c495126ac84fdb28cb2558e1620ffb87a10c8b64c/numpy-2.4.6-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:0280e0356c0829a18d9de1cb7eee50ec22ca639878d7240307ca0943d73cd2c4", size = 16969194, upload-time = "2026-05-18T23:33:13.503Z" },
+uv.lock:345:    { url = "https://files.pythonhosted.org/packages/0e/0d/f5957185c0ee2f3e12f78715aa9e3b353fd83633316c8532b38faa37e3f6/numpy-2.4.6-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:110f8b71aacb688ec69062bb7f6938a0f8acb01b7c1c4beb453c65b6d234584d", size = 14964111, upload-time = "2026-05-18T23:33:17.795Z" },
+uv.lock:346:    { url = "https://files.pythonhosted.org/packages/ad/40/40a40ee0ddf7ceb782c49af278894b686e586d65d8c1889c8b5da01a3d7d/numpy-2.4.6-cp311-cp311-macosx_14_0_arm64.whl", hash = "sha256:4cfe66903cc32a9921a6733d96b19bb6abf310397581bbad89c228f5abaf0ee8", size = 5469159, upload-time = "2026-05-18T23:33:20.654Z" },
+uv.lock:347:    { url = "https://files.pythonhosted.org/packages/63/13/f9a8046535cb21deae82f8d03de9617e08882d274fad2539630761888228/numpy-2.4.6-cp311-cp311-macosx_14_0_x86_64.whl", hash = "sha256:8155154c7c691289fe18f510b5d4657c68c67989f293f0535a91360392ff6538", size = 6798936, upload-time = "2026-05-18T23:33:22.987Z" },
+uv.lock:348:    { url = "https://files.pythonhosted.org/packages/33/a8/6fa8c1a345a8c85dbb21932c447bee07c30a2c2a3f31e369c0a84b300147/numpy-2.4.6-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:0ab0a9c4ffb1a6d95ef519fe4247dba8eb6b18ad93999f76b7f657039acabd47", size = 15966692, upload-time = "2026-05-18T23:33:26.62Z" },
+uv.lock:349:    { url = "https://files.pythonhosted.org/packages/02/03/74fe2a4cb3817d94d86402f2506554130a2f01414e299b5a843e5a8a957f/numpy-2.4.6-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:89cd468399cfd2504718f0ba50e410dca55a170b61a02ad92bb18c8a65186e93", size = 16918164, upload-time = "2026-05-18T23:33:29.955Z" },
+uv.lock:350:    { url = "https://files.pythonhosted.org/packages/c5/80/3615be3313f7e7696609bc194b9f0101da809df79e859bdb84e0cd043f46/numpy-2.4.6-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:c2d37ab77531417474168eb79d6d80b14f821a966818505d03013d0833edb7a8", size = 17322877, upload-time = "2026-05-18T23:33:34.724Z" },
+uv.lock:351:    { url = "https://files.pythonhosted.org/packages/ca/ac/a691e0fe2675e370d0e08ff905adc49a1c8830e8cae03efe4477e92cd55d/numpy-2.4.6-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:f407cb6b8e9d6d8c626bc73c945db1706035af8fd632295547bf1c9e46d092d6", size = 18651487, upload-time = "2026-05-18T23:33:38.217Z" },
+uv.lock:352:    { url = "https://files.pythonhosted.org/packages/15/a7/9bc1cd626d7bf6869bfedf27b91b6ab5dd607758bf8e959d6fa80c6a59cb/numpy-2.4.6-cp311-cp311-win32.whl", hash = "sha256:ddea102b48f9e339f3948bf22040944184627a30fdf7f858667673b9c5f033c8", size = 6233945, upload-time = "2026-05-18T23:33:41.331Z" },
+uv.lock:353:    { url = "https://files.pythonhosted.org/packages/c5/31/7fc6239c12bce7e931463251cca4426c465e1876ba3cc785402ef4dd8f4e/numpy-2.4.6-cp311-cp311-win_amd64.whl", hash = "sha256:1e254a00cdf42b1e4d5b3d68d33af63268d41340d8885df2ab6470f2e1500147", size = 12608406, upload-time = "2026-05-18T23:33:44.131Z" },
+uv.lock:354:    { url = "https://files.pythonhosted.org/packages/27/83/140f85a466595a16382996a1bf06b2b54bcd597488921b0c9daaeeda72af/numpy-2.4.6-cp311-cp311-win_arm64.whl", hash = "sha256:ed9749eef4cbd126da3dc1d6bcb3a57f5eb7ac6a6484146bdbf743f552dfc577", size = 10479528, upload-time = "2026-05-18T23:33:50.725Z" },
+uv.lock:355:    { url = "https://files.pythonhosted.org/packages/de/12/b422cc84439adc0d00de605bf4a308890ae5c26f2c71fbd73e5d08fbb0dd/numpy-2.4.6-pp311-pypy311_pp73-macosx_10_15_x86_64.whl", hash = "sha256:55cced7c52e981362f708ad635198e97a752dfba412cc03c23bbf3bd8d5cd662", size = 16847511, upload-time = "2026-05-18T23:36:50.673Z" },
+uv.lock:356:    { url = "https://files.pythonhosted.org/packages/44/53/f481bef68011740f8849418d82db07230e825013f31f4eef5ba5b805316a/numpy-2.4.6-pp311-pypy311_pp73-macosx_11_0_arm64.whl", hash = "sha256:d6da64deb6b8ed903e7560180a92f2d804ee1ba5eeb849ac2748b8c1aba1f6d7", size = 14889064, upload-time = "2026-05-18T23:36:53.879Z" },
+uv.lock:357:    { url = "https://files.pythonhosted.org/packages/7f/57/42ed575c10ced8af951d426bc4e1f8aff16fd851db33f067036215a7f860/numpy-2.4.6-pp311-pypy311_pp73-macosx_14_0_arm64.whl", hash = "sha256:68a5124b13fa6cc2086764a20005d30bc0548146f7f5322f02fce212ca14317f", size = 5394157, upload-time = "2026-05-18T23:36:57.194Z" },
+uv.lock:358:    { url = "https://files.pythonhosted.org/packages/6a/ef/f66cc724fcc36c1e364c67f51ae9146090b8b584f27d58b97fdae3edd737/numpy-2.4.6-pp311-pypy311_pp73-macosx_14_0_x86_64.whl", hash = "sha256:948424b06129ce883307e8cff868c31396d8dc7630a59c61d70d98dbe70f222c", size = 6708728, upload-time = "2026-05-18T23:36:59.575Z" },
+uv.lock:359:    { url = "https://files.pythonhosted.org/packages/1a/9c/c531f2293b91265d8b48e9b329f54fdd7ffae73cb4134ea10cca4237e9cc/numpy-2.4.6-pp311-pypy311_pp73-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:5dbbdb29840ca3d91ee0fece42fc29278886d908280bfec0a5846c6f901a3eb0", size = 15798374, upload-time = "2026-05-18T23:37:02.674Z" },
+uv.lock:360:    { url = "https://files.pythonhosted.org/packages/1a/b0/413077f6b1153ed3cba361401c6783bbad6114804a000cc22eb71c13e190/numpy-2.4.6-pp311-pypy311_pp73-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:8ad03c0965fb3c692200e74d458ca28c1dbb4ce96f9a479a8aa041ad5fabca02", size = 16747286, upload-time = "2026-05-18T23:37:06.327Z" },
+uv.lock:361:    { url = "https://files.pythonhosted.org/packages/15/ce/e5ec180bc41812edcd8daeb8639d205622c0e8c02259d8ab25a0201b3c2a/numpy-2.4.6-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:2803abfebfc990042cd494d8ce2d5f82e9d847af6d35ec486923aa19dbad5e73", size = 12504263, upload-time = "2026-05-18T23:37:09.715Z" },
+uv.lock:368:dependencies = [
+uv.lock:390:dependencies = [
+uv.lock:391:    { name = "numpy" },
+uv.lock:429:dependencies = [
+uv.lock:444:dependencies = [
+uv.lock:491:dependencies = [
+uv.lock:507:dependencies = [
+uv.lock:521:dependencies = [
+uv.lock:556:dependencies = [
+uv.lock:626:dependencies = [
+uv.lock:665:dependencies = [
+
+codex
+The scoped limiter has two non-obvious costs: it changes a process-global native-library setting while active (so concurrent library users can be affected), and it requires invalidating the existing L3 key; otherwise old ambient-thread artifacts remain valid cache hits. Also, import-time environment forcing is not reliable if the host application imported NumPy first. I’m verifying the cross-machine reproducibility boundary against primary documentation now.
+web search: 
+web search: site:github.com/joblib/threadpoolctl threadpool_limits global effect documentation ...
+web search: 
+web search: threadpoolctl official README threadpool_limits global impact context manager limitations github joblib ...
+exec
+/bin/bash -lc "rg -n -g '"'!.claude/**'"' \"geometry_manifest|geometry_key|geometry_content|content_key\\(\\).*geometry|l3|geometry_meta|reports\" src/gsmm_compiler/batch.py" in /home/mcpu/GitHub/gsmm_compiler_maxent_sampling
+ succeeded in 0ms:
+220:    reports: dict[str, Any] = field(default_factory=dict)
+254:    geometry, bootstrap, geometry_meta = _load_or_build_geometry(
+269:            geometry_meta["reachability_certificate"]
+301:        reports={
+304:            "geometry": geometry_meta["geometry_manifest"],
+425:def build_l3_bundle(
+447:    geometry_arrays, geometry_meta = geometry.to_bundle()
+458:            "geometry": geometry_meta,
+460:            "geometry_manifest": geometry.manifest(),
+476:        arrays, meta = build_l3_bundle(reduced, config, model_id=model_id)
+480:            GEOMETRY_CACHE_LAYER, key, lambda: build_l3_bundle(reduced, config, model_id=model_id)
+492:    # On **every** path, not just the miss. `build_l3_bundle` already gated what it built, so this
+840:            **plan.reports,
+
+exec
+/bin/bash -lc "sed -n '190,325p' src/gsmm_compiler/batch.py
+sed -n '800,845p' src/gsmm_compiler/batch.py" in /home/mcpu/GitHub/gsmm_compiler_maxent_sampling
+ succeeded in 0ms:
+    seen: dict[str, str] = {}
+    for spec in specs:
+        key = spec.model_id or Path(spec.model_path).stem
+        if key in seen:
+            raise BatchError(
+                f"two manifest rows resolve to model_id {key!r} ({seen[key]} and "
+                f"{spec.model_path}); give one an explicit distinct model_id"
+            )
+        seen[key] = spec.model_path
+
+
+# ---- per-model preparation (parent-only: this is the sole cobra/HiGHS path) ---------------------
+
+
+@dataclass(frozen=True)
+class ModelPlan:
+    """Everything a model's ``(β, chain)`` units need — frozen arrays, all picklable to workers."""
+
+    model_id: str
+    reduced: ReducedPolytope
+    transform: RoundedTransform
+    objective: ReducedObjective
+    energy_scale_value: float
+    j_star: float
+    optimum_coordinates: NDArray[np.float64] | None
+    movable: NDArray[np.intp]
+    storage: SampleStorage
+    sampler: Any  # SamplerConfig
+    near_zero_thresholds: tuple[float, ...]
+    feasibility_tol: float
+    reports: dict[str, Any] = field(default_factory=dict)
+    """The heavy human-facing manifests (model report, objective, geometry, energy scale) — kept out
+    of the pickled worker payload by living only on the parent's plan, never on a `SampleJob`."""
+
+
+def prepare_model(
+    spec: ModelSpec, config: Config, *, cache: ArtifactCache | None = None
+) -> ModelPlan:
+    """Run L0→L3, calibrate, and return the frozen artifacts its chains sample from.
+
+    Imports cobra lazily (parsing is the one place it is needed) so the module stays worker-safe.
+    The geometry — the expensive, β-independent stage — goes through the cache; the rest is cheap
+    enough to recompute each run.
+
+    **Every run goes through `calibration.calibrate`, with no branch** (M10.2). With the pilot
+    switches off it returns ``T₀`` and the support-vertex ``s_J`` unchanged, so v1's numbers keep
+    v1's labels; with them on it runs the pilot DAG. Routing the default path through the same call
+    is deliberate — a second, uncalibrated code path is how the two would drift apart, and this
+    package has spent two milestones on artifacts that never met.
+    """
+    from gsmm_compiler.model_input import load_canonical_model  # cobra; parent-only
+
+    biomass_id = spec.biomass_id or config.model.biomass_id
+    # L0 (M10.2d). Measured warm, this was the whole remaining serial term: 1.157 s, of which 0.65 s
+    # is cobra's *import* — which a hit skips too, because `load_model` imports it lazily and the
+    # lookup key reads cobra's version from package metadata.
+    canonical = load_canonical_model(spec.model_path, biomass_id, cache=cache)
+    model_id = spec.model_id or canonical.model_id
+    reduced = canonical.polytope.reduce()
+
+    resolved = resolve_objective(canonical.polytope, reduced, config.objective)
+    lowered = lower_objective(reduced, resolved.objective)
+    solution = solve_sparse_objective(reduced, resolved.objective)
+
+    geometry, bootstrap, geometry_meta = _load_or_build_geometry(
+        reduced, config, model_id=model_id, cache=cache
+    )
+
+    calibration = calibrate(
+        geometry,
+        reduced,
+        bootstrap,
+        lowered,
+        model_id=model_id,
+        optimum=solution.optimum,
+        sampler=config.sampler,
+        # The proof `_load_or_build_geometry` already checked, handed on rather than recomputed:
+        # the pilots are chains stepping in T₀'s frame, so T₀ must be certified before them.
+        bootstrap_certificate=ReachabilityCertificate.from_cache(
+            geometry_meta["reachability_certificate"]
+        ),
+        geometry_config=config.geometry,
+        # In T₀'s frame; `calibrate` returns it in the final transform's frame. Production only —
+        # it never reaches a pilot (`calibration.NeutralPilot`).
+        optimum_coordinates=bootstrap.to_coordinates(reduced.to_reduced(solution.optimum.v_full)),
+        # The same store the geometry came from. The pilots are the expensive node in the DAG —
+        # 19.3 s measured against geometry's 1.17 s — so a `--cache-dir` run that cached the cheap
+        # stage and recomputed the expensive one was 16.4× upside-down (§1.6.7, M10.2b).
+        cache=cache,
+    )
+    transform = calibration.transform
+    scale = calibration.energy_scale
+    optimum_coordinates = calibration.optimum_coordinates
+
+    return ModelPlan(
+        model_id=model_id,
+        reduced=reduced,
+        transform=transform,
+        objective=lowered,
+        energy_scale_value=scale.value,
+        j_star=scale.j_star,
+        optimum_coordinates=(
+            None
+            if optimum_coordinates is None
+            else np.ascontiguousarray(optimum_coordinates, dtype=np.float64)
+        ),
+        movable=movable_reactions(transform),
+        storage=SampleStorage.from_config(config.output),
+        sampler=config.sampler,
+        near_zero_thresholds=config.objective.near_zero_thresholds,
+        feasibility_tol=config.geometry.feasibility_tol,
+        reports={
+            "model_report": canonical.report(),
+            "objective": lowered.manifest(),
+            "geometry": geometry_meta["geometry_manifest"],
+            "energy_scale": scale.manifest(),
+            "calibration": calibration.manifest(),
+            # The certificate of the transform **this run samples**, in report form. Under
+            # re-rounding that is T₁, not T₀ — reporting the bootstrap's certificate here while
+            # production steps in T₁'s frame would be this package's signature bug (a manifest
+            # describing an artifact that was not used), committed in the milestone about it.
+            "reachability_certificate": calibration.certificate_report(),
+            "lp_optimum": solution.diagnostics(),
+            "config": config.as_dict(),
+            "provenance": Provenance.capture().as_dict(),
+            # The reaction axis, so cross-model aggregation can label full-length flux columns and
+            # pick out exchanges without re-parsing the model (which would need cobra).
+            "axes": {
+                "reaction_ids": list(canonical.polytope.reaction_ids),
+                "exchange_mask": canonical.exchange_mask.astype(bool).tolist(),
+                "n_chains": int(config.sampler.n_chains),
+                "activity_threshold": float(min(config.objective.near_zero_thresholds)),
+            },
+        },
+    )
+
+    return {
+        "model_id": manifest["model_id"],
+        "beta": manifest["beta"],
+        "beta_index": manifest["beta_index"],
+        "chain_index": manifest["chain_index"],
+        "diagnostics": manifest["diagnostics"],
+        "trace_summary": manifest["trace_summary"],
+    }
+
+
+def _write_model_manifest(
+    plan: ModelPlan, layout: RunLayout, summaries: dict[tuple[int, int], dict[str, Any]]
+) -> None:
+    units = [summaries[key] for key in sorted(summaries)]
+    ladder = [
+        {
+            "beta": float(beta),
+            "beta_index": beta_index,
+            "mean_j": float(
+                np.mean(
+                    [
+                        u["trace_summary"]["mean_j"]
+                        for u in units
+                        if u["beta_index"] == beta_index
+                    ]
+                )
+            ),
+        }
+        for beta_index, beta in enumerate(plan.sampler.betas)
+    ]
+    layout.model_dir(plan.model_id).mkdir(parents=True, exist_ok=True)
+    write_json(
+        layout.model_manifest_path(plan.model_id),
+        {
+            "model_id": plan.model_id,
+            "n_units": len(units),
+            "betas": [float(b) for b in plan.sampler.betas],
+            "store_mode": plan.storage.mode,
+            "ladder": ladder,
+            "units": units,
+            **plan.reports,
+        },
+    )
+
+
+def _mark_model_complete(model_id: str, layout: RunLayout) -> None:
+
+web search: 
+web search: https://github.com/joblib/threadpoolctl
+web search: 
+web search: 'global effect'
+codex
+Choose B, scoped around the entire L3 writer—not merely the Gram–Schmidt expressions.
+
+1. Fix and costs
+
+Wrap all of `build_l3_bundle()` in a single-threaded BLAS context. That covers:
+
+- `build_geometry()`, including the SVD, direction-space projection, Gram–Schmidt, complement construction, norms, and rank checks in [affine_geometry.py](/home/mcpu/GitHub/gsmm_compiler_maxent_sampling/src/gsmm_compiler/affine_geometry.py:350).
+- `build_transform()`, so T0 is reproducible under the same policy.
+- Reachability certification, insofar as it performs BLAS/LAPACK work involving T0.
+
+`build_l3_bundle()` is the correct boundary because it is deliberately the sole L3 writer in [batch.py](/home/mcpu/GitHub/gsmm_compiler_maxent_sampling/src/gsmm_compiler/batch.py:425). Wrapping only `OrthonormalBasis.remove_components()` would miss SVD-derived projections, complement construction, T0, and validation.
+
+Costs not yet priced:
+
+- `GEOMETRY_IMPL_VERSION` must be bumped. Otherwise the existing `e9d6…` entries remain hits and the fix does nothing for warmed caches.
+- `threadpoolctl` changes native-library state, which can be process-wide depending on the backend. Concurrent threads doing unrelated BLAS work may temporarily be restricted too. Its scope semantics explicitly vary between OpenMP and OpenBLAS backends. [threadpoolctl documentation](https://github.com/joblib/threadpoolctl#setting-the-maximum-size-of-thread-pools)
+- The whole L3 numerical section becomes serial, not just four projections. Probably cheap here, but it should be benchmarked.
+- The supported numerical backends need defining. Inside the context, inspect detected BLAS controllers and verify that recognized pools report one thread; otherwise “pinning” is only an intention.
+- Add separate-process regression tests for ambient, 1, and 4 threads, comparing basis, T0, and complete L3 content hashes. Also verify that the caller’s environment and prior thread limits are restored.
+
+A is inferior because package import may occur after the host application has already initialized NumPy/BLAS. It therefore combines global environment mutation with an incomplete guarantee. C describes one known hidden input but leaves the operational failure and all other backend differences. D is not mathematical fantasy, but it is not a 260×46 Gram–Schmidt change: strict determinism would also require specified SVD, norm, projection, rank, Cholesky, and certificate reductions. A performant implementation likely means a compiled deterministic numerical kernel, not a few Python loops.
+
+If `threadpoolctl`’s process-global effect is unacceptable, the serious E is a dedicated L3 subprocess launched with an explicit environment before NumPy import. That gives stronger isolation but adds serialization, lifecycle, error-propagation, and packaging complexity. B is proportionate here.
+
+2. What one thread promises
+
+One thread is sufficient to remove the measured thread-dependent reduction ordering on the tested installation. It is not sufficient for universal byte reproducibility.
+
+At fixed thread count, different BLAS/LAPACK libraries, versions, builds, and CPU-selected SIMD kernels may use different operation orders. OpenBLAS explicitly supports runtime CPU-specific kernel selection, while Intel documents that ordinary BLAS execution need not be bitwise reproducible and provides separate conditional-reproducibility modes. [OpenBLAS architecture dispatch](https://github.com/OpenMathLib/OpenBLAS#support-for-multiple-targets-in-a-single-library), [oneMKL numerical reproducibility](https://www.intel.com/content/www/us/en/docs/onemkl/developer-reference-dpcpp/2025-0/numerical-reproducibility.html). NumPy itself notes that the same NumPy version linked against different LAPACK implementations or built on different platforms can produce different numerical results. [NumPy NEP 19](https://numpy.org/neps/nep-0019-rng-policy.html)
+
+Therefore distinguish two keys:
+
+- A recipe/lookup key: declared mathematical inputs, implementation versions, determinism policy, and a numerical-runtime compatibility profile.
+- A content key: a hash of the actual serialized artifact bytes.
+
+The code already has this distinction in substance: `geometry_cache_key()` is the recipe key, while `ReducedGeometry.content_key()` hashes the scaling, basis, center, and support points in [affine_geometry.py](/home/mcpu/GitHub/gsmm_compiler_maxent_sampling/src/gsmm_compiler/affine_geometry.py:1238). They should be named and documented as different promises.
+
+I would revise §1.1 to say:
+
+> Within a declared numerical-runtime compatibility profile, a recipe key must rebuild deterministically. Every stored artifact also has a content hash of its serialized fields. Across profiles, byte equality is not promised; backend changes must either miss the recipe cache or be explicitly accepted as semantic, certificate-validated portability.
+
+A strict runtime profile would include at least BLAS/LAPACK vendor, version/build, selected architecture/kernel class, solver version/settings, and the one-thread policy. Unrestricted cross-machine cache sharing and strict byte identity cannot both be promised with ordinary floating-point libraries.
+
+3. Worker oversubscription versus geometry correctness
+
+They are separate requirements sharing a mechanism.
+
+Section 1.2 places the environment rule under sampling workers in [BUILD_PLAN.md](/home/mcpu/GitHub/gsmm_compiler_maxent_sampling/BUILD_PLAN.md:122). Its reason is resource control. Geometry determinism is a parent-side numerical correctness/reproducibility policy and should have its own name, scope, tests, versioning, and manifest fields.
+
+There is also a subtle correction to the alleged drift: although [batch.py](/home/mcpu/GitHub/gsmm_compiler_maxent_sampling/src/gsmm_compiler/batch.py:687) imports NumPy before calling `_limit_thread_env()`, it calls the function before creating spawned processes. Those new interpreters inherit the environment before importing their own NumPy. The initializer is late and largely redundant; the parent-side pre-spawn call is what matters. The real worker-policy discrepancy is `setdefault`: it does not enforce one thread when the caller supplied four.
+
+Keep these policies separate:
+
+- Worker thread limit: performance/resource policy, applied before spawning workers.
+- L3 BLAS limit: forced reproducibility policy, scoped around L3 construction and cache-versioned.
+
+4. Visibility
+
+Yes—visibility should accompany elimination, not replace it.
+
+The geometry manifest already contains `ReducedGeometry.content_key()`, which includes the basis, and `prepare_model()` copies that geometry manifest into the final model manifest in [batch.py](/home/mcpu/GitHub/gsmm_compiler_maxent_sampling/src/gsmm_compiler/batch.py:301). So the distinction is already indirectly observable.
+
+Make it diagnostic rather than merely forensic by recording together:
+
+- L3 recipe/lookup key.
+- L3 content key.
+- An explicit basis-array hash and T0 hash.
+- Determinism policy version and effective thread limit.
+- Canonicalized BLAS/LAPACK vendor, version, threading layer, and selected architecture.
+
+Do not put the basis hash into the pre-build lookup key—it is circular. It belongs in content identity and manifests. This would have made “one recipe key produced two content keys” immediately visible while the certificate continued to fail closed.
+
+VERDICT: AGREE
+CONTESTED: 1. §1.2 does not literally mandate import-time, process-global pinning for parent geometry; its stated scope is worker oversubscription. 2. One BLAS thread does not establish cross-machine byte reproducibility.
+tokens used
+95,301
+Choose B, scoped around the entire L3 writer—not merely the Gram–Schmidt expressions.
+
+1. Fix and costs
+
+Wrap all of `build_l3_bundle()` in a single-threaded BLAS context. That covers:
+
+- `build_geometry()`, including the SVD, direction-space projection, Gram–Schmidt, complement construction, norms, and rank checks in [affine_geometry.py](/home/mcpu/GitHub/gsmm_compiler_maxent_sampling/src/gsmm_compiler/affine_geometry.py:350).
+- `build_transform()`, so T0 is reproducible under the same policy.
+- Reachability certification, insofar as it performs BLAS/LAPACK work involving T0.
+
+`build_l3_bundle()` is the correct boundary because it is deliberately the sole L3 writer in [batch.py](/home/mcpu/GitHub/gsmm_compiler_maxent_sampling/src/gsmm_compiler/batch.py:425). Wrapping only `OrthonormalBasis.remove_components()` would miss SVD-derived projections, complement construction, T0, and validation.
+
+Costs not yet priced:
+
+- `GEOMETRY_IMPL_VERSION` must be bumped. Otherwise the existing `e9d6…` entries remain hits and the fix does nothing for warmed caches.
+- `threadpoolctl` changes native-library state, which can be process-wide depending on the backend. Concurrent threads doing unrelated BLAS work may temporarily be restricted too. Its scope semantics explicitly vary between OpenMP and OpenBLAS backends. [threadpoolctl documentation](https://github.com/joblib/threadpoolctl#setting-the-maximum-size-of-thread-pools)
+- The whole L3 numerical section becomes serial, not just four projections. Probably cheap here, but it should be benchmarked.
+- The supported numerical backends need defining. Inside the context, inspect detected BLAS controllers and verify that recognized pools report one thread; otherwise “pinning” is only an intention.
+- Add separate-process regression tests for ambient, 1, and 4 threads, comparing basis, T0, and complete L3 content hashes. Also verify that the caller’s environment and prior thread limits are restored.
+
+A is inferior because package import may occur after the host application has already initialized NumPy/BLAS. It therefore combines global environment mutation with an incomplete guarantee. C describes one known hidden input but leaves the operational failure and all other backend differences. D is not mathematical fantasy, but it is not a 260×46 Gram–Schmidt change: strict determinism would also require specified SVD, norm, projection, rank, Cholesky, and certificate reductions. A performant implementation likely means a compiled deterministic numerical kernel, not a few Python loops.
+
+If `threadpoolctl`’s process-global effect is unacceptable, the serious E is a dedicated L3 subprocess launched with an explicit environment before NumPy import. That gives stronger isolation but adds serialization, lifecycle, error-propagation, and packaging complexity. B is proportionate here.
+
+2. What one thread promises
+
+One thread is sufficient to remove the measured thread-dependent reduction ordering on the tested installation. It is not sufficient for universal byte reproducibility.
+
+At fixed thread count, different BLAS/LAPACK libraries, versions, builds, and CPU-selected SIMD kernels may use different operation orders. OpenBLAS explicitly supports runtime CPU-specific kernel selection, while Intel documents that ordinary BLAS execution need not be bitwise reproducible and provides separate conditional-reproducibility modes. [OpenBLAS architecture dispatch](https://github.com/OpenMathLib/OpenBLAS#support-for-multiple-targets-in-a-single-library), [oneMKL numerical reproducibility](https://www.intel.com/content/www/us/en/docs/onemkl/developer-reference-dpcpp/2025-0/numerical-reproducibility.html). NumPy itself notes that the same NumPy version linked against different LAPACK implementations or built on different platforms can produce different numerical results. [NumPy NEP 19](https://numpy.org/neps/nep-0019-rng-policy.html)
+
+Therefore distinguish two keys:
+
+- A recipe/lookup key: declared mathematical inputs, implementation versions, determinism policy, and a numerical-runtime compatibility profile.
+- A content key: a hash of the actual serialized artifact bytes.
+
+The code already has this distinction in substance: `geometry_cache_key()` is the recipe key, while `ReducedGeometry.content_key()` hashes the scaling, basis, center, and support points in [affine_geometry.py](/home/mcpu/GitHub/gsmm_compiler_maxent_sampling/src/gsmm_compiler/affine_geometry.py:1238). They should be named and documented as different promises.
+
+I would revise §1.1 to say:
+
+> Within a declared numerical-runtime compatibility profile, a recipe key must rebuild deterministically. Every stored artifact also has a content hash of its serialized fields. Across profiles, byte equality is not promised; backend changes must either miss the recipe cache or be explicitly accepted as semantic, certificate-validated portability.
+
+A strict runtime profile would include at least BLAS/LAPACK vendor, version/build, selected architecture/kernel class, solver version/settings, and the one-thread policy. Unrestricted cross-machine cache sharing and strict byte identity cannot both be promised with ordinary floating-point libraries.
+
+3. Worker oversubscription versus geometry correctness
+
+They are separate requirements sharing a mechanism.
+
+Section 1.2 places the environment rule under sampling workers in [BUILD_PLAN.md](/home/mcpu/GitHub/gsmm_compiler_maxent_sampling/BUILD_PLAN.md:122). Its reason is resource control. Geometry determinism is a parent-side numerical correctness/reproducibility policy and should have its own name, scope, tests, versioning, and manifest fields.
+
+There is also a subtle correction to the alleged drift: although [batch.py](/home/mcpu/GitHub/gsmm_compiler_maxent_sampling/src/gsmm_compiler/batch.py:687) imports NumPy before calling `_limit_thread_env()`, it calls the function before creating spawned processes. Those new interpreters inherit the environment before importing their own NumPy. The initializer is late and largely redundant; the parent-side pre-spawn call is what matters. The real worker-policy discrepancy is `setdefault`: it does not enforce one thread when the caller supplied four.
+
+Keep these policies separate:
+
+- Worker thread limit: performance/resource policy, applied before spawning workers.
+- L3 BLAS limit: forced reproducibility policy, scoped around L3 construction and cache-versioned.
+
+4. Visibility
+
+Yes—visibility should accompany elimination, not replace it.
+
+The geometry manifest already contains `ReducedGeometry.content_key()`, which includes the basis, and `prepare_model()` copies that geometry manifest into the final model manifest in [batch.py](/home/mcpu/GitHub/gsmm_compiler_maxent_sampling/src/gsmm_compiler/batch.py:301). So the distinction is already indirectly observable.
+
+Make it diagnostic rather than merely forensic by recording together:
+
+- L3 recipe/lookup key.
+- L3 content key.
+- An explicit basis-array hash and T0 hash.
+- Determinism policy version and effective thread limit.
+- Canonicalized BLAS/LAPACK vendor, version, threading layer, and selected architecture.
+
+Do not put the basis hash into the pre-build lookup key—it is circular. It belongs in content identity and manifests. This would have made “one recipe key produced two content keys” immediately visible while the certificate continued to fail closed.
+
+VERDICT: AGREE
+CONTESTED: 1. §1.2 does not literally mandate import-time, process-global pinning for parent geometry; its stated scope is worker oversubscription. 2. One BLAS thread does not establish cross-machine byte reproducibility.
