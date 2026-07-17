@@ -148,6 +148,7 @@ from gsmm_compiler.highs_backend import (
     BACKEND_IMPL_VERSION,
     DEFAULT_PRIMAL_FEASIBILITY_TOL,
     HighsLinearProgram,
+    LPNotOptimalError,
     LPSolution,
 )
 from gsmm_compiler.native_csc import VALUE_DTYPE
@@ -155,7 +156,7 @@ from gsmm_compiler.numerics import under_deterministic_blas
 from gsmm_compiler.provenance import content_key, stream_seed
 from gsmm_compiler.sparse_objective import build_flux_lp
 
-GEOMETRY_IMPL_VERSION: Final = 2
+GEOMETRY_IMPL_VERSION: Final = 3
 """Bumped when a change here can alter the bytes of a geometry. Feeds the L3 cache key (§1.1).
 
 2 (M10.2): L3 now stores the **geometry** (``s``, ``B``, centre, support points, certificate) and
@@ -164,6 +165,13 @@ The bump is load-bearing rather than cosmetic: `batch.geometry_cache_key` does *
 `ReducedGeometry.content_key`, so without it a v1 bundle — transform arrays, no ``basis`` — would
 still be a cache **hit** and `from_bundle` would die on a missing key. §1.1's rule is that a schema
 change must **miss**, never error on stale bytes.
+
+3 (M11.1): `blocked_reactions` now brackets each width and cold-escalates an unresolved reaction, so
+its **mask can differ** from a v2 build on the same polytope — where the warm duals were loose, a
+reaction v2 called moving is now certified blocked, which moves the basis, the support points and
+possibly ``d``. That is a genuine change of the geometry's bytes, so it must **miss** a v2 cache
+rather than be served one. M11.0's `BACKEND_IMPL_VERSION` bump does not cover this: that identifies
+the *solver*, this is an *algorithm* change above it.
 """
 
 NOISE_SAFETY: Final = 10.0
@@ -213,25 +221,63 @@ def reaction_scales(reduced: ReducedPolytope, *, floor: float) -> NDArray[np.flo
 
 @dataclass(frozen=True)
 class BlockedReactions:
-    """Free reactions that provably cannot carry flux — the exact zeros of the direction space."""
+    """Free reactions that cannot carry flux — the zeros of the direction space, at a resolution.
+
+    **Three states, because two instruments answer two different questions** (M11.1, BUILD_PLAN
+    §1.6.11). Each reaction's width is *bracketed*, never collapsed to one number:
+
+    * ``upper`` — ``U_i``, from weak duality. Sound for **any** multipliers, optimal or nonsense,
+      needing no primal point at all. ``U_i ≤ blocked_tol`` is what certifies BLOCKED.
+    * ``lower`` — ``L_i``, from the two returned endpoints, **minus** their own admitted error and
+      rounded outward. ``L_i > blocked_tol`` (strictly) is what qualifies MOVING.
+    * anything else is **UNRESOLVED**: the bracket straddles the bar and this instrument cannot say.
+
+    **The two sides are not symmetric, and pretending otherwise is what broke 24 of 40 strains.**
+    Only BLOCKED is *certified*: turning a constraint residual into a distance from the exact
+    feasible set needs a Hoffman constant this package does not have (`probe_direction` records the
+    same limit at its own noise bar), so the endpoints are only tolerance-feasible and MOVING is
+    **resolution-qualified**, never proved. That is §1.4.1's own honesty — "numerically fixed at
+    resolution ``blocked_tol``, not provably constant" — applied at last to *both* sides.
+
+    The predecessor collapsed this to ``ranges[i] = max(U_i, W_i)`` and read ``> blocked_tol`` as
+    "moving", when it licenses only *"not certified blocked by this dual"*. Since warm-started duals
+    are sound but **loose**, a flat reaction's ``U_i`` drifted over the bar and was called moving.
+    """
 
     mask: NDArray[np.bool_]
-    """``(n_free,)``. True where FVA proved ``max vᵢ == min vᵢ``."""
-    ranges: NDArray[np.float64]
-    """``(n_free,)`` FVA range per free reaction — the evidence, kept for the manifest."""
-    separation: float
-    """The smallest *unblocked* range divided by the largest *blocked* one.
+    """``(n_free,)``. True where ``U_i ≤ blocked_tol`` — certified flat by weak duality."""
+    upper: NDArray[np.float64]
+    """``(n_free,)`` rigorous upper bound on each width. The evidence for BLOCKED."""
+    lower: NDArray[np.float64]
+    """``(n_free,)`` resolution-qualified lower witness. The evidence for MOVING.
 
-    This is the number that says whether the blocked/free split was a judgement call or an
-    observation. On the example model it is ~1.5e11 — the blocked reactions span ≤2e-12 and the
-    narrowest moving one spans 0.30 — so **no tolerance in eleven orders of magnitude changes the
-    answer**. A model where this ratio is small has a genuinely ambiguous dimension, and
-    `blocked_reactions` refuses to guess on its behalf.
+    Kept **separate** from `upper` rather than folded into one ``max``: the two bracket the true
+    width, so ``lower > upper`` is a broken arithmetic contract and must be loud. A ``max`` would
+    silently repair it (Codex, M11.1 review).
+    """
+    unresolved: NDArray[np.bool_]
+    """``(n_free,)``. True where the bracket straddles the bar even after cold escalation."""
+    n_escalated: int
+    """How many reactions needed a cold solve pair. Reported: it is the warm path's error rate."""
+    separation: float
+    """Narrowest resolution-qualified-moving `lower` ÷ widest certified-blocked `upper`.
+
+    **A diagnostic since M11.1, no longer a gate.** It measures whether ``d`` is *sensitive to
+    moving* ``blocked_tol``; UNRESOLVED measures whether a bracket *straddles* it. Those are
+    different properties, so retiring the guard does forfeit the tolerance-stability claim — which
+    is acceptable only because this module is explicitly resolution-bounded, and the gate that
+    replaces it ("no reaction is unresolved") tests each classification directly instead of
+    inferring soundness from a gap between two clusters. Computed from the certified endpoints, not
+    from the conflated ``ranges`` its predecessor used.
     """
 
     @property
     def n_blocked(self) -> int:
         return int(np.count_nonzero(self.mask))
+
+    @property
+    def n_unresolved(self) -> int:
+        return int(np.count_nonzero(self.unresolved))
 
 
 def blocked_reactions(
@@ -251,44 +297,169 @@ def blocked_reactions(
     `min_separation` guards the one thing that could make this a guess: if the widest blocked range
     is not far below the narrowest moving one, the split depends on `tol` and the affine dimension
     is ambiguous. We refuse rather than quietly pick a dimension.
+
+    **M11.1 — the warm pass is a fast path, and its verdicts are checked, not trusted.** The
+    predecessor ran one persistent warm-started program over all ``2·n_free`` solves and believed
+    whatever came back. Measured across the 40 real strains that is wrong two ways: 9 die outright
+    when HiGHS returns ``kUnknown``, and 24 refuse because the warm duals — sound, but *loose for
+    the objective they were not solved for* — push a flat reaction's ``U_i`` over the bar. Both are
+    the **same case**: a reaction whose bracket straddles ``tol``, including one whose solve gave no
+    usable evidence at all. Each such reaction gets **one** cold solve pair on a fresh instance;
+    everything else keeps the warm start. Measured, that is ~5 reactions in 446.
+
+    This is not "retry until it passes" (§1.6.7 r4 rejected that): the acceptance criterion never
+    moves, the retry is *declared* — the inherited basis is removed, which is a different
+    computation, not the same one re-rolled — and it is bounded at one. A reaction still unresolved
+    after its cold pair **refuses**, reporting the resolution rather than picking a class.
     """
     n = reduced.n_free
-    ranges = np.empty(n, dtype=VALUE_DTYPE)
-    cost = np.zeros(n, dtype=VALUE_DTYPE)
+    upper = np.empty(n, dtype=VALUE_DTYPE)
+    lower = np.empty(n, dtype=VALUE_DTYPE)
+    unresolved = np.zeros(n, dtype=np.bool_)
+    warm: HighsLinearProgram | None = program
+    n_escalated = 0
 
     for i in range(n):
-        cost[i] = 1.0
-        high = program.maximize(cost)
-        low = program.maximize(-cost)
-        cost[i] = 0.0
-        # The range is bounded **from above**, by weak duality on each solve. Taking the primal
-        # values would give a *lower* bound on the range — precisely the wrong end when the
-        # conclusion drawn is "this reaction cannot move": an LP that stopped
-        # short would report a range of zero for a reaction that is wide open, and the projection
-        # would then delete a real dimension. Same instrument as the span certificate, same reason.
-        unit = np.zeros(n, dtype=VALUE_DTYPE)
-        unit[i] = 1.0
-        ranges[i] = max(
-            dual_upper_bound(high, unit, reduced) + dual_upper_bound(low, -unit, reduced),
-            float(high.primal[i] - low.primal[i]),
+        bracket = _width_bracket(reduced, warm, warm, i, n) if warm is not None else None
+        if bracket is None:
+            # A non-optimal solve yields no witness in *either* direction — the same state as a
+            # bracket that straddles the bar, and it escalates the same way. The catch is here
+            # rather than in `HighsLinearProgram.solve`, which must go on refusing for everyone:
+            # `sparse_objective.critical_l1_penalty` needs `LPNotOptimalError` to detect an
+            # unbounded `J*`. One caller earns an exemption its own arithmetic proves.
+            #
+            # And the failed instance is abandoned: later solves warm-started off a basis HiGHS
+            # could not certify would still be *usable*, but their provenance would be a story
+            # nobody can retell (Codex, M11.1 review).
+            warm = None
+        elif not _straddles(bracket, tol):
+            upper[i], lower[i] = bracket
+            continue
+
+        # Escalate on a **fully** cold pair — a fresh instance per *solve*, not per reaction. One
+        # instance shared by the two solves would warm-start `min` off `max`'s basis, and that one
+        # step of inherited history is enough to leave a floor reaction straddling: measured, it
+        # turned genuinely-resolvable reactions on several strains into false "unresolved" refusals
+        # while the truly-at-floor cases (Hafnia, `U ≈ 2e-9`) stayed unresolved either way. Removing
+        # *all* warm history is what the escalation is for; leaving one step was leaving the bug.
+        n_escalated += 1
+        cold = _width_bracket(
+            reduced, build_flux_lp(reduced, threads=1), build_flux_lp(reduced, threads=1), i, n
         )
+        if cold is None:
+            # No complete `U_i` exists, so this reaction's resolution is *unavailable* — not a
+            # number to be maxed into an aggregate as if it had been measured.
+            upper[i], lower[i], unresolved[i] = np.inf, -np.inf, True
+            continue
+        upper[i], lower[i] = cold
+        unresolved[i] = _straddles(cold, tol)
 
-    mask = ranges <= tol
+    _reject_contradictory_bracket(upper, lower)
+    mask = upper <= tol
+    moving = lower > tol  # strict: `>=` would overlap `mask` when both bounds sit on the bar
+    unresolved |= ~(mask | moving)
 
-    blocked_max = float(np.max(ranges[mask], initial=0.0))
-    moving_min = float(np.min(ranges[~mask], initial=np.inf))
+    blocked_max = float(np.max(upper[mask], initial=0.0))
+    moving_min = float(np.min(lower[moving], initial=np.inf))
     separation = np.inf if blocked_max <= 0.0 else moving_min / blocked_max
 
-    if np.any(mask) and np.any(~mask) and separation < min_separation:
+    if np.any(unresolved):
+        worst = float(np.max(upper[unresolved]))
         raise GeometryError(
-            f"the blocked/moving split is ambiguous: the widest blocked reaction spans "
-            f"{blocked_max:.3e} and the narrowest moving one spans {moving_min:.3e} — a separation "
-            f"of only {separation:.1f}×, below the required {min_separation:.0f}×. The affine "
-            f"dimension depends on geometry.blocked_tol ({tol:.1e}) rather than on the polytope. "
-            "Tighten the LP feasibility tolerance, or set the blocked tolerance deliberately."
+            f"{int(np.count_nonzero(unresolved))} of {n} reactions cannot be resolved as blocked "
+            f"or moving at geometry.blocked_tol ({tol:.1e}), even after a cold re-solve: their "
+            f"widths are bracketed to at most {worst:.3e} from above and no further than {tol:.1e} "
+            "below, so this instrument cannot tell a flat reaction from a narrow one here. The "
+            "affine dimension would depend on the tolerance rather than on the polytope. Set "
+            "geometry.blocked_tol deliberately above the reported bracket, and know that doing so "
+            "declares any dimension narrower than it to be absent."
         )
 
-    return BlockedReactions(mask=mask, ranges=ranges, separation=separation)
+    return BlockedReactions(
+        mask=mask,
+        upper=upper,
+        lower=lower,
+        unresolved=unresolved,
+        n_escalated=n_escalated,
+        separation=separation,
+    )
+
+
+def _width_bracket(
+    reduced: ReducedPolytope,
+    high_program: HighsLinearProgram,
+    low_program: HighsLinearProgram,
+    index: int,
+    n: int,
+) -> tuple[float, float] | None:
+    """``(U_i, L_i)`` for one reaction, or ``None`` when a solve returned no usable answer.
+
+    ``U_i`` is bounded **from above** by weak duality on each solve, and that direction is the whole
+    point: a primal reading is a *lower* bound, so an LP that stopped short would report a range of
+    zero for a reaction that is wide open and the projection would delete a real dimension. Same
+    instrument as the span certificate, same reason.
+
+    ``L_i`` is that primal reading, kept for the *opposite* question — is this reaction certainly
+    moving? — and charged for its own error first. It is **not** a proof: the endpoints are only
+    tolerance-feasible, and no Hoffman constant is available to turn that into a distance from the
+    exact feasible set. Hence the outward subtraction, and hence "resolution-qualified".
+
+    ``high_program`` and ``low_program`` are the **same** object on the warm fast path (the ``max``
+    and ``min`` solves warm-start off each other, which is the point of the persistent instance) and
+    **two fresh** objects on the cold escalation, so neither inherits the other's basis.
+    """
+    cost = np.zeros(n, dtype=VALUE_DTYPE)
+    cost[index] = 1.0
+    try:
+        high = high_program.maximize(cost)
+        low = low_program.maximize(-cost)
+    except LPNotOptimalError:
+        return None
+
+    unit = np.zeros(n, dtype=VALUE_DTYPE)
+    unit[index] = 1.0
+    upper = dual_upper_bound(high, unit, reduced) + dual_upper_bound(low, -unit, reduced)
+
+    admitted = max(
+        _bound_violation(high.primal, reduced),
+        _bound_violation(low.primal, reduced),
+        high.max_primal_infeasibility,
+        low.max_primal_infeasibility,
+    )
+    width = float(high.primal[index] - low.primal[index])
+    eps = float(np.finfo(VALUE_DTYPE).eps)
+    reach = float(max(abs(reduced.lower_bounds[index]), abs(reduced.upper_bounds[index])))
+    lower = width - NOISE_SAFETY * 2.0 * admitted - eps * reach
+    return upper, float(np.nextafter(lower, -np.inf))
+
+
+def _straddles(bracket: tuple[float, float], tol: float) -> bool:
+    """Neither certified blocked (``U ≤ tol``) nor resolution-qualified moving (``L > tol``)."""
+    upper, lower = bracket
+    return not (upper <= tol or lower > tol)
+
+
+def _reject_contradictory_bracket(
+    upper: NDArray[np.float64], lower: NDArray[np.float64]
+) -> None:
+    """``L_i ≤ U_i`` is an arithmetic contract, not a preference — so a violation is loud.
+
+    The two bound the same width from opposite sides. The predecessor wrote ``max(U, W)``, which
+    cannot *observe* a contradiction because it resolves it: a primal witness wider than a rigorous
+    upper bound would silently become the reported range, and the fact that weak duality had just
+    been contradicted would go unrecorded (Codex, M11.1 review).
+    """
+    finite = np.isfinite(upper) & np.isfinite(lower)
+    broken = np.flatnonzero(finite & (lower > upper))
+    if broken.size:
+        i = int(broken[0])
+        raise GeometryError(
+            f"reaction {i} has a resolution-qualified lower width ({lower[i]:.6e}) above its "
+            f"rigorous upper bound ({upper[i]:.6e}), and {broken.size} reaction(s) do. These "
+            "bracket the same quantity from opposite sides, so one of the two is wrong: either "
+            "weak duality was contradicted or an endpoint is further outside the feasible set than "
+            "its admitted error. Neither is a tolerance to widen."
+        )
 
 
 # ---- the space every feasible direction must lie in ---------------------------------------------
@@ -727,12 +898,13 @@ def _check_blocked_span(
     `span_tol` individually, which permits the *combination* to reach
     ``√n_blocked · span_tol``, and a probe spread across them would then report a width the
     projection has already zeroed. This is the check that actually holds: it uses the
-    measured FVA ranges rather than the config's worst case, and on the example model it
-    comes to 5.7e-16 against a 1e-9 bar.
+    measured FVA widths rather than the config's worst case, and on the example model it
+    comes to 5.7e-16 against a 1e-9 bar. The **upper** bracket is the width to use here — the
+    same rigorous bound that certified each of these reactions blocked one at a time.
     """
     if not np.any(blocked.mask):
         return
-    extent = float(np.linalg.norm(blocked.ranges[blocked.mask] / scales[blocked.mask]))
+    extent = float(np.linalg.norm(blocked.upper[blocked.mask] / scales[blocked.mask]))
     if extent > config.span_tol:
         raise GeometryError(
             f"the blocked reactions span {extent:.3e} in scaled coordinates *together* "
@@ -1110,6 +1282,13 @@ class GeometryDiagnostics:
     """Free reactions FVA proved cannot carry flux — exact zeros of the direction space."""
     blocked_separation: float
     """How unambiguous that split was: narrowest moving range ÷ widest blocked range."""
+    n_blocked_escalated: int
+    """How many reactions the warm FVA pass could not classify and a cold re-solve had to (M11.1).
+
+    Zero on a model whose warm duals stay tight; nonzero is the warm path's own error rate, and
+    worth watching — a model that needs many cold re-solves is one whose geometry sits near the
+    instrument's floor.
+    """
     n_support_points: int
     n_lp_solves: int
     n_random_probes: int
@@ -1153,6 +1332,7 @@ class GeometryDiagnostics:
             "dimension": self.dimension,
             "n_blocked": self.n_blocked,
             "blocked_separation": self.blocked_separation,
+            "n_blocked_escalated": self.n_blocked_escalated,
             "n_support_points": self.n_support_points,
             "n_lp_solves": self.n_lp_solves,
             "n_random_probes": self.n_random_probes,
@@ -1584,6 +1764,7 @@ def _singleton_geometry(reduced: ReducedPolytope, config: GeometryConfig) -> Red
             dimension=0,
             n_blocked=0,
             blocked_separation=np.inf,
+            n_blocked_escalated=0,
             n_support_points=1,
             n_lp_solves=0,
             n_random_probes=0,
@@ -1713,6 +1894,7 @@ def _validate(
         dimension=d,
         n_blocked=blocked.n_blocked,
         blocked_separation=blocked.separation,
+        n_blocked_escalated=blocked.n_escalated,
         n_support_points=int(support_points.shape[0]),
         n_lp_solves=n_lp_solves,
         n_random_probes=n_random_probes,

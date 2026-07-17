@@ -8,9 +8,11 @@ looks plausible.
 from __future__ import annotations
 
 import math
+from typing import cast
 
 import numpy as np
 import pytest
+from numpy.typing import NDArray
 
 from gsmm_compiler.affine_geometry import (
     BlockedReactions,
@@ -21,6 +23,7 @@ from gsmm_compiler.affine_geometry import (
     SupportProbe,
     _append,
     _check_blocked_span,
+    _reject_contradictory_bracket,
     blocked_reactions,
     build_geometry,
     complement_basis,
@@ -31,6 +34,7 @@ from gsmm_compiler.affine_geometry import (
 )
 from gsmm_compiler.config import ConfigError, GeometryConfig
 from gsmm_compiler.flux_polytope import FluxPolytope, ReducedPolytope
+from gsmm_compiler.highs_backend import HighsLinearProgram, LPNotOptimalError
 from gsmm_compiler.native_csc import NativeCSC
 from gsmm_compiler.sparse_objective import build_flux_lp
 
@@ -271,14 +275,85 @@ def test_a_fully_fixed_polytope_returns_the_singleton_geometry() -> None:
     assert geometry.certificate.exhaustive
 
 
-def test_blocked_reactions_refuse_an_ambiguous_split() -> None:
-    """When blocked and moving ranges are 5× apart, the dimension is the tolerance's opinion."""
+def test_a_tolerance_between_two_real_widths_classifies_rather_than_refusing() -> None:
+    """M11.1 retired the separation gate: a `tol` between two real widths is no longer "ambiguous".
+
+    The predecessor refused this exact polytope — the 1e-7 branch and the 5e-7 branch are only 5×
+    apart, and `tol = 2e-7` lands between them, which the old ``min_separation = 100`` guard called
+    a choice about `tol` rather than a fact. But each reaction *is* individually classifiable: the
+    1e-7 branch has `U ≤ 2e-7` (certified blocked), the 5e-7 branch has `L > 2e-7` (moving). Under
+    the declared resolution contract (§1.6.11) that is the honest answer — a dimension narrower than
+    the tolerance the user set is declared absent — not a refusal. Nothing is *unresolved*.
+    """
     reduced = two_narrow_scales()
-    program = build_flux_lp(reduced)
-    # 2e-7 sits between the 1e-7 branch and the 5e-7 one: it would block the first and keep the
-    # second, on a 5× separation. That is a choice about `tol`, not a fact about the polytope.
-    with pytest.raises(GeometryError, match="ambiguous"):
-        blocked_reactions(reduced, program, tol=2e-7, min_separation=100.0)
+    blocked = blocked_reactions(reduced, build_flux_lp(reduced), tol=2e-7)
+    assert blocked.n_unresolved == 0
+    assert blocked.n_blocked == 2  # the 1e-7 branch's two reactions, declared below-resolution
+    assert int(np.sum(blocked.lower > 2e-7)) == 2  # the 5e-7 branch, resolution-qualified moving
+
+
+def test_blocked_reactions_refuse_a_reaction_it_cannot_resolve() -> None:
+    """The new gate (M11.1): refuse when a width straddles the bar even after a cold re-solve.
+
+    A reaction bounded to ``[0, blocked_tol]`` has a true width sitting exactly on the tolerance, so
+    its bracket brackets the bar: `U` is a hair above (not certified blocked) and `L` a hair below
+    (not resolution-qualified moving). This is the *Hafnia* case in miniature, and the whole point
+    of the third state — it is neither, and no cold re-solve moves a width that is genuinely at the
+    floor. The message names the reactions and reports the bracket, and does **not** advise
+    disabling a check.
+    """
+    reduced = make_polytope([[1.0, -1.0]], [0.0, 0.0], [1e-9, 1000.0])
+    with pytest.raises(GeometryError, match="cannot be resolved as blocked or moving") as caught:
+        blocked_reactions(reduced, build_flux_lp(reduced), tol=1e-9)
+    assert "cold re-solve" in str(caught.value)
+
+
+def test_a_kunknown_warm_solve_is_recovered_by_cold_escalation() -> None:
+    """The heart of M11.1: a reaction whose *warm* solve gives no witness is re-solved cold.
+
+    This is the mechanism that turns 9 of the 40 real strains from a `kUnknown` crash into a clean
+    build. A toy cannot degrade a warm start, so the degradation is injected: a program wrapper that
+    raises `LPNotOptimalError` on the solves for one reaction and delegates everything else. The
+    reaction must still be classified — matching an all-clean run — and `n_escalated` must count it.
+
+    Non-vacuous: without the escalation the `LPNotOptimalError` propagates and the call raises;
+    without the *catch* being caller-specific it would loosen `solve()` for everyone.
+    """
+    reduced = triangle()  # every reaction wide open; nothing genuinely unresolved
+    clean = blocked_reactions(reduced, build_flux_lp(reduced), tol=1e-9)
+    assert clean.n_escalated == 0  # the control takes the warm fast path, no cold re-solves
+
+    class _FailsWarmOnReaction:
+        """Delegates to a real flux LP but refuses the two solves that probe `victim`."""
+
+        def __init__(self, victim: int) -> None:
+            self._inner = build_flux_lp(reduced)
+            self._victim = victim
+
+        def maximize(self, costs: NDArray[np.float64]) -> object:
+            if float(costs[self._victim]) != 0.0:
+                raise LPNotOptimalError("kUnknown", "flux_only")
+            return self._inner.maximize(costs)
+
+    degraded = blocked_reactions(
+        reduced, cast(HighsLinearProgram, _FailsWarmOnReaction(victim=1)), tol=1e-9
+    )
+    assert degraded.n_escalated >= 1  # reaction 1 could not be solved warm
+    assert degraded.n_unresolved == 0  # but cold resolved it
+    assert bool(degraded.mask[1]) == bool(clean.mask[1])  # to the same verdict as a clean run
+
+
+def test_a_contradictory_bracket_is_loud_not_repaired() -> None:
+    """`L_i > U_i` breaks the arithmetic contract, so it raises — it is never maxed away (M11.1).
+
+    The two bracket the same width from opposite sides. The predecessor's ``max(U, W)`` could not
+    even observe this, because it resolved it. Driven through the helper on hand-built arrays so the
+    guard is tested in isolation from any solver.
+    """
+    upper = np.array([1e-12, 5e-13])
+    lower = np.array([1e-6, 0.0])  # reaction 0: a lower witness far above its rigorous upper bound
+    with pytest.raises(GeometryError, match="above its .*upper bound"):
+        _reject_contradictory_bracket(upper, lower)
 
 
 def test_blocked_reactions_accept_the_example_models_wide_separation() -> None:
@@ -496,7 +571,10 @@ def test_a_blocked_axis_the_sweep_still_flags_is_diagnosed_not_mystified() -> No
     basis = OrthonormalBasis(reduced.n_free, memory_limit_bytes=1 << 30)
     blocked = BlockedReactions(
         mask=np.array([False, True, False]),
-        ranges=np.zeros(3),
+        upper=np.zeros(3),
+        lower=np.zeros(3),
+        unresolved=np.zeros(3, dtype=bool),
+        n_escalated=0,
         separation=np.inf,
     )
     killed = SupportProbe(
@@ -615,11 +693,18 @@ def test_the_blocked_reactions_must_be_flat_together_not_only_one_at_a_time() ->
     projection has already zeroed."""
     scales = np.array([1.0, 1.0, 1.0])
     config = GeometryConfig()
-    ranges = np.full(3, 0.9e-9)  # each below span_tol, but ‖·‖₂ = 1.56e-9 is not
+    upper = np.full(3, 0.9e-9)  # each below span_tol, but ‖·‖₂ = 1.56e-9 is not
 
     with pytest.raises(GeometryError, match="together"):
         _check_blocked_span(
-            BlockedReactions(mask=np.ones(3, dtype=bool), ranges=ranges, separation=np.inf),
+            BlockedReactions(
+                mask=np.ones(3, dtype=bool),
+                upper=upper,
+                lower=np.zeros(3),
+                unresolved=np.zeros(3, dtype=bool),
+                n_escalated=0,
+                separation=np.inf,
+            ),
             scales,
             config,
         )
@@ -671,6 +756,6 @@ def test_the_fva_ranges_are_upper_bounds_not_lp_readings() -> None:
     reduced = triangle()
     blocked = blocked_reactions(reduced, build_flux_lp(reduced), tol=1e-9)
 
-    # Every reaction of the triangle moves, and the reported ranges are real widths, not zeros.
+    # Every triangle reaction moves, and the reported upper bounds are real widths, not zeros.
     assert blocked.n_blocked == 0
-    assert np.all(blocked.ranges >= 10.0 - 1e-6)
+    assert np.all(blocked.upper >= 10.0 - 1e-6)
