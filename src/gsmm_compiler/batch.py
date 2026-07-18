@@ -76,6 +76,7 @@ from gsmm_compiler.rounding import (
     certify_reachable_mass_balance,
     require_certified_transform,
 )
+from gsmm_compiler.schedule import resolve_schedule
 from gsmm_compiler.sparse_objective import (
     ReducedObjective,
     lower_objective,
@@ -289,6 +290,27 @@ def prepare_model(
     scale = calibration.energy_scale
     optimum_coordinates = calibration.optimum_coordinates
 
+    # M11.5: size the production schedule from the pilot, BEFORE the plan is built — so the resolved
+    # `n_samples` is what `sample_recipe_key` hashes and what the workers step under. In "fixed"
+    # mode this is the identity, so nothing changes. This is the exact `energy_scale_value` pattern:
+    # the mode is config, the resolved number is keyed. Placing it anywhere the key cannot see would
+    # let two runs of one config draw different numbers and collide in the cache (§M11.5 THE TRAP).
+    resolved_sampler, schedule_resolution = resolve_schedule(
+        config.sampler, transform, calibration.scale_pilot
+    )
+    if schedule_resolution.mode == "pilot_ess":
+        _log.info(
+            "schedule: pilot_ess target=%d q=%.2f → n_samples %d → %d (τ_q=%.1f sweeps, "
+            "cap %d%s)",
+            schedule_resolution.target_ess,
+            schedule_resolution.ess_quantile,
+            schedule_resolution.requested_n_samples,
+            schedule_resolution.resolved_n_samples,
+            schedule_resolution.quantile_tau_int,
+            schedule_resolution.max_schedule_sweeps,
+            ", CAP HIT — mixing exceeds budget" if schedule_resolution.cap_hit else "",
+        )
+
     return ModelPlan(
         model_id=model_id,
         reduced=reduced,
@@ -303,7 +325,8 @@ def prepare_model(
         ),
         movable=movable_reactions(transform),
         storage=SampleStorage.from_config(config.output),
-        sampler=config.sampler,
+        # The RESOLVED schedule — its `n_samples` reaches `sample_recipe_key` and `run_chain`.
+        sampler=resolved_sampler,
         near_zero_thresholds=config.objective.near_zero_thresholds,
         feasibility_tol=config.geometry.feasibility_tol,
         reports={
@@ -312,6 +335,11 @@ def prepare_model(
             "geometry": geometry_meta["geometry_manifest"],
             "energy_scale": scale.manifest(),
             "calibration": calibration.manifest(),
+            # Both schedules, so the manifest never describes a run the workers did not do: `config`
+            # echoes the *requested* sampler, `schedule` records how it was resolved, and
+            # `resolved_sampler` is the exact effective config (Codex, M11.5 review).
+            "schedule": schedule_resolution.as_dict(),
+            "resolved_sampler": asdict(resolved_sampler),
             # The certificate of the transform **this run samples**, in report form. Under
             # re-rounding that is T₁, not T₀ — reporting the bootstrap's certificate here while
             # production steps in T₁'s frame would be this package's signature bug (a manifest

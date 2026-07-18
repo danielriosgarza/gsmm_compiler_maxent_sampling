@@ -379,6 +379,44 @@ class SamplerConfig:
     """Base entropy. Each chain's stream is keyed on ``(model_id, stage, β_index, chain_index)``
     on top of it (`provenance.stream_seed`) — never on a position in a `spawn()` sequence."""
 
+    schedule_mode: str = "fixed"
+    """How ``n_samples`` is decided (M11.5). Two modes:
+
+    - ``"fixed"`` (default) — ``n_samples`` is exactly what the config says.
+      `schedule.resolve_schedule` is the identity, so every pre-M11.5 run and every sample artifact
+      key is **byte-unchanged**.
+    - ``"pilot_ess"`` — size ``n_samples`` so the β=0 scale pilot's worst-protected flux coordinate
+      is predicted to reach `target_ess` effective samples: ``n ≈ target_ess·τ_q / n_chains`` (spec
+      §M11.5, `benchmarks/M11_5_SCHEDULE_TAU.md`). The measurement chose this over a fixed d-power
+      rule (that rule's exponent is not a constant — 1.2/1.6/2.2 by quantile — and it ignores a
+      β-inflation measured up to 27×). The name says **pilot**, not target-met: the pilot is β=0, so
+      the resolved schedule is a β=0 *prediction*; high-β rungs are under-sized and `diagnostics`
+      reports the *achieved* per-rung flux-ESS separately, never claiming the target was met.
+    """
+    target_ess: int | None = None
+    """Target effective samples per protected flux coordinate for ``schedule_mode="pilot_ess"``.
+
+    Required in that mode; ``None`` (the default) is only valid in ``"fixed"`` mode. A "target" the
+    implementation predicts at β=0 and *reports achievement of* per rung — not asserts (§M11.5)."""
+    schedule_ess_quantile: float = 0.90
+    """Which flux coordinate ``pilot_ess`` protects: the ``schedule_ess_quantile`` quantile of τ,
+    i.e. the ``1 − q`` quantile of ESS. Default 0.90 protects the 10th-percentile-ESS coordinate.
+
+    Not ``1.0`` (the worst coordinate): the measurement showed the worst is a near-constant reaction
+    at the estimator's noise floor (minESS 3–9 at β=16), so sizing on it chases noise. Not a low
+    quantile either (protects too few reactions). 0.90 is a tolerated-coverage choice — a policy
+    default, not a sampler constant (Codex, M11.5 review)."""
+    max_schedule_sweeps: int = 200_000
+    """Resource cap on the resolved schedule, in **sweeps** (``pilot_ess``). The β-inflation is
+    erratic (a single rung can demand ~100k sweeps off one outlier), so the cap bounds the chase; a
+    run that hits it records ``cap_hit = true`` and reports "mixing exceeds budget" rather than the
+    target being silently unmet.
+
+    A cap in *sweeps*, not draws: one retained draw is ``thin`` sweeps, so the resolver clamps the
+    resolved ``n_samples`` to ``max_schedule_sweeps // thin`` (Codex, M11.5 review — enforcing it in
+    draw units let a ``thin > 1`` run exceed the declared sweep budget by up to ``thin×``). Must be
+    ≥ ``n_samples · thin`` so the requested floor never exceeds the cap."""
+
     pilot_reround: bool = False
     """Re-round ``T`` from a frozen β=0 pilot's own covariance (spec §17.4, M10).
 
@@ -447,6 +485,45 @@ class SamplerConfig:
                 "sampler.energy_scale_fallback must be finite and > 0 when set (or None to refuse "
                 f"a degenerate warm-up range), got {self.energy_scale_fallback}"
             )
+
+        # ---- M11.5: the adaptive schedule ----------------------------------------------------
+        if self.schedule_mode not in ("fixed", "pilot_ess"):
+            raise ConfigError(
+                f'sampler.schedule_mode must be "fixed" or "pilot_ess", got {self.schedule_mode!r}'
+            )
+        if not 0.0 < self.schedule_ess_quantile < 1.0:
+            raise ConfigError(
+                "sampler.schedule_ess_quantile must lie strictly in (0, 1), got "
+                f"{self.schedule_ess_quantile}"
+            )
+        if self.max_schedule_sweeps < 1:
+            raise ConfigError("sampler.max_schedule_sweeps must be >= 1")
+        if self.target_ess is not None and self.target_ess < 1:
+            raise ConfigError(f"sampler.target_ess must be >= 1 when set, got {self.target_ess}")
+        if self.schedule_mode == "pilot_ess":
+            if self.target_ess is None:
+                raise ConfigError(
+                    'sampler.schedule_mode="pilot_ess" needs sampler.target_ess set (the effective '
+                    "sample size to size the schedule to)"
+                )
+            if self.energy_scale != "pilot_sd":
+                # pilot_ess sizes from the T₁ scale pilot's flux trace, which only exists under
+                # `energy_scale="pilot_sd"`. Refuse at config time rather than several thousand
+                # sweeps in — and never silently fall back (Codex, M11.5 review): a fallback would
+                # size the schedule off a pilot the run never ran.
+                raise ConfigError(
+                    'sampler.schedule_mode="pilot_ess" needs sampler.energy_scale="pilot_sd" (it '
+                    "sizes the schedule from the β=0 scale pilot's flux trace, which no other "
+                    f"energy_scale runs), got energy_scale={self.energy_scale!r}"
+                )
+            floor_sweeps = self.n_samples * self.thin
+            if self.max_schedule_sweeps < floor_sweeps:
+                raise ConfigError(
+                    f"sampler.max_schedule_sweeps ({self.max_schedule_sweeps}) must be >= "
+                    f"n_samples·thin ({floor_sweeps}): it is a cap in **sweeps**, and one retained "
+                    f"draw is `thin` sweeps, so the requested floor of {self.n_samples} draws "
+                    f"already costs {floor_sweeps} sweeps — the cap must not sit below the floor"
+                )
 
 
 @dataclass(frozen=True)

@@ -46,9 +46,13 @@ MC error), so it is **not** an M2/M4/M5/M6/M7 math gate — no closing `/collab`
   infrastructure (`diagnostics.effective_sample_size`). Sub-forks for `/collab`: size on worst-coordinate
   vs a percentile vs J (census says not J); a single β=0 pilot vs per-rung pilots; and the β>0 inflation.
 - **(C) Doubling-until-target** (the census's own method): run the base, measure flux-ESS, extend
-  (2k→4k→8k…) until the target or a resource cap. Most robust, most compute; the schedule's restart guard
-  already supports resumption. Report "mixing time exceeds budget" as a legitimate outcome, never widen
-  the target to pass.
+  (2k→4k→8k…) until the target or a resource cap. Most robust, most compute. Report "mixing time exceeds
+  budget" as a legitimate outcome, never widen the target to pass. ⚠️ **CORRECTED (M11.5 `/collab`):
+  the restart guard does NOT support resumption of a changed schedule** — `batch._already_done` *raises*
+  on a changed `recipe_key` (a larger `n_samples` changes it) and no per-chain RNG checkpoint is stored,
+  so C is *re-run longer in a fresh directory, regenerating from seed*, not resume/extend. This is why C
+  is deferred: it needs either a checkpoint mechanism or a fresh-dir re-run loop, both out of M11.5(a)'s
+  scope.
 
 A **B+C hybrid** (pilot-sized initial guess, doubling backstop to the target) is likely the honest
 answer, but let the MEASURE-FIRST data + `/collab` decide.

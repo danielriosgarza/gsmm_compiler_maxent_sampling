@@ -1488,3 +1488,71 @@ law. **Result: build-geometry OK 34 → 40 of 40** — the 6 `reachable_mass_bal
 strains (2 Hafnia, pumilus, Liquorilactobacillus) pass on this machine as basis-marginal. 979 tests
 green (+8), ruff + mypy clean. The integration test is non-vacuous by sabotage (reverting the call
 site to `program.maximize` fails it with `LPNotOptimalError kUnknown`).
+
+---
+
+## M11.5(a) — the dimension-scaled sampling schedule (`/collab` think, 3 rounds, AGREE)
+
+**Fork:** how to size the MCMC schedule (sweeps) across dimension d and tilt β. Not a math gate —
+a longer/shorter chain samples the same π_β with more/less MC error. Decided *after* a MEASURE-FIRST
+sweep (`benchmarks/M11_5_SCHEDULE_TAU.md`): τ_int across 9 strains (d=34…145) × β∈{0,1,8,16}, which
+reproduces the M11.4 census exactly on shared strains.
+
+**Measured, and it decided the fork:**
+- τ vs d at β=0 is super-linear *and statistic-dependent*: median ∝ d^1.18, **p90 ∝ d^1.63**, worst
+  ∝ d^2.23; plus ±1.5–2× strain-to-strain scatter at fixed d.
+- **β inflates τ hugely and unpredictably from d**: p90-τ(β=16)/τ(0) mean 7.4×, **max 26.8×** — the
+  largest on the *smallest* model (bifido d=46), the smallest (4.0×) on the *largest* (Rahnella
+  d=145). No β=0 quantity carries it.
+- "worst" is a noise floor (minESS 3–9 at β=16); J-only ESS hides the problem (census). **p90 is the
+  robust target.**
+
+**Settled contract (Codex DISAGREE r1+r2 on the *contract* while endorsing the *direction*, then
+AGREE r3 — the "read the reasoning, not the verdict" pattern; every contested point sharpened it):**
+
+1. **Reject A** (fixed `N(d)=base·(d/d_ref)^p`): the exponent is not a constant, there is fixed-d
+   scatter, and it ignores a 27× β-inflation. "A guess dressed as a rule", now measured to fail.
+2. **Build B (`schedule_mode="pilot_ess"`)**; **defer C** (doubling). *Correct the record:* the
+   restart guard does **not** resume a changed schedule — `_already_done` **raises** on a changed
+   `recipe_key`, and no RNG checkpoint is stored — so C is *re-run longer in a fresh dir from seed*,
+   not resume. (The M11.5 spec's "restart guard already supports resumption" was false; corrected.)
+3. **Name limits the claim.** `pilot_ess`, not `target_ess`: the β=0 pilot predicts the β=0 schedule;
+   at β=16 the mode can predict 400 and deliver 15. The name must not assert an achieved property.
+4. **`resolve_schedule(sampler, transform, scale_pilot)`**, pure/deterministic. Signature carries the
+   **transform** (r2 hole: `ScalePilot` stores fluxes + a transform *key*, not `T`, so the resolver
+   could not derive the movable mask) and *binds* `transform.content_key() == scale_pilot.recipe.
+   transform_key`. Mask = `movable_reactions(transform)` (exact structural, not a std threshold).
+   `ess = effective_sample_size(scale_pilot.fluxes[:, :, movable])`; ESS≤0 → τ=∞ **retained** in the
+   quantile; `q = percentile(τ_int, 100·schedule_ess_quantile)` (τ_int = pilot_chains·pilot_samples/
+   ess; thin: `q *= pilot_thin/prod_thin`). Nonfinite q → n = cap (ceil(inf) raises). Else
+   `n = min(cap, max(n_samples, ceil(target_ess · q / n_chains)))`. Uses `sampler.n_chains` only (no
+   second chain-count). **burn_in is not sized by τ** (autocorrelation is the wrong instrument) —
+   left = requested; a burn-in policy is deferred.
+5. **Verification is two separate booleans** (r2 hole: fixed burn_in is fine, but J-only R̂ cannot
+   verify flux mixing). Add flux-level split-R̂ (**max over movable**) + p10 flux-ESS per rung to
+   `run_diagnostics`: `ess_target_met` (achieved p10 flux-ESS ≥ target) **and**
+   `convergence_diagnostic_passed` (flux max R̂ ≤ bar; **nonfinite → failed, no rung passes
+   silently**). "target_verified" = both, worded evidence-not-proof; β>0 rungs that miss are flagged.
+6. **Pilot source:** reuse the **T₁ ScalePilot** (production-frame fluxes), which exists only under
+   `energy_scale="pilot_sd"`. `pilot_ess` without it is a config-time error, not a silent fallback.
+   A dedicated flux pilot for other configs is deferred.
+7. **Keying:** resolve in `prepare_model` after `calibrate`, before `ModelPlan`; the result becomes
+   `plan.sampler`, so `sample_recipe_key` and the workers read the resolved integers. Manifest records
+   **both** `requested_sampler` and `resolved_sampler` + the resolver inputs (pilot key, raw quantile
+   τ, target, quantile, uncapped n, cap-hit, `schedule_impl_version`) — fixing `reports["config"]`,
+   which echoed the *unresolved* config. `fixed` mode is byte-identical for **sample artifacts**
+   (only the echoed config/manifest gains fields). A ceil-boundary cross across machines → different
+   integer → different sample key → **safe false MISS**, never a collision.
+
+**Build-diff review (Codex, 2026-07-18): keying CONFIRMED correct, one honesty hole found & fixed.**
+Codex verified the resolved `n_samples` reaches both `sample_recipe_key` and worker execution, and
+that omitting policy-only fields (`schedule_mode`/`target_ess`) from the key is valid because equal
+resolved sampling fields produce equal bytes (confirmed independently: fixed-mode flux arrays are
+**sha256-identical** to pre-change). The hole: **`max_schedule_sweeps` was enforced in retained-draw
+units, not sweeps** — with `thin > 1` a run could spend up to `thin×` its declared sweep budget while
+reporting `cap_hit=false`, and the validation checked `cap ≥ n_samples` instead of `n_samples·thin`.
+Fixed per Codex's prescription (a): the cap stays in sweeps, the resolver clamps draws to
+`max_schedule_sweeps // thin`, `cap_hit` is decided in sweep units, and validation requires
+`cap ≥ n_samples·thin`. Dormant at the ubiquitous `thin=1` (so fixed-mode byte-identity is untouched),
+but a real name/unit lie under thinning. Test-locked (`test_cap_is_a_sweep_budget_under_thinning`:
+thin=5, 1000-sweep cap → 200 draws). **Result: 1004 tests green (+25), ruff + mypy clean.**

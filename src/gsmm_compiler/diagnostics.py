@@ -42,6 +42,19 @@ Relative to a floored ``|S|·|v|`` (`NativeCSC.relative_residual`), and matched 
 ``span_tol``: below this the residual is the arithmetic that measured it, not a real excursion.
 """
 
+SAMPLING_RHAT_BAR = 1.05
+"""Split-R̂ a rung's **flux** coordinates must clear for `convergence_diagnostic_passed` (M11.5).
+
+Not R̂ of ``J``: the census (`benchmarks/M11_4_CENSUS.md`) measured R̂(J)=1.07 while the worst *flux*
+R̂ was 1.48 — J mixes while the chain is trapped along objective-neutral directions. So the
+schedule's "target verified" claim rests on the flux R̂, not J's. A diagnostic, not a proof: R̂ is
+only as informative as the starts are dispersed (see the module docstring)."""
+
+_MOVABLE_STD_FLOOR = 1e-8
+"""A stored reaction "moves" for the flux convergence check if its pooled std exceeds this (mirrors
+`benchmarks/census_diag.py`). A structurally-constant reaction has R̂ = 1 and undefined ESS;
+including it would inflate the pass rate, so the check assesses only what actually moved."""
+
 
 class DiagnosticsError(ValueError):
     """The draws handed in are not a shape a diagnostic can be computed from."""
@@ -405,6 +418,117 @@ def feasibility_report(
 # ---- the M8 run-diagnostics report (feasibility / objective / mcmc / geometry / solver) ---------
 
 
+_SAMPLE_ARRAY_BY_MODE = {"full_flux": "flux", "reduced": "coordinates"}
+
+
+def _load_sampling_array(
+    chain_dir: Any, unit: dict[str, Any], store_mode: str
+) -> NDArray[np.float64] | None:
+    """One chain's sampled array — full flux (``full_flux``) or coordinates (``reduced``).
+
+    ``None`` (rather than an exception) when the array is absent or unreadable, so a run whose
+    storage somehow lacks it still produces the rest of the diagnostics with an explicit
+    "unavailable" flag rather than crashing the whole report.
+    """
+    from gsmm_compiler.output import load_array  # local: keeps diagnostics import-light
+
+    name = _SAMPLE_ARRAY_BY_MODE.get(store_mode)
+    if name is None:
+        return None
+    ref = unit.get("arrays", {}).get(name)
+    if ref is None:
+        return None
+    try:
+        array = load_array(
+            chain_dir / ref["file"],
+            sha256=ref["sha256"],
+            dtype=ref["dtype"],
+            shape=tuple(ref["shape"]),
+        )
+    except (OSError, KeyError, ValueError):
+        return None
+    return array.astype(VALUE_DTYPE, copy=False)
+
+
+def _sampling_summary(per_beta: list[dict[str, Any]]) -> dict[str, Any]:
+    """Roll the per-rung flux convergence up to one verdict for the model.
+
+    ``all_rungs_target_verified`` is the honest headline: it is ``True`` only if **every** rung both
+    reached the target ESS and passed the flux R̂ bar. A ``pilot_ess`` run whose β=0 pilot predicted
+    the target lands here as ``False`` at high β, with the offending rungs named — the measurement's
+    whole point (`benchmarks/M11_5_SCHEDULE_TAU.md`: β inflates τ up to 27×, unpredictably)."""
+    rungs = [b for b in per_beta if "flux_worst_rhat" in b]
+    if not rungs:
+        return {"available": False}
+    p10s = [b["flux_p10_ess"] for b in rungs if b.get("flux_p10_ess") is not None]
+    verified = [b["target_verified"] for b in rungs if b.get("target_verified") is not None]
+    return {
+        "available": True,
+        "rhat_bar": SAMPLING_RHAT_BAR,
+        "max_flux_r_hat": max(b["flux_worst_rhat"] for b in rungs),
+        "min_flux_p10_ess": min(p10s) if p10s else None,
+        "all_rungs_convergence_passed": all(
+            b["convergence_diagnostic_passed"] for b in rungs
+        ),
+        "all_rungs_target_verified": all(verified) if verified else None,
+        "rungs_target_not_verified": [
+            b["beta"] for b in rungs if b.get("target_verified") is False
+        ],
+    }
+
+
+def _sampling_convergence(
+    samples: NDArray[np.float64], *, target_ess: int | None, bar: float
+) -> dict[str, Any]:
+    """Flux/coordinate-level split-R̂ and ESS for one rung, plus its two verification booleans.
+
+    ``samples`` is ``(n_chains, n_samples, n_stored)`` — full fluxes in ``full_flux`` mode, or
+    rounded coordinates in ``reduced`` mode. Only reactions that actually moved are assessed
+    (``_MOVABLE_STD_FLOOR``). The two booleans are kept **separate** on purpose (Codex, M11.5):
+
+    * ``convergence_diagnostic_passed`` — the worst movable split-R̂ is finite and ≤ ``bar``. A
+      nonfinite R̂ (a coordinate constant within chains but not across them — no mixing at all) is a
+      **failure**, never a silent pass.
+    * ``ess_target_met`` — the protected (10th-percentile) ESS reached ``target_ess``. ``None`` when
+      no target was declared (``schedule_mode="fixed"``).
+
+    ``target_verified`` requires **both**, and even then it is evidence, not proof: R̂ is only as
+    informative as the starts are dispersed (module docstring). Reporting the achieved flux-ESS
+    here — not trusting the β=0 pilot's *prediction* — is what stops `pilot_ess` from claiming a
+    target it does not meet at high β (`schedule.resolve_schedule`).
+    """
+    nc, ns, n_stored = samples.shape
+    pooled = samples.reshape(nc * ns, n_stored)
+    movable = np.flatnonzero(pooled.std(axis=0) > _MOVABLE_STD_FLOOR)
+    if movable.size == 0:  # nothing moved (a pinned polytope): trivially converged, no ESS reported
+        return {
+            "flux_n_assessed": 0,
+            "flux_worst_rhat": 1.0,
+            "flux_p10_ess": None,
+            "convergence_diagnostic_passed": True,
+            "ess_target_met": None if target_ess is None else True,
+            "target_verified": None if target_ess is None else True,
+        }
+    sub = samples[:, :, movable]
+    rhat = split_r_hat(sub)
+    ess = effective_sample_size(sub)
+    worst_rhat = float(rhat.max())
+    p10_ess = float(np.percentile(ess, 10.0))
+    converged = bool(np.isfinite(worst_rhat) and worst_rhat <= bar)
+    ess_met = None if target_ess is None else bool(p10_ess >= target_ess)
+    verified = None if ess_met is None else bool(ess_met and converged)
+    return {
+        "flux_n_assessed": int(movable.size),
+        "flux_worst_rhat": worst_rhat,
+        "flux_median_rhat": float(np.median(rhat)),
+        "flux_p10_ess": p10_ess,
+        "flux_median_ess": float(np.median(ess)),
+        "convergence_diagnostic_passed": converged,
+        "ess_target_met": ess_met,
+        "target_verified": verified,
+    }
+
+
 def run_diagnostics(layout: Any, model_id: str) -> dict[str, Any]:
     """Assemble one completed model's diagnostics JSON from its stored artifacts (M8).
 
@@ -424,12 +548,17 @@ def run_diagnostics(layout: Any, model_id: str) -> dict[str, Any]:
     manifest = read_json(layout.model_manifest_path(model_id))
     betas = manifest["betas"]
     n_chains = int(manifest["axes"]["n_chains"])
+    store_mode = str(manifest.get("store_mode", "full_flux"))
+    # The target the schedule was sized to, if any — read off the RESOLVED sampler the run used, so
+    # a `fixed`-mode run reports flux convergence with no target to meet (Codex, M11.5 review).
+    target_ess = manifest.get("resolved_sampler", {}).get("target_ess")
 
     per_beta: list[dict[str, Any]] = []
     worst_bound = 0.0
     worst_mass_balance = 0.0
     for beta_index, beta in enumerate(betas):
         chains = []
+        samples = []
         for chain_index in range(n_chains):
             chain_dir = layout.chain_dir(model_id, beta_index, chain_index)
             unit = read_json(chain_dir / "manifest.json")
@@ -442,23 +571,36 @@ def run_diagnostics(layout: Any, model_id: str) -> dict[str, Any]:
                     shape=tuple(ref["shape"]),
                 )
             )
+            samples.append(_load_sampling_array(chain_dir, unit, store_mode))
             worst_bound = max(worst_bound, float(unit["diagnostics"]["max_bound_violation"]))
             worst_mass_balance = max(
                 worst_mass_balance, float(unit["diagnostics"]["max_mass_balance_residual"])
             )
         stacked = np.stack(chains)  # (n_chains, n_samples)
-        per_beta.append(
-            {
-                "beta": float(beta),
-                "beta_index": beta_index,
-                "mean_j": float(stacked.mean()),
-                "r_hat_j": float(split_r_hat(stacked)[0]),
-                "ess_j": float(effective_sample_size(stacked)[0]),
-                "mcse_j": float(mcse(stacked)[0]),
-            }
-        )
+        rung = {
+            "beta": float(beta),
+            "beta_index": beta_index,
+            "mean_j": float(stacked.mean()),
+            "r_hat_j": float(split_r_hat(stacked)[0]),
+            "ess_j": float(effective_sample_size(stacked)[0]),
+            "mcse_j": float(mcse(stacked)[0]),
+        }
+        # Flux-level convergence — the statistic the "target verified" claim actually rests on.
+        # J-only convergence hides a chain trapped along objective-neutral flux directions (census).
+        # Skipped only if the sampled arrays could not be loaded (recorded, never guessed).
+        loaded = [s for s in samples if s is not None]
+        if len(loaded) == len(samples):
+            rung.update(
+                _sampling_convergence(
+                    np.stack(loaded), target_ess=target_ess, bar=SAMPLING_RHAT_BAR
+                )
+            )
+        else:  # pragma: no cover - the sampled array is always stored; kept honest if it is not
+            rung["flux_convergence_unavailable"] = True
+        per_beta.append(rung)
 
     monotonicity = _mean_j_monotonicity(per_beta)
+    sampling = _sampling_summary(per_beta)
     return {
         "model_id": model_id,
         "feasibility": {
@@ -473,6 +615,10 @@ def run_diagnostics(layout: Any, model_id: str) -> dict[str, Any]:
             "min_ess_j": min((b["ess_j"] for b in per_beta), default=0.0),
             "mean_j_monotonicity": monotonicity,
         },
+        # M11.5: the flux-level verdict + how the schedule was sized. Separate from `mcmc` (J-only)
+        # so existing consumers are untouched and the two convergence views sit side by side.
+        "sampling_convergence": sampling,
+        "schedule": manifest.get("schedule"),
         "geometry": manifest.get("geometry"),
         "solver": manifest.get("lp_optimum"),
     }
