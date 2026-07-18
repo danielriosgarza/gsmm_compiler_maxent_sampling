@@ -71,7 +71,7 @@ Implemented in **M5**; the mass-balance gate replaced in **M9** — see BUILD_PL
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields
-from typing import Any, TypeVar
+from typing import Any, Final, TypeVar
 
 import numpy as np
 from numpy.typing import NDArray
@@ -90,16 +90,39 @@ from gsmm_compiler.provenance import content_key
 
 _ArrayT = TypeVar("_ArrayT", bound=np.ndarray[Any, Any])
 
-ROUNDING_IMPL_VERSION = 2
+ROUNDING_IMPL_VERSION = 3
 """Bump when the transform's arithmetic changes — invalidates every cached ``T`` and its samples.
 
 2 (M10): `RoundingDiagnostics` gained `covariance_source`, so a v1 bundle cannot say which
 estimator produced its ``C_q``. `from_cache` would reject it on the missing field anyway; bumping
 the version makes such a bundle **miss** the cache instead of erroring on a hit — BUILD_PLAN §1.1's
 rule that a refactor changing artifact semantics must miss, never load stale.
+
+3 (M11.3): `ReachabilityCertificate` gained `n_unknown_witnesses`, so a v2 bundle's certificate
+lacks a field `from_cache` now requires. Same rule: a schema change must **miss**, not error on a
+hit. The certificate's *bound* arithmetic is unchanged — the bump is the new field, not new numbers.
 """
 
 VALUE_DTYPE = np.float64
+
+_REACHABLE_WITNESS_STATUSES: Final = frozenset({"kOptimal", "kUnknown"})
+"""Model statuses whose row duals `_reachable_extreme` will accept — the provably-reachable set for
+the reachable-mass-balance LP, and nothing wider (M11.3).
+
+The bound `_reachable_extreme` builds is an upper bound for **any** finite duals (weak duality), so
+a ``kUnknown`` solve — a warm-started instance that could not *certify* optimality though its duals
+stay sound — is usable; measured across the 6 curated strains that hit it, its duals agree with a
+cold optimal re-solve to 8–9 digits and the completed certificate is CERTIFIED 12–27× inside 1e-9.
+
+``kUnbounded`` and ``kInfeasible`` **cannot** arise for this LP and are deliberately absent, so
+their appearance raises rather than being read: every column is bounded (``|y_k| ≤ Ω_k``, ``Ω``
+finite from `_reachable_coordinate_box`), and ``y = 0`` is always feasible (the centre is in
+bounds, so ``T·0 = 0 ∈ [l−c, u−c]`` and ``|0| ≤ Ω``). Either status means the LP built is not
+the one intended — a corrupt IR — which must fail loudly. Limit/error statuses are likewise absent
+and stay fail-closed: boundedness and feasibility do not rule them out, so accepting them would
+broaden an incident-specific policy past its evidence (Codex, M11.3 review). ``kUnknown`` is here
+because it is the **measured** degradation mode, not because it is the only non-optimal status.
+"""
 
 _BYTES_PER_FLOAT64 = 8
 
@@ -1110,6 +1133,19 @@ class ReachabilityCertificate:
     directly."""
 
     n_lps: int
+
+    n_unknown_witnesses: int
+    """How many of the ``n_lps`` solves returned ``kUnknown`` — a warm-started instance that could
+    not *certify* optimality — yet handed back usable duals the bound was built from anyway (M11.3).
+
+    Zero on a clean build; the 6 curated strains that hit this see 1–2. It is **telemetry, not a
+    gate**: the weak-duality bound is valid for any finite duals (see
+    `_REACHABLE_WITNESS_STATUSES`), so a positive count does not weaken the certificate — it makes
+    the exceptional path *visible* in a cached artifact rather than only in build-time logs (the
+    M10.2e "visibility beside elimination" rule). A rising count across a batch is the early sign of
+    a degrading solver worth looking at.
+    """
+
     elapsed_seconds: float
     polytope_key: str
 
@@ -1151,15 +1187,22 @@ class ReachabilityCertificate:
                 f"a reachability certificate's contract must be finite and positive, got "
                 f"{self.contract!r}"
             )
-        if min(self.n_rows, self.n_rows_certified, self.n_lps) < 0:
+        if min(self.n_rows, self.n_rows_certified, self.n_lps, self.n_unknown_witnesses) < 0:
             raise RoundingError(
                 f"a reachability certificate cannot have negative counts (n_rows={self.n_rows}, "
-                f"n_rows_certified={self.n_rows_certified}, n_lps={self.n_lps})"
+                f"n_rows_certified={self.n_rows_certified}, n_lps={self.n_lps}, "
+                f"n_unknown_witnesses={self.n_unknown_witnesses})"
             )
         if self.n_rows_certified > self.n_rows:
             raise RoundingError(
                 f"a reachability certificate claims {self.n_rows_certified} rows certified out of "
                 f"{self.n_rows}"
+            )
+        if self.n_unknown_witnesses > self.n_lps:
+            raise RoundingError(
+                f"a reachability certificate claims {self.n_unknown_witnesses} kUnknown witnesses "
+                f"out of {self.n_lps} solves: each witness is one of those solves, so this "
+                "evidence is corrupt"
             )
 
     @property
@@ -1185,6 +1228,7 @@ class ReachabilityCertificate:
             "reachable_n_rows": self.n_rows,
             "reachable_n_rows_certified": self.n_rows_certified,
             "reachable_n_lps": self.n_lps,
+            "reachable_n_unknown_witnesses": self.n_unknown_witnesses,
             "reachable_elapsed_seconds": self.elapsed_seconds,
             "reachable_is_certified": self.is_certified,
             "reachable_margin": self.margin,
@@ -1334,6 +1378,7 @@ def certify_reachable_mass_balance(
             n_rows=n_rows,
             n_rows_certified=0,
             n_lps=0,
+            n_unknown_witnesses=0,
             elapsed_seconds=time.perf_counter() - start,
             polytope_key=transform.polytope_key,
             transform_key=transform.content_key(),
@@ -1354,7 +1399,7 @@ def certify_reachable_mass_balance(
         name="reachable_mass_balance",
     )
 
-    worst_absolute, worst_row, n_lps, n_certified = 0.0, 0, 0, 0
+    worst_absolute, worst_row, n_lps, n_certified, n_unknown = 0.0, 0, 0, 0, 0
     for row in range(n_rows):
         objective = energy[row]
         if not objective.any():
@@ -1364,13 +1409,17 @@ def certify_reachable_mass_balance(
             bound = abs(float(residual_at_centre[row]))
         else:
             offset = float(residual_at_centre[row])
-            high = offset + _reachable_extreme(program, matrix, objective, row_lower, row_upper,
-            omega)
-            low = offset - _reachable_extreme(
+            high_bound, high_unknown = _reachable_extreme(
+                program, matrix, objective, row_lower, row_upper, omega
+            )
+            low_bound, low_unknown = _reachable_extreme(
                 program, matrix, -objective, row_lower, row_upper, omega
             )
+            high = offset + high_bound
+            low = offset - low_bound
             n_lps += 2
             n_certified += 1
+            n_unknown += int(high_unknown) + int(low_unknown)
             bound = max(abs(low), abs(high))
 
         if bound > worst_absolute:
@@ -1384,6 +1433,7 @@ def certify_reachable_mass_balance(
         n_rows=n_rows,
         n_rows_certified=n_certified,
         n_lps=n_lps,
+        n_unknown_witnesses=n_unknown,
         elapsed_seconds=time.perf_counter() - start,
         polytope_key=transform.polytope_key,
         transform_key=transform.content_key(),
@@ -1451,8 +1501,14 @@ def _reachable_extreme(
     row_lower: NDArray[np.float64],
     row_upper: NDArray[np.float64],
     omega: NDArray[np.float64],
-) -> float:
+) -> tuple[float, bool]:
     """A **rigorous upper bound** on ``max_{y ∈ Y} objective·y``, from weak duality.
+
+    Returns ``(bound, from_unknown)`` — ``from_unknown`` is ``True`` when HiGHS could not certify
+    the solve optimal (``kUnknown``) but returned usable duals anyway, which the caller only
+    *counts*, for telemetry. It never enters the bound: the inequality below holds for any finite
+    duals, so a ``kUnknown`` solve's multipliers give an upper bound exactly as an optimal one's do
+    — the status changes only the *tightness*, not the validity. See `_REACHABLE_WITNESS_STATUSES`.
 
     **Never from the primal.** M4 established this and named the next two milestones as the places
     the temptation would return: a returned ``objective_value`` is a *lower* bound on the maximum —
@@ -1479,9 +1535,10 @@ def _reachable_extreme(
     """
     norm = float(np.abs(objective).max())
     unit = objective / norm
-    solution = program.maximize(unit)
+    witness = program.maximize_dual_witness(unit, accept=_REACHABLE_WITNESS_STATUSES)
+    from_unknown = "kUnknown" in witness.model_status
 
-    duals = np.asarray(solution.row_duals, dtype=VALUE_DTYPE)
+    duals = np.asarray(witness.row_duals, dtype=VALUE_DTYPE)
     if not np.all(np.isfinite(duals)):
         raise RoundingError("HiGHS returned non-finite row duals; no bound can be built from them")
 
@@ -1505,4 +1562,4 @@ def _reachable_extreme(
     bound = (value + allowance) * norm
     if not np.isfinite(bound):
         raise RoundingError("the reachable dual bound is not finite; the LP's duals are unusable")
-    return bound
+    return bound, from_unknown

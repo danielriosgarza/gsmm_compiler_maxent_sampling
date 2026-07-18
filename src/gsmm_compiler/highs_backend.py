@@ -89,11 +89,22 @@ class HighsBackendError(RuntimeError):
 
 
 class LPNotOptimalError(HighsBackendError):
-    """The LP terminated at a non-optimal model status (infeasible, unbounded, limit reached…)."""
+    """The LP terminated at a model status the caller does not accept.
 
-    def __init__(self, model_status: str, name: str) -> None:
+    ``solve`` accepts only ``kOptimal``. The dual-witness path (`solve_dual_witness`) accepts a
+    caller-declared whitelist, so the message names *what was expected* rather than hardcoding
+    ``kOptimal`` — a witness that legitimately accepts ``kUnknown`` must not report that a status
+    it accepted was "expected kOptimal". Callers still discriminate on ``model_status`` (e.g.
+    `sparse_objective.critical_l1_penalty` on unbounded ``J*``, `affine_geometry`'s ``kUnknown``
+    escalation), which is why this stays one exception type carrying the raw status string.
+    """
+
+    def __init__(
+        self, model_status: str, name: str, *, accepted: frozenset[str] | None = None
+    ) -> None:
+        expected = "kOptimal" if accepted is None else f"one of {sorted(accepted)}"
         super().__init__(
-            f"LP {name!r} terminated with model status {model_status}, expected kOptimal"
+            f"LP {name!r} terminated with model status {model_status}, expected {expected}"
         )
         self.model_status = model_status
 
@@ -174,6 +185,33 @@ class LPSolution:
     this; only this number can. `affine_geometry` gates its span certificate on it.
     """
     simplex_iterations: int
+    elapsed_seconds: float
+
+
+@dataclass(frozen=True)
+class LPDualWitness:
+    """Row multipliers from a solve that may **not** be optimal — the raw material of a weak-duality
+    bound, and nothing more.
+
+    Deliberately not an `LPSolution`. Holding an `LPSolution` *proves* HiGHS reported ``kOptimal``
+    (that is the whole point of `solve` raising otherwise); holding one of these proves only that
+    the solver ran and returned a status the caller had **declared acceptable** for a dual-only use.
+    It carries no ``primal``, no ``objective_value`` — because a caller that reads those would be
+    trusting a point the solver did not certify. The one legitimate consumer is a bound of the form
+    ``max cᵀv ≤ bᵀy + Σⱼ max(dⱼlⱼ, dⱼuⱼ)`` (see `LPSolution.row_duals`), which holds for **any**
+    finite ``y`` — no optimality, dual feasibility, or primal feasibility required. So a
+    ``kUnknown`` solve's duals still give an upper bound; only *tightness* is at the solver's mercy.
+
+    `solve_dual_witness` validates ``row_duals.shape == (n_rows,)`` before constructing one: a model
+    status alone does not guarantee HiGHS populated the dual vector (``HighsSolution::clear`` leaves
+    it empty, and some ``kUnknown`` paths discard duals), so an empty or wrong-length vector must
+    fail closed rather than be read as "no binding constraints". (Codex, M11.3 review, verified
+    against the HiGHS 1.15.1 source.)
+    """
+
+    model_status: str
+    run_status: str
+    row_duals: NDArray[np.float64]
     elapsed_seconds: float
 
 
@@ -344,11 +382,15 @@ class HighsLinearProgram:
         """
         self._frozen = True
 
-    def solve(self) -> LPSolution:
-        """Solve, and return the solution only if HiGHS reports ``kOptimal``.
+    def _run_solver(self) -> tuple[Any, Any, float]:
+        """Run HiGHS once and return ``(model_status, run_status, elapsed)`` — no solution read.
 
-        Raises `LPNotOptimalError` on any other model status — an infeasible or unbounded LP must
-        not reach the scientific code wearing the clothes of an answer.
+        The shared prefix of `solve` and `solve_dual_witness`: the frozen-check, the timed ``run``,
+        the process solve counter, and the ``kError`` guard. Neither the ``kOptimal`` gate nor
+        ``getSolution`` lives here, because that is exactly where the two paths diverge — `solve`
+        accepts only ``kOptimal`` and reads a full `LPSolution`; the witness path accepts a declared
+        whitelist and reads only the row duals. Extracting this keeps `solve`'s observable behaviour
+        byte-identical (it still raises before ``getSolution`` on a non-optimal status).
         """
         if self._frozen:
             raise SolverFrozenError(
@@ -367,7 +409,20 @@ class HighsLinearProgram:
         if run_status == highspy.HighsStatus.kError:
             raise HighsBackendError(f"HiGHS failed to run {self.name!r} (run returned kError)")
 
-        model_status = self._highs.getModelStatus()
+        return self._highs.getModelStatus(), run_status, elapsed
+
+    def solve(self) -> LPSolution:
+        """Solve, and return the solution only if HiGHS reports ``kOptimal``.
+
+        Raises `LPNotOptimalError` on any other model status — an infeasible or unbounded LP must
+        not reach the scientific code wearing the clothes of an answer. **This gate is load-bearing
+        elsewhere** and must not be loosened: `sparse_objective.critical_l1_penalty` reads an
+        unbounded status *through* this exception to detect a zero-cost growth path, and
+        `affine_geometry` escalates a ``kUnknown`` FVA solve by catching it. A caller that needs the
+        duals of a non-optimal solve uses `solve_dual_witness`, which does not touch this method.
+        """
+        highspy = self._highs_module
+        model_status, run_status, elapsed = self._run_solver()
         if model_status != highspy.HighsModelStatus.kOptimal:
             raise LPNotOptimalError(str(model_status), self.name)
 
@@ -403,6 +458,64 @@ class HighsLinearProgram:
         self.set_objective(costs)
         self.set_maximize()
         return self.solve()
+
+    def solve_dual_witness(self, *, accept: frozenset[str]) -> LPDualWitness:
+        """Solve, and return the **row duals** whenever HiGHS reports a status in ``accept``.
+
+        For a caller whose only use of the solution is a weak-duality bound (`LPDualWitness`), the
+        ``kOptimal`` gate in `solve` is too strong: the bound holds for *any* finite duals, so a
+        ``kUnknown`` solve — a warm-started instance that could not *certify* optimality though its
+        duals stay sound — is usable. This reads them without loosening `solve` (which must go on
+        refusing for every other caller, `sparse_objective.critical_l1_penalty` among them).
+
+        ``accept`` is a whitelist of `HighsModelStatus` **member names** (e.g. ``"kOptimal"``,
+        ``"kUnknown"``), and it is the caller's assertion that every status in it is one whose duals
+        are meaningful *for its LP*. It is matched by exact name — not the substring test used
+        loosely elsewhere, which would let ``"Unbounded"`` also accept ``kUnboundedOrInfeasible`` —
+        and the tokens are validated against the live enum, so a typo fails loudly here rather than
+        silently refusing every solve. A status outside ``accept`` raises `LPNotOptimalError` before
+        `getSolution` is ever called, exactly as `solve` refuses before reading.
+
+        No dual-**quality** signal is consulted (``max_dual_infeasibility`` and the like): gating a
+        dual-based bound on a quality reading is the anti-pattern the whole M11 family traces to.
+        The only guards are structural — the status whitelist, and that the returned dual vector has
+        the right length (a model status does not guarantee HiGHS populated it).
+        """
+        highspy = self._highs_module
+        valid = set(highspy.HighsModelStatus.__members__)
+        unknown_tokens = accept - valid
+        if unknown_tokens:
+            raise HighsBackendError(
+                f"solve_dual_witness accept={sorted(accept)} names statuses that are not HiGHS "
+                f"model statuses: {sorted(unknown_tokens)} — a typo would silently refuse every LP"
+            )
+
+        model_status, run_status, elapsed = self._run_solver()
+        if model_status.name not in accept:
+            raise LPNotOptimalError(str(model_status), self.name, accepted=accept)
+
+        solution = self._highs.getSolution()
+        row_duals = np.asarray(solution.row_dual, dtype=VALUE_DTYPE)
+        if row_duals.shape != (self._n_rows,):
+            raise HighsBackendError(
+                f"HiGHS returned {row_duals.size} row duals at status {model_status!s}, expected "
+                f"{self._n_rows}: an accepted status does not guarantee a populated dual vector, "
+                "so no bound can be built from this one"
+            )
+        return LPDualWitness(
+            model_status=str(model_status),
+            run_status=str(run_status),
+            row_duals=row_duals,
+            elapsed_seconds=elapsed,
+        )
+
+    def maximize_dual_witness(
+        self, costs: NDArray[np.float64], *, accept: frozenset[str]
+    ) -> LPDualWitness:
+        """Set an objective and solve for its dual witness — the witness twin of `maximize`."""
+        self.set_objective(costs)
+        self.set_maximize()
+        return self.solve_dual_witness(accept=accept)
 
 
 # ---- helpers ------------------------------------------------------------------------------------

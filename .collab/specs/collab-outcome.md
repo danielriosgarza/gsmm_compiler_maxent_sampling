@@ -1438,3 +1438,53 @@ measured **invariant** (fluxes `e1ee88278c` at 1 and 14 threads; the certificate
 both, because the original only hashed `coordinates` — **it was defending a claim broader than the one
 it checked.** Writing that test surfaced the manifest/timing precision now in §1.1: `to_cache()`
 carries `elapsed_seconds`, so the *bundle's bytes* are never reproducible and were never the claim.
+
+---
+
+## M11.3 — reachability's caller-specific dual-witness path (2026-07-18; Claude×Codex, 2 rounds, consensus)
+
+**Design review before building (required M9 gate). Codex round 1 DISAGREE ×3; round 2 AGREE, none contested.**
+Full spec + measured premise: `.collab/specs/m113-reachability-dual-witness.md`.
+
+**Premise, measured on all 6 failing strains (~2838 solves):** the only non-optimal status is `kUnknown`
+(never kUnbounded/kInfeasible); `max_dual_infeasibility==0.0` on every kUnknown solve; the discarded
+kUnknown duals give a bound agreeing with a cold optimal re-solve to 8–9 digits; the completed
+certificate is CERTIFIED 12–27× inside 1e-9; and the kUnknown row is never the binding row.
+
+**Adopted from Codex (round 1):**
+1. Narrow `LPDualWitness{model_status, run_status, row_duals, elapsed}` return type — NOT `LPSolution`,
+   whose "holding one proves kOptimal" invariant must stay true. Witness validates `row_duals.shape`
+   only (Codex confirmed at HiGHS 1.15.1 source that `HighsSolution::clear()` can empty `row_dual`, so
+   the shape check is load-bearing, not decorative — it fails closed on an empty/short/long dual vector).
+2. Exact `status.name` match (not substring — `"Unbounded" in …` also matches `kUnboundedOrInfeasible`);
+   accept-token validation; `LPNotOptimalError` gains `accepted=` for an accurate witness-path message.
+3. Telemetry: `n_unknown_witnesses` on `ReachabilityCertificate` (durable/cached — visibility beside
+   elimination); bump `ROUNDING_IMPL_VERSION` 2→3 (schema change ⇒ stale bundles MISS, never hit-then-error).
+
+**Whitelist `{kOptimal, kUnknown}`** — not tighter (kOptimal is the common case), not wider (limit/error
+statuses are NOT ruled out by boundedness/feasibility, so they stay fail-closed). kUnbounded/kInfeasible
+cannot arise for THIS LP (finite Ω columns; y=0 ∈ Y), asserted via the whitelist, not assumed. No
+dual-quality gate — that veto-a-dual-claim-on-a-primal-signal pattern is the whole M11 family's disease.
+
+**Deferred (Codex round-1 point 1, conceded real): the objective-normalization residual charge.**
+`_reachable_extreme` proves the bound for `norm·unit`, not `objective`; the term `Σ|objective−norm·unit|·Ω`
+and the final `*norm`/`+offset`/`max` inward-rounding are uncharged. **Dual-independent** (never involves
+π; identical for kOptimal and kUnknown) and **pre-existing** (M9), so orthogonal to the dual-witness
+change. Measured: 2.7e-25 (Rahnella d145), 4.2e-26 (lactis d51) — ~16 orders below the 1e-9 contract,
+~8e-17 relative. M11.3 changes zero bound *values*; bundling a ~1e-25 dual-independent change would
+perturb every bound for unrelated reasons. Recorded as its own small hardening step. (Codex caveat:
+the measurement is prioritization evidence, not a universal bound over arbitrary future models.)
+
+**Closing review on the built diff (2026-07-18): Codex AGREE, none contested.** Verified: `solve()`
+byte-identical after the `_run_solver` extraction (only a harmless `_highs_module` lookup moved);
+`from_unknown` substring is unambiguous under the fixed accept set; `ROUNDING_IMPL_VERSION 2→3`
+changes the L3 lookup key + transform content key + pilot + sample identity, so stale bundles miss
+before `from_cache` can reject the new field (no other persisted certificate schema found); no
+non-optimal witness leaks to an optimality-assuming consumer (`_reachable_extreme` reads row duals
+only); the `n_unknown_witnesses ≤ n_lps` invariant is exact (2 solves / 2 possible unknowns per
+certified row; structural-zero and singleton paths record 0); the change cannot corrupt the sampled
+law. **Result: build-geometry OK 34 → 40 of 40** — the 6 `reachable_mass_balance` failures cleared
+(durable: the fix removes the failure mode, machine-independent), and the 4 previously-deferred
+strains (2 Hafnia, pumilus, Liquorilactobacillus) pass on this machine as basis-marginal. 979 tests
+green (+8), ruff + mypy clean. The integration test is non-vacuous by sabotage (reverting the call
+site to `program.maximize` fails it with `LPNotOptimalError kUnknown`).

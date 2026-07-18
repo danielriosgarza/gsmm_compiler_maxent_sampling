@@ -22,6 +22,7 @@ import pytest
 from tests.conftest import dense_polytope
 
 from gsmm_compiler.affine_geometry import build_geometry
+from gsmm_compiler.highs_backend import HighsLinearProgram
 from gsmm_compiler.rounding import (
     DEFAULT_MASS_BALANCE_CONTRACT,
     RoundingError,
@@ -168,6 +169,61 @@ def test_the_certificate_deliberately_misses_a_structural_corruption_that_the_di
     assert delta < DEFAULT_MASS_BALANCE_CONTRACT
 
 
+def test_the_certificate_completes_when_a_reachable_solve_returns_kunknown(
+    monkeypatch: Any,
+) -> None:
+    """M11.3: a warm-started reachable solve that returns ``kUnknown`` — the mode that refused 6 of
+    the 40 curated strains — must not sink the build.
+
+    The certificate reads the (sound) row duals of that solve for its weak-duality bound, which
+    holds for any finite duals, and finishes. Because those are the *same* duals the solver
+    computed, the bound is **bit-identical** to the clean build: accepting ``kUnknown`` changes
+    whether the loop finishes, not the number it finishes with. And it *records* that it leaned on a
+    degraded solve.
+
+    Non-vacuity: before M11.3, `_reachable_extreme` routed through `HighsLinearProgram.solve`, which
+    raises `LPNotOptimalError` on ``kUnknown`` *before* reading the duals — so this same relabel
+    made `certify_reachable_mass_balance` raise. Confirmed by sabotage: reverting the one call site
+    to ``program.maximize(...)`` makes this test fail with that exception.
+    """
+    import highspy
+
+    reduced = dense_polytope(
+        stoichiometry=[[1.0, -1.0, 0.0], [0.0, 1.0, -1.0]],
+        lower=[-10.0, -10.0, -10.0],
+        upper=[10.0, 10.0, 10.0],
+    )
+    transform = build_transform(build_geometry(reduced, model_id="kunknown"), reduced)
+
+    baseline = certify_reachable_mass_balance(transform, reduced)
+    assert baseline.n_lps > 0 and baseline.n_unknown_witnesses == 0, "premise: a clean build"
+
+    real_run = HighsLinearProgram._run_solver
+
+    def relabel_reachable_as_unknown(self: Any) -> Any:
+        # Run the real solve, then relabel ONLY the reachable LP's status as kUnknown. The solve
+        # itself is untouched, so the duals read afterward are exactly the optimal ones — this
+        # reproduces the measured reality (HiGHS returns sound duals but will not certify it)
+        # without depending on which model happens to trip a warm-started instance into kUnknown.
+        status, run_status, elapsed = real_run(self)
+        if self.name == "reachable_mass_balance":
+            status = highspy.HighsModelStatus.kUnknown
+        return status, run_status, elapsed
+
+    monkeypatch.setattr(HighsLinearProgram, "_run_solver", relabel_reachable_as_unknown)
+
+    relabeled = certify_reachable_mass_balance(transform, reduced)
+
+    assert relabeled.is_certified
+    assert relabeled.n_unknown_witnesses == relabeled.n_lps > 0, (
+        "every reachable solve was relabeled kUnknown, so every witness must be counted"
+    )
+    assert relabeled.worst_absolute == baseline.worst_absolute, (
+        "the kUnknown witness reads the same duals the optimal solve did, so the weak-duality "
+        "bound is the identical number — the fix changes whether the loop finishes, not the bound"
+    )
+
+
 def test_the_certificate_refuses_a_foreign_polytope(
     toy_canonical: Any, simplex_polytope: Any
 ) -> None:
@@ -215,4 +271,8 @@ def test_the_toy_model_certifies(toy_canonical: Any) -> None:
         "reachable_is_certified",
         "reachable_margin",
         "reachable_n_lps",
+        "reachable_n_unknown_witnesses",
     }
+    # A clean toy build certifies without any degraded solve — the exceptional path is measured, not
+    # assumed absent.
+    assert certificate.n_unknown_witnesses == 0

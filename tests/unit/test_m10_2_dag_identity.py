@@ -513,7 +513,7 @@ class TestNoTransformIsSampledUncertified:
         """
         good = dict(
             worst_absolute=3.8e-11, worst_row=0, worst_row_id="X", contract=1e-9,
-            n_rows=10, n_rows_certified=10, n_lps=20, elapsed_seconds=0.5,
+            n_rows=10, n_rows_certified=10, n_lps=20, n_unknown_witnesses=0, elapsed_seconds=0.5,
             polytope_key="p", transform_key="t",
         )
         assert ReachabilityCertificate(**good).is_certified, "premise: this one is genuine"
@@ -524,6 +524,7 @@ class TestNoTransformIsSampledUncertified:
             ("a non-finite contract", {"contract": float("inf")}),
             ("a negative LP count", {"n_lps": -5}),
             ("more rows certified than exist", {"n_rows_certified": 11}),
+            ("more kUnknown witnesses than solves", {"n_unknown_witnesses": 21}),
         ):
             with pytest.raises(RoundingError, match="certificate"):
                 ReachabilityCertificate(**{**good, **damage})  # type: ignore[arg-type]

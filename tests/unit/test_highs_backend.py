@@ -13,12 +13,15 @@ import pytest
 from gsmm_compiler.highs_backend import (
     HighsBackendError,
     HighsLinearProgram,
+    LPDualWitness,
     LPNotOptimalError,
     SolverFrozenError,
     reset_solve_count,
     total_solve_count,
 )
 from gsmm_compiler.native_csc import NativeCSC
+
+_WITNESS_ACCEPT = frozenset({"kOptimal", "kUnknown"})
 
 
 def _program(
@@ -192,6 +195,93 @@ class TestSolveCounter:
 
         assert total_solve_count() == before
         assert program.solve_count == 0
+
+
+class TestDualWitness:
+    """`solve_dual_witness` — read the row duals of a solve `solve` would refuse, without loosening
+    `solve` (M11.3). The reachable-mass-balance certificate needs the duals of a ``kUnknown`` solve
+    for a weak-duality bound that holds regardless of optimality; every other caller must keep
+    getting `LPNotOptimalError`, so `solve` is deliberately left untouched and these tests pin the
+    boundary between the two paths.
+    """
+
+    def test_reads_duals_on_an_accepted_nonoptimal_status(self) -> None:
+        """A genuinely UNBOUNDED LP: `solve` refuses it, but a witness that lists ``kUnbounded`` as
+        acceptable returns its row duals. This is the whole mechanism — reading the one output
+        `solve` discards on a non-optimal status — exercised on a real status, not a mocked one."""
+        program = _program([[1.0]], [0.0], [np.inf], [-np.inf], [np.inf], [1.0], maximize=True)
+
+        witness = program.solve_dual_witness(accept=frozenset({"kOptimal", "kUnbounded"}))
+
+        assert isinstance(witness, LPDualWitness)
+        assert "Unbounded" in witness.model_status
+        assert witness.row_duals.shape == (1,)
+        assert witness.row_duals.dtype == np.float64
+
+    def test_refuses_a_status_outside_the_whitelist(self) -> None:
+        """The whitelist is asserted, not decorative: an unbounded solve is refused by a witness
+        accepting only ``{kOptimal, kUnknown}``, and the message names what it *did* accept — not
+        the stale "expected kOptimal", which would be false for a path that accepts ``kUnknown``."""
+        program = _program([[1.0]], [0.0], [np.inf], [-np.inf], [np.inf], [1.0], maximize=True)
+
+        with pytest.raises(LPNotOptimalError) as raised:
+            program.solve_dual_witness(accept=_WITNESS_ACCEPT)
+        assert "Unbounded" in raised.value.model_status
+        assert "one of" in str(raised.value)
+        assert "kUnknown" in str(raised.value) and "kOptimal" in str(raised.value)
+
+    def test_an_optimal_witness_reads_the_same_duals_as_solve(self) -> None:
+        """On a `kOptimal` solve the witness path and `solve` must agree on the row duals — the
+        witness is a strictly wider acceptance gate over the *same* extraction, not a different
+        computation."""
+        args = ([[1.0, 1.0]], [0.0, 0.0], [2.0, 2.0], [3.0], [3.0], [1.0, 1.0])
+        strict = _program(*args, maximize=True).solve()
+        witness = _program(*args, maximize=True).maximize_dual_witness(
+            np.asarray([1.0, 1.0]), accept=_WITNESS_ACCEPT
+        )
+
+        assert "Optimal" in witness.model_status
+        np.testing.assert_allclose(witness.row_duals, strict.row_duals)
+
+    def test_a_typo_in_the_accept_set_fails_loudly(self) -> None:
+        """A misspelled status must raise here, not silently never-match and refuse every solve —
+        which would look exactly like a model that cannot be solved."""
+        program = _program([[1.0]], [0.0], [1.0], [1.0], [1.0], [1.0])
+
+        with pytest.raises(HighsBackendError, match="not HiGHS model statuses"):
+            program.solve_dual_witness(accept=frozenset({"kOptmal"}))
+
+    def test_solve_stays_strict_where_a_witness_would_accept(self) -> None:
+        """The load-bearing invariance: on the *same* unbounded LP a witness accepts, `solve` still
+        raises "expected kOptimal". `sparse_objective.critical_l1_penalty` reads that exception to
+        detect a zero-cost growth path, so widening the witness must not widen `solve`."""
+        program = _program([[1.0]], [0.0], [np.inf], [-np.inf], [np.inf], [1.0], maximize=True)
+        program.solve_dual_witness(accept=frozenset({"kUnbounded"}))  # accepted here
+
+        with pytest.raises(LPNotOptimalError) as raised:
+            program.solve()  # ...refused here, unchanged
+        assert "expected kOptimal" in str(raised.value)
+
+    def test_a_frozen_program_refuses_a_witness_solve(self) -> None:
+        """Freezing forbids *every* solve once sampling starts (§1.3) — the witness path runs
+        through the same `_run_solver`, so it must be forbidden too, and an uncounted refusal."""
+        program = _program([[1.0]], [0.0], [1.0], [0.0], [1.0], [1.0])
+        program.freeze()
+        before = total_solve_count()
+
+        with pytest.raises(SolverFrozenError, match="sampling"):
+            program.maximize_dual_witness(np.asarray([1.0]), accept=_WITNESS_ACCEPT)
+        assert total_solve_count() == before
+
+    def test_a_witness_solve_is_counted(self) -> None:
+        """A witness solve is a real HiGHS solve and is counted, so the "no solver in the inner
+        loop" assertion cannot be evaded by taking the witness path instead of `solve`."""
+        reset_solve_count()
+        program = _program([[1.0]], [0.0], [1.0], [1.0], [1.0], [1.0])
+
+        program.maximize_dual_witness(np.asarray([1.0]), accept=_WITNESS_ACCEPT)
+
+        assert total_solve_count() == 1
 
 
 def test_highs_applies_the_objective_offset_under_maximize() -> None:
