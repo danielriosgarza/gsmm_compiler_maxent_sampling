@@ -908,10 +908,10 @@ its base-weight value through the reweighting loop or is re-resolved from the fr
 ✅ **The suite and the CLI are both green from a clean state, at any thread count** — which is the
 milestone. Measured, deterministic (not flaky — repeated runs agree):
 
-| | `pytest` (979) | `maxent sample`, clean cache |
+| | `pytest` (1005) | `maxent sample`, clean cache |
 |---|---|---|
-| **ambient threads** | ✅ 979 passed | ✅ completes |
-| **`OMP_NUM_THREADS=1`** | ✅ 979 passed | ✅ completes |
+| **ambient threads** | ✅ 1005 passed | ✅ completes |
+| **`OMP_NUM_THREADS=1`** | ✅ 1005 passed | ✅ completes |
 
 The R̂ test that used to straddle its bar (`test_the_chains_mix_and_the_diagnostics_say_so`) was
 settled by its **schedule**, not by the pin: the bar was inside the distribution of valid runs across
@@ -923,7 +923,7 @@ cd /home/mcpu/GitHub/gsmm_compiler_maxent_sampling
 # The thread count no longer changes any of this (M10.2e). Both of these pass under ambient
 # threads and under OMP_NUM_THREADS=1 — that equivalence IS the milestone, so check it if in doubt.
 # Note `pytest -q | tail` reports *tail's* exit code, which is always 0: read the count, not $?.
-.venv/bin/python -m pytest -q | tail -3                # expect 979 passed
+.venv/bin/python -m pytest -q | tail -3                # expect 1005 passed
 .venv/bin/python -m pytest -q -m "not slow" | tail -3  # the fast subset
 .venv/bin/ruff check . && .venv/bin/mypy               # expect clean
 .venv/bin/gsmm-compiler model inspect examples/toy_network.json     # affine RHS: nonzero
@@ -959,6 +959,20 @@ for f in "$D"/*.json; do
   if echo "$out" | grep -q "dimension"; then echo "OK   $(basename "$f" | cut -c1-40)"
   else echo "FAIL $(echo "$out" | grep -oiE 'kUnknown@[a-z_]+|cannot be resolved|does not resolve' | head -1) $(basename "$f" | cut -c1-40)"; fi
 done
+
+# M11.5(a): the dimension-scaled schedule. schedule_mode="fixed" (default) is the identity — a run
+# with it is byte-identical to pre-M11.5 (verified: sha256 of flux arrays unchanged). pilot_ess mode
+# sizes n_samples from the β=0 scale pilot; the resolved value flows into the sample recipe key (THE
+# TRAP). Smoke it on a small strain — expect a log line "schedule: pilot_ess target=… → n_samples
+# 5 → <larger>" and the diagnostics to report the target VERIFIED at β=0 and NOT verified at β=8.
+L=$(ls "$D"/GCF_964062975_1_Lactococcus_lactis_CIRM_BIA2553*.json)
+rm -rf /tmp/pe && .venv/bin/gsmm-compiler maxent sample "$L" --out /tmp/pe/out --cache-dir /tmp/pe/cache \
+  --workers 4 --set sampler.energy_scale=pilot_sd --set sampler.pilot_chains=2 \
+  --set sampler.pilot_burn_in=300 --set sampler.pilot_samples=300 --set sampler.betas=[0.0,8.0] \
+  --set sampler.n_chains=2 --set sampler.burn_in=200 --set sampler.n_samples=5 \
+  --set sampler.schedule_mode=pilot_ess --set sampler.target_ess=60 2>&1 | grep "schedule:"
+# The MEASURE-FIRST τ sweep behind benchmarks/M11_5_SCHEDULE_TAU.md (9 strains × 4 β, ~17 min):
+#   .venv/bin/python benchmarks/schedule_sweep.py && .venv/bin/python benchmarks/analyze_tau.py
 ```
 
 ---

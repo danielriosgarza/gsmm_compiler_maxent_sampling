@@ -121,7 +121,9 @@ or only the doubling backstop — is the `/collab` question.
 ## Reproduce
 
 ```
-scratchpad/schedule_sweep.py     # runs the 9 strains × 4 β, writes sweep/tau_sweep.json
-scratchpad/analyze_tau.py        # the four tables above + the power-law fits
-benchmarks/census_diag.py <run>  # per-run τ (worst/p90/median tau_int), the extended summarizer
+benchmarks/schedule_sweep.py [OUT]   # runs the 9 strains × 4 β, writes OUT/tau_sweep.json
+benchmarks/analyze_tau.py [OUT/tau_sweep.json]   # the four tables above + the power-law fits
+benchmarks/census_diag.py <run_dir>  # per-run τ (worst/p90/median tau_int), the extended summarizer
 ```
+`OUT` defaults to `$SWEEP_OUT` or `/tmp/gsmm_schedule_sweep`; the curated model dir is `$CURATED_MODELS`
+or the `method_3_curated` path. All deterministic at seed 0.
