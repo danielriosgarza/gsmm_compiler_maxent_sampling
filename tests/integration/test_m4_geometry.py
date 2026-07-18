@@ -119,6 +119,31 @@ def test_the_span_certificate_is_exhaustive(geometry) -> None:  # type: ignore[n
     assert certificate.leakage < 1e-12
 
 
+def test_a_noise_swamped_probe_no_longer_refuses_a_certified_geometry(reduced) -> None:  # type: ignore[no-untyped-def]
+    """M11.2 (§1.6.10, §1.6.11): the span gate is `resolution ≤ span_tol`, not `n_inconclusive==0`.
+
+    `model_id="strain_1"` is the tracker's own #1 open defect: on this **unchanged** model it
+    raised "the span certificate is not exhaustive (…, 2 inconclusive)" for ten milestones, while
+    `strain_2` certified — and `model_id` varies nothing but the RNG stream that orders the solves.
+    The audit measured why: an inconclusive probe reports that its *primal* discovery signal was
+    noise-swamped, which is evidence about the solver's warm-start path, not about the span (46/46
+    constructed truncations were detected on *conclusive* probes; the two signals are disjoint by
+    ~5e4×). The certificate's rigorous `resolution` is 2.7e-11 here — 37× under the width that would
+    be a real dimension — so the geometry **is** certified; v3 simply refused to say so.
+
+    Non-vacuous: on the v3 gate (`n_inconclusive == 0`) this call raises. The assertion below —
+    that a build with `n_inconclusive > 0` succeeds and reports `exhaustive` — cannot pass there.
+    """
+    geometry = build_geometry(reduced, model_id="strain_1")
+    certificate = geometry.certificate
+
+    assert geometry.dimension == 46  # the same geometry every seed finds
+    assert certificate.exhaustive  # v3 refused this exact case
+    assert certificate.n_inconclusive > 0  # …and it refused it *because* of this, now a diagnostic
+    assert certificate.resolution <= GeometryConfig().span_tol  # the bound that licenses it
+    assert certificate.complement_is_complete
+
+
 def test_a_truncated_basis_is_rejected(reduced, geometry) -> None:  # type: ignore[no-untyped-def]
     """Hide any one of the 46 dimensions and the sweep must find it. This is the gate's core claim.
 

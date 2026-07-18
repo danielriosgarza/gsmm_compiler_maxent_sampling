@@ -136,8 +136,9 @@ Implemented in **M4** — see BUILD_PLAN.md §1.4.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, fields
-from typing import Any, Final
+from typing import Any, Final, Protocol
 
 import numpy as np
 from numpy.typing import NDArray
@@ -150,13 +151,96 @@ from gsmm_compiler.highs_backend import (
     HighsLinearProgram,
     LPNotOptimalError,
     LPSolution,
+    total_solve_count,
 )
 from gsmm_compiler.native_csc import VALUE_DTYPE
 from gsmm_compiler.numerics import under_deterministic_blas
 from gsmm_compiler.provenance import content_key, stream_seed
 from gsmm_compiler.sparse_objective import build_flux_lp
 
-GEOMETRY_IMPL_VERSION: Final = 3
+
+class Maximizer(Protocol):
+    """Anything the probing code can hand an objective to and get a checked `LPSolution` back.
+
+    `HighsLinearProgram` satisfies it directly (the warm fast path); `_SolveSession` satisfies it
+    while adding cold escalation on ``kUnknown`` (M11.2). Widening `probe_direction` and
+    `sweep_complement` to this Protocol is what lets the escalation reach the support and span
+    stages without either of them knowing whether the solve behind it was warm or cold.
+    """
+
+    def maximize(self, costs: NDArray[np.float64]) -> LPSolution: ...
+
+
+def solve_fresh_once(reduced: ReducedPolytope, costs: NDArray[np.float64]) -> LPSolution:
+    """One fresh LP instance, one solve — the escalation primitive (M11.2, Codex's factoring).
+
+    A brand-new `HighsLinearProgram` has no inherited basis, so this is the "remove all warm-start
+    history" solve that turned `blocked_reactions`' `kUnknown` crashes into clean builds. It is
+    deliberately *single*: `blocked_reactions` needs a cold **pair** and calls this twice on two
+    fresh instances, which keeps its measured one-pair retry budget from silently growing.
+    """
+    return build_flux_lp(reduced, threads=1).maximize(
+        np.asarray(costs, dtype=VALUE_DTYPE)
+    )
+
+
+class _SolveSession:
+    """Owns the LP-instance lifecycle for one `build_geometry` call (M11.2, §1.6.11).
+
+    Warm fast path on a persistent instance until the **first** ``kUnknown``; then cold-only — a
+    fresh instance per solve — for the rest of the build. That transition is the whole point: M11.1
+    abandoned a degraded instance only *inside* `blocked_reactions` (a local ``warm = None``), while
+    `build_geometry` kept using the original program for the initial solve, support discovery and
+    the span sweep — so a strain recovered in one stage and still died ``kUnknown`` in the next. The
+    session makes the abandonment build-wide.
+
+    Escalates **only** ``kUnknown``. Infeasible, unbounded and limit statuses keep their
+    hard-failure meaning — a ``kUnknown`` is "the solver could not decide", which a fresh basis can
+    fix; the others are verdicts about the model, which it cannot (Codex, M11.2 review).
+
+    A ``kUnknown`` does not *prove* later warm solves are wrong, but continuing to warm-start off an
+    instance the solver could not certify makes the geometry a story nobody can retell. Cold-only
+    for the tail is the conservative, M11.1-consistent choice; `degraded` and `n_cold_solves` record
+    that it happened and what it cost so a run that leaned on it is visible. `n_cold_solves` counts
+    the session's **own** cold retries (the initial/support/span solves); `blocked_reactions`' cold
+    pairs are reported separately as `n_blocked_escalated`, and the total appears in `n_lp_solves`.
+    """
+
+    def __init__(self, reduced: ReducedPolytope, *, cold_only: bool = False) -> None:
+        self._reduced = reduced
+        self._program = build_flux_lp(reduced, threads=1)
+        self._cold_only = cold_only
+        self.n_cold_solves = 0
+        self.degraded = cold_only
+
+    @property
+    def program(self) -> HighsLinearProgram:
+        """The persistent warm instance, for `blocked_reactions`' warm sweep and cold-pair logic."""
+        return self._program
+
+    def mark_degraded(self) -> None:
+        """`blocked_reactions` calls this when its use of the persistent instance hit ``kUnknown``.
+
+        The instance is the session's own, so once `blocked_reactions` could not certify a solve on
+        it, every later stage must stop warm-starting off it too. Recorded as a **boolean** rather
+        than a solve index: `blocked_reactions`' own FVA solves do not pass through this session, so
+        an index here would count from zero and mislead (Codex, M11.2 review).
+        """
+        self._cold_only = True
+        self.degraded = True
+
+    def maximize(self, costs: NDArray[np.float64]) -> LPSolution:
+        """Warm attempt, then one cold retry on ``kUnknown`` — a drop-in for `program.maximize`."""
+        if not self._cold_only:
+            try:
+                return self._program.maximize(costs)
+            except LPNotOptimalError as error:
+                _reraise_unless_kunknown(error)  # infeasible/unbounded/limit stay hard failures
+                self.mark_degraded()
+        self.n_cold_solves += 1
+        return solve_fresh_once(self._reduced, costs)
+
+GEOMETRY_IMPL_VERSION: Final = 4
 """Bumped when a change here can alter the bytes of a geometry. Feeds the L3 cache key (§1.1).
 
 2 (M10.2): L3 now stores the **geometry** (``s``, ``B``, centre, support points, certificate) and
@@ -172,6 +256,12 @@ reaction v2 called moving is now certified blocked, which moves the basis, the s
 possibly ``d``. That is a genuine change of the geometry's bytes, so it must **miss** a v2 cache
 rather than be served one. M11.0's `BACKEND_IMPL_VERSION` bump does not cover this: that identifies
 the *solver*, this is an *algorithm* change above it.
+
+4 (M11.2): the span certificate's ``exhaustive`` now means ``resolution ≤ span_tol`` rather than
+``n_inconclusive == 0``, so a geometry that v3 refused (a noise-swamped probe under a certified
+resolution) v4 accepts and stores. The *arrays* of an accepted geometry are unchanged, but its
+cached **certificate/diagnostic semantics** are not, and a v3 bundle would carry the old verdict —
+so v4 must miss it (Codex, M11.2 review).
 """
 
 NOISE_SAFETY: Final = 10.0
@@ -286,6 +376,7 @@ def blocked_reactions(
     *,
     tol: float,
     min_separation: float = 100.0,
+    on_degraded: Callable[[], None] | None = None,
 ) -> BlockedReactions:
     """FVA over the free reactions: which of them cannot move at all? (2·n_free warm-started LPs.)
 
@@ -320,18 +411,24 @@ def blocked_reactions(
     n_escalated = 0
 
     for i in range(n):
-        bracket = _width_bracket(reduced, warm, warm, i, n) if warm is not None else None
+        bracket = _warm_width_bracket(warm, reduced, i, n) if warm is not None else None
         if bracket is None:
-            # A non-optimal solve yields no witness in *either* direction — the same state as a
-            # bracket that straddles the bar, and it escalates the same way. The catch is here
-            # rather than in `HighsLinearProgram.solve`, which must go on refusing for everyone:
+            # A ``kUnknown`` warm solve yields no witness in *either* direction — the same state as
+            # a bracket that straddles the bar, and it escalates the same way. Only ``kUnknown``
+            # reaches here: `_warm_width_bracket` re-raises infeasible/unbounded/limit, model
+            # verdicts a fresh basis cannot change. The catch is caller-side, not in
+            # `HighsLinearProgram.solve`, which must go on refusing for everyone —
             # `sparse_objective.critical_l1_penalty` needs `LPNotOptimalError` to detect an
-            # unbounded `J*`. One caller earns an exemption its own arithmetic proves.
+            # unbounded `J*`.
             #
             # And the failed instance is abandoned: later solves warm-started off a basis HiGHS
             # could not certify would still be *usable*, but their provenance would be a story
-            # nobody can retell (Codex, M11.1 review).
+            # nobody can retell (Codex, M11.1 review). `on_degraded` propagates that abandonment
+            # to the *rest of the build* (M11.2): M11.1's `warm = None` was local to this function,
+            # so `build_geometry` kept warm-starting the next stages off the same degraded instance.
             warm = None
+            if on_degraded is not None:
+                on_degraded()
         elif not _straddles(bracket, tol):
             upper[i], lower[i] = bracket
             continue
@@ -343,9 +440,7 @@ def blocked_reactions(
         # while the truly-at-floor cases (Hafnia, `U ≈ 2e-9`) stayed unresolved either way. Removing
         # *all* warm history is what the escalation is for; leaving one step was leaving the bug.
         n_escalated += 1
-        cold = _width_bracket(
-            reduced, build_flux_lp(reduced, threads=1), build_flux_lp(reduced, threads=1), i, n
-        )
+        cold = _cold_width_bracket(reduced, i, n)
         if cold is None:
             # No complete `U_i` exists, so this reaction's resolution is *unavailable* — not a
             # number to be maxed into an aggregate as if it had been measured.
@@ -385,14 +480,24 @@ def blocked_reactions(
     )
 
 
-def _width_bracket(
-    reduced: ReducedPolytope,
-    high_program: HighsLinearProgram,
-    low_program: HighsLinearProgram,
-    index: int,
-    n: int,
-) -> tuple[float, float] | None:
-    """``(U_i, L_i)`` for one reaction, or ``None`` when a solve returned no usable answer.
+def _reraise_unless_kunknown(error: LPNotOptimalError) -> None:
+    """Escalation is for ``kUnknown`` — "the solver could not decide" — and nothing else (M11.2).
+
+    Infeasible, unbounded and limit statuses are verdicts about the *model* that a fresh basis
+    cannot change, so re-raising them keeps their hard-failure meaning across the whole build, not
+    only inside `_SolveSession`. On a reduced polytope (feasible by construction, finite bounds) a
+    single-coordinate FVA solve should only ever be optimal or ``kUnknown``, so an infeasible or
+    unbounded status here signals a corrupt IR — exactly the thing that must surface, not be quietly
+    re-solved. (Codex, M11.2 review.)
+    """
+    if "kUnknown" not in error.model_status:
+        raise error
+
+
+def _bracket_from_solutions(
+    reduced: ReducedPolytope, high: LPSolution, low: LPSolution, index: int, n: int
+) -> tuple[float, float]:
+    """``(U_i, L_i)`` from a max/min solution pair — the one bracket computation, warm or cold.
 
     ``U_i`` is bounded **from above** by weak duality on each solve, and that direction is the whole
     point: a primal reading is a *lower* bound, so an LP that stopped short would report a range of
@@ -403,19 +508,7 @@ def _width_bracket(
     moving? — and charged for its own error first. It is **not** a proof: the endpoints are only
     tolerance-feasible, and no Hoffman constant is available to turn that into a distance from the
     exact feasible set. Hence the outward subtraction, and hence "resolution-qualified".
-
-    ``high_program`` and ``low_program`` are the **same** object on the warm fast path (the ``max``
-    and ``min`` solves warm-start off each other, which is the point of the persistent instance) and
-    **two fresh** objects on the cold escalation, so neither inherits the other's basis.
     """
-    cost = np.zeros(n, dtype=VALUE_DTYPE)
-    cost[index] = 1.0
-    try:
-        high = high_program.maximize(cost)
-        low = low_program.maximize(-cost)
-    except LPNotOptimalError:
-        return None
-
     unit = np.zeros(n, dtype=VALUE_DTYPE)
     unit[index] = 1.0
     upper = dual_upper_bound(high, unit, reduced) + dual_upper_bound(low, -unit, reduced)
@@ -431,6 +524,40 @@ def _width_bracket(
     reach = float(max(abs(reduced.lower_bounds[index]), abs(reduced.upper_bounds[index])))
     lower = width - NOISE_SAFETY * 2.0 * admitted - eps * reach
     return upper, float(np.nextafter(lower, -np.inf))
+
+
+def _warm_width_bracket(
+    program: HighsLinearProgram, reduced: ReducedPolytope, index: int, n: int
+) -> tuple[float, float] | None:
+    """Warm bracket: both solves on the persistent instance (they warm-start off each other)."""
+    cost = np.zeros(n, dtype=VALUE_DTYPE)
+    cost[index] = 1.0
+    try:
+        high = program.maximize(cost)
+        low = program.maximize(-cost)
+    except LPNotOptimalError as error:
+        _reraise_unless_kunknown(error)
+        return None
+    return _bracket_from_solutions(reduced, high, low, index, n)
+
+
+def _cold_width_bracket(
+    reduced: ReducedPolytope, index: int, n: int
+) -> tuple[float, float] | None:
+    """Cold bracket: each leg is a fresh instance via `solve_fresh_once` — no inherited history.
+
+    Uses the single approved escalation primitive twice rather than driving two fresh programs by
+    hand, so there is one place a fresh solve is defined (Codex, M11.2 review).
+    """
+    cost = np.zeros(n, dtype=VALUE_DTYPE)
+    cost[index] = 1.0
+    try:
+        high = solve_fresh_once(reduced, cost)
+        low = solve_fresh_once(reduced, -cost)
+    except LPNotOptimalError as error:
+        _reraise_unless_kunknown(error)
+        return None
+    return _bracket_from_solutions(reduced, high, low, index, n)
 
 
 def _straddles(bracket: tuple[float, float], tol: float) -> bool:
@@ -733,7 +860,7 @@ class SupportProbe:
 
 
 def probe_direction(
-    program: HighsLinearProgram,
+    program: Maximizer,
     reduced: ReducedPolytope,
     basis: OrthonormalBasis,
     direction: NDArray[np.float64],
@@ -1023,13 +1150,44 @@ def _check_mass_balance(
 # ---- the deterministic span certificate (BUILD_PLAN §1.4) ---------------------------------------
 
 
+def _span_resolution(
+    n_complement: int, leakage: float, max_width: float, diameter: float
+) -> float:
+    """The width bound a completed sweep licenses — the **one** definition, used by two callers.
+
+    `SpanCertificate.resolution` reports it; `sweep_complement` gates on it. Extracting it (M11.2)
+    keeps the gate and the report from drifting apart — a recurring shape in this repo, where a
+    duplicated formula is how a claim and its check come to disagree. See the `resolution` property
+    for the ``√k`` subadditivity and the leakage term.
+    """
+    value = (
+        float(np.sqrt(max(n_complement, 1))) * float(np.sqrt(1.0 + leakage)) * max_width
+        + leakage * diameter
+    )
+    eps = float(np.finfo(np.float64).eps)
+    rounded = float(np.nextafter(value * (1.0 + 8.0 * eps), np.inf))
+    if not np.isfinite(rounded):
+        raise GeometryError("the span resolution is not finite; this certificate certifies nothing")
+    return rounded
+
+
 @dataclass(frozen=True)
 class SpanCertificate:
     """The evidence that ``B`` spans every feasible direction — or the admission that it may not."""
 
     exhaustive: bool
-    """True only if every one of the ``n_free − d`` complement directions was probed *and* every
-    probe was conclusive. A cap, a truncated complement, or a noise-swamped probe each forbid it."""
+    """The span is certified to the requested resolution: ``resolution ≤ span_tol`` on a **complete,
+    uncapped** sweep with no probe having proved a new direction (M11.2, §1.6.11).
+
+    It is **not** "every probe conclusive" — that was the v1 rule, and it conflated *"a probe's
+    primal/residual discovery signal was noise-swamped"* with *"the span may be incomplete"*, which
+    are different propositions (§1.6.10). `is_conclusive` governs whether a probe's endpoints can
+    *drive discovery*; the flatness claim rests only on each probe's **rigorous** `width_upper`
+    (weak duality, assuming nothing of the returned point), aggregated by `resolution`. So an
+    inconclusive probe may sit under a certified geometry, and a conclusive probe with a loose dual
+    bound may fail: the new predicate is stronger about what it *claims*, not a subset of the old.
+    A cap or a truncated complement still forbid it (those leave directions genuinely unprobed).
+    `n_inconclusive` survives as a reported diagnostic."""
     n_probes: int
     n_complement: int
     """``n_free − d``: how many probes a complete certificate needs."""
@@ -1071,19 +1229,7 @@ class SpanCertificate:
         width is zero and the span proof is airtight, but a float64 LP can only ever say "flatter
         than this", and this is the honest value of *this*.
         """
-        value = (
-            float(np.sqrt(max(self.n_complement, 1)))
-            * float(np.sqrt(1.0 + self.leakage))
-            * self.max_width
-            + self.leakage * self.diameter
-        )
-        eps = float(np.finfo(np.float64).eps)
-        rounded = float(np.nextafter(value * (1.0 + 8.0 * eps), np.inf))
-        if not np.isfinite(rounded):
-            raise GeometryError(
-                "the span resolution is not finite; this certificate certifies nothing"
-            )
-        return rounded
+        return _span_resolution(self.n_complement, self.leakage, self.max_width, self.diameter)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -1181,7 +1327,7 @@ def complement_basis(
 
 
 def sweep_complement(
-    program: HighsLinearProgram,
+    program: Maximizer,
     reduced: ReducedPolytope,
     basis: OrthonormalBasis,
     scales: NDArray[np.float64],
@@ -1254,8 +1400,16 @@ def sweep_complement(
             failing = probe
             break
 
+    # Gate on the quantity the certificate actually claims (the resolution), not on `n_inconclusive`
+    # (M11.2, §1.6.11). The resolution rests only on each probe's rigorous `width_upper`; a probe
+    # being inconclusive says its primal discovery signal was noise-swamped, a different proposition
+    # (§1.6.10). `failing is None`, `complete` and `not capped` stay: those are the cases where a
+    # direction was genuinely left unprobed, and no resolution bound covers them.
+    resolution = _span_resolution(n_complement, leakage, max_width, diameter)
     certificate = SpanCertificate(
-        exhaustive=(failing is None and complete and not capped and n_inconclusive == 0),
+        exhaustive=(
+            failing is None and complete and not capped and resolution <= config.span_tol
+        ),
         n_probes=n_probes,
         n_complement=n_complement,
         max_width=max_width,
@@ -1291,6 +1445,19 @@ class GeometryDiagnostics:
     """
     n_support_points: int
     n_lp_solves: int
+    """Every HiGHS solve this build ran — warm, failed-warm, `blocked_reactions`' cold pairs and the
+    session's cold retries — from the process-global counter. Exact for a **serialized** build; two
+    `build_geometry` calls running in one process concurrently would overlap their deltas, so the
+    batch runs geometry in the parent, one strain at a time (§1.2)."""
+    n_cold_solves: int
+    """The **session's** cold retries — the initial/support/span solves it ran on a fresh instance
+    after the warm one returned ``kUnknown`` (M11.2). It does **not** include `blocked_reactions`'
+    cold pairs (those are `n_blocked_escalated`) nor a refusal's fully-cold re-sweep (that path
+    raises). Zero when the support/span stages never degraded."""
+    degraded: bool
+    """True if the build abandoned its warm instance at any point (in `blocked_reactions` or a later
+    stage). A boolean, not an index: `blocked_reactions`' FVA solves bypass the session,
+    so an index would count from zero and mislead (Codex, M11.2 review)."""
     n_random_probes: int
     n_sweeps: int
     simplex_iterations: int
@@ -1335,6 +1502,8 @@ class GeometryDiagnostics:
             "n_blocked_escalated": self.n_blocked_escalated,
             "n_support_points": self.n_support_points,
             "n_lp_solves": self.n_lp_solves,
+            "n_cold_solves": self.n_cold_solves,
+            "degraded": self.degraded,
             "n_random_probes": self.n_random_probes,
             "n_sweeps": self.n_sweeps,
             "simplex_iterations": self.simplex_iterations,
@@ -1552,15 +1721,24 @@ def build_geometry(
     inverse_scale_norm = float(np.linalg.norm(1.0 / scales))
     noise_ceiling = probe_noise_ceiling(inverse_scale_norm)
 
-    program = build_flux_lp(reduced, threads=1)
-    solves_at_start = program.solve_count
+    # One solve session owns the LP instance for the whole build (M11.2): warm until the first
+    # `kUnknown`, cold-only after — so a degradation in *any* stage propagates to the ones that
+    # follow, which M11.1's function-local abandonment could not do. `solves_at_start` reads the
+    # **process-global** counter, which records every solve on every instance (warm, failed, and the
+    # fresh cold retries), so the reported LP count no longer undercounts the escalations.
+    session = _SolveSession(reduced)
+    solves_at_start = total_solve_count()
     basis = OrthonormalBasis(n, memory_limit_bytes=memory_limit_bytes)
     rng = np.random.default_rng(stream_seed(model_id=model_id, stage="geometry", seed=cfg.seed))
 
     # FVA first: the reactions that cannot move are exact zeros of every feasible direction, and a
     # basis that carries their noise instead corrupts the chord (module docstring, point 4). Then
     # factor the space those directions must live in, so no candidate can pollute the basis.
-    blocked = blocked_reactions(reduced, program, tol=cfg.blocked_tol)
+    # `blocked_reactions` runs its own warm sweep + cold-pair escalation on the session's instance,
+    # and tells the session (`mark_degraded`) if that instance ever returned `kUnknown`.
+    blocked = blocked_reactions(
+        reduced, session.program, tol=cfg.blocked_tol, on_degraded=session.mark_degraded
+    )
     space = direction_space(
         reduced,
         scales,
@@ -1571,7 +1749,7 @@ def build_geometry(
     _check_blocked_span(blocked, scales, cfg)
 
     # A zero objective asks HiGHS for *any* feasible point — the seed of the support set (§15.6).
-    initial = program.maximize(np.zeros(n, dtype=VALUE_DTYPE))
+    initial = session.maximize(np.zeros(n, dtype=VALUE_DTYPE))
     support: list[NDArray[np.float64]] = [initial.primal]
     iterations = initial.simplex_iterations
 
@@ -1595,7 +1773,7 @@ def build_geometry(
         n_random_probes += 1
 
         probe = probe_direction(
-            program, reduced, basis, candidate / norm, scales, inverse_scale_norm, cfg, space
+            session, reduced, basis, candidate / norm, scales, inverse_scale_norm, cfg, space
         )
         iterations += probe.simplex_iterations
         if probe.is_new_direction:
@@ -1609,7 +1787,7 @@ def build_geometry(
     while True:
         n_sweeps += 1
         certificate, failing = sweep_complement(
-            program, reduced, basis, scales, inverse_scale_norm, cfg, memory_limit_bytes, space
+            session, reduced, basis, scales, inverse_scale_norm, cfg, memory_limit_bytes, space
         )
         if failing is None:
             break
@@ -1619,14 +1797,34 @@ def build_geometry(
         support.extend([failing.v_plus, failing.v_minus])
 
     if cfg.exhaustive_span_certificate and not certificate.exhaustive:
-        raise GeometryError(
-            "the span certificate is not exhaustive "
-            f"({certificate.n_probes}/{certificate.n_complement} probes, "
-            f"{certificate.n_inconclusive} inconclusive, complement complete="
-            f"{certificate.complement_is_complete}) — spec §15.4 forbids sampling a "
-            "lower-dimensional subset on an uncertified basis. Set "
-            "geometry.exhaustive_span_certificate = false to accept a randomized partial check."
-        )
+        # Before a *final* refusal, re-sweep fully cold and re-check (M11.2, Codex). The sweep's
+        # `width_upper` is a weak-duality bound, sound but able to be *loose* under a warm-started
+        # basis — the same mechanism that made `blocked_reactions` refuse valid strains — so a
+        # `resolution > span_tol` from a warm sweep is not yet a statement about the polytope. Only
+        # when a cold sweep, on fresh instances with no inherited history, still fails to resolve it
+        # do we call the geometry uncertifiable. This costs one extra sweep, and only on the refusal
+        # path. (`failing`/`complete`/`capped` refusals are structural, not warm-dual artifacts, so
+        # they are not re-confirmed — a genuinely unprobed direction stays unprobed cold.)
+        confirmed = certificate
+        if certificate.complement_is_complete and not (
+            cfg.max_span_probes is not None and cfg.max_span_probes < certificate.n_complement
+        ):
+            cold_session = _SolveSession(reduced, cold_only=True)
+            confirmed, _ = sweep_complement(
+                cold_session, reduced, basis, scales, inverse_scale_norm, cfg,
+                memory_limit_bytes, space,
+            )
+        if not confirmed.exhaustive:
+            raise GeometryError(
+                "the span certificate does not resolve the polytope to span_tol, even after a "
+                f"fully-cold re-sweep (resolution {confirmed.resolution:.3e} vs span_tol "
+                f"{cfg.span_tol:.1e}; {confirmed.n_probes}/{confirmed.n_complement} probes, "
+                f"{confirmed.n_inconclusive} inconclusive [diagnostic], complement complete="
+                f"{confirmed.complement_is_complete}) — spec §15.4 forbids sampling a "
+                "lower-dimensional subset on an uncertified basis. Set "
+                "geometry.exhaustive_span_certificate = false to accept a randomized partial check."
+            )
+        certificate = confirmed
 
     support_points = np.asarray(support, dtype=VALUE_DTYPE)
     center, clamp = _feasible_center(support_points, reduced, cfg)
@@ -1641,13 +1839,15 @@ def build_geometry(
         blocked=blocked,
         space=space,
         config=cfg,
-        n_lp_solves=program.solve_count - solves_at_start,
+        n_lp_solves=total_solve_count() - solves_at_start,
         n_random_probes=n_random_probes,
         n_sweeps=n_sweeps,
         simplex_iterations=iterations,
         n_floored=n_floored,
         inverse_scale_norm=inverse_scale_norm,
         noise_ceiling=noise_ceiling,
+        n_cold_solves=session.n_cold_solves,
+        degraded=session.degraded,
     )
 
     return ReducedGeometry(
@@ -1767,6 +1967,8 @@ def _singleton_geometry(reduced: ReducedPolytope, config: GeometryConfig) -> Red
             n_blocked_escalated=0,
             n_support_points=1,
             n_lp_solves=0,
+            n_cold_solves=0,
+            degraded=False,
             n_random_probes=0,
             n_sweeps=0,
             simplex_iterations=0,
@@ -1804,6 +2006,8 @@ def _validate(
     n_floored: int,
     inverse_scale_norm: float,
     noise_ceiling: float,
+    n_cold_solves: int,
+    degraded: bool,
 ) -> GeometryDiagnostics:
     """The checks spec §15.4 and §16 demand — each a hard failure, none of them a warning."""
     d = int(basis.shape[1])
@@ -1897,6 +2101,8 @@ def _validate(
         n_blocked_escalated=blocked.n_escalated,
         n_support_points=int(support_points.shape[0]),
         n_lp_solves=n_lp_solves,
+        n_cold_solves=n_cold_solves,
+        degraded=degraded,
         n_random_probes=n_random_probes,
         n_sweeps=n_sweeps,
         simplex_iterations=simplex_iterations,

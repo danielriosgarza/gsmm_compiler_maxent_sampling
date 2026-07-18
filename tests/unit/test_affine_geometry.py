@@ -7,6 +7,7 @@ looks plausible.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from typing import cast
 
@@ -14,6 +15,7 @@ import numpy as np
 import pytest
 from numpy.typing import NDArray
 
+import gsmm_compiler.affine_geometry as ag
 from gsmm_compiler.affine_geometry import (
     BlockedReactions,
     GeometryError,
@@ -24,6 +26,7 @@ from gsmm_compiler.affine_geometry import (
     _append,
     _check_blocked_span,
     _reject_contradictory_bracket,
+    _SolveSession,
     blocked_reactions,
     build_geometry,
     complement_basis,
@@ -343,6 +346,145 @@ def test_a_kunknown_warm_solve_is_recovered_by_cold_escalation() -> None:
     assert bool(degraded.mask[1]) == bool(clean.mask[1])  # to the same verdict as a clean run
 
 
+def test_the_solve_session_goes_cold_after_a_kunknown_and_stays_cold(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The build-wide session (M11.2): warm until a `kUnknown`, then cold-only for the rest.
+
+    This is the abstraction that fixes the leak Codex found — M11.1 abandoned a degraded instance
+    only inside `blocked_reactions`, while `build_geometry` kept warm-starting the later stages off
+    the same instance. A toy cannot degrade a warm start, so the persistent instance is wrapped to
+    raise `kUnknown` on its second solve; the fresh instances the cold retries build are real, so
+    the session recovers and every later solve is cold.
+    """
+    reduced = triangle()
+    real_build = ag.build_flux_lp
+    builds: list[int] = []
+
+    class _FailsSecondWarm:
+        def __init__(self, inner: object) -> None:
+            self._inner = inner
+            self._n = 0
+
+        def maximize(self, costs: NDArray[np.float64]) -> object:
+            self._n += 1
+            if self._n == 2:
+                raise LPNotOptimalError("HighsModelStatus.kUnknown", "flux_only")
+            return self._inner.maximize(costs)  # type: ignore[attr-defined]
+
+    def fake_build(r: object, threads: int = 1) -> object:
+        builds.append(1)
+        prog = real_build(r, threads=threads)  # type: ignore[arg-type]
+        return _FailsSecondWarm(prog) if len(builds) == 1 else prog  # only the persistent instance
+
+    monkeypatch.setattr(ag, "build_flux_lp", fake_build)
+    session = _SolveSession(reduced)
+    n = reduced.n_free
+    cost = np.zeros(n)
+    cost[0] = 1.0
+
+    session.maximize(np.zeros(n))  # first solve: warm, fine
+    assert session.n_cold_solves == 0 and session.degraded is False
+    session.maximize(cost)  # second solve on the persistent instance: kUnknown -> cold retry
+    assert session.degraded is True and session.n_cold_solves == 1
+    session.maximize(-cost)  # cold-only now: no warm attempt at all
+    assert session.n_cold_solves == 2
+
+
+def test_the_solve_session_escalates_only_kunknown(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Infeasible / unbounded / limit keep their hard-failure meaning; only `kUnknown` escalates.
+
+    A `kUnknown` is "the solver could not decide", which a fresh basis can fix; the others are
+    verdicts about the model, which it cannot (Codex, M11.2). So a non-`kUnknown` status must
+    propagate, not silently trigger a cold retry that would mask a genuinely infeasible model.
+    """
+    reduced = triangle()
+    real_build = ag.build_flux_lp
+    builds: list[int] = []
+
+    class _FailsInfeasible:
+        def __init__(self, inner: object) -> None:
+            self._inner = inner
+
+        def maximize(self, costs: NDArray[np.float64]) -> object:
+            raise LPNotOptimalError("HighsModelStatus.kInfeasible", "flux_only")
+
+    def fake_build(r: object, threads: int = 1) -> object:
+        builds.append(1)
+        prog = real_build(r, threads=threads)  # type: ignore[arg-type]
+        return _FailsInfeasible(prog) if len(builds) == 1 else prog
+
+    monkeypatch.setattr(ag, "build_flux_lp", fake_build)
+    session = _SolveSession(reduced)
+    with pytest.raises(LPNotOptimalError, match="kInfeasible"):
+        session.maximize(np.zeros(reduced.n_free))
+    assert session.n_cold_solves == 0  # it did not escalate
+
+
+def test_a_cold_only_session_never_warm_starts() -> None:
+    """`cold_only=True` — the mode the span sweep's fully-cold re-confirmation uses (M11.2).
+
+    Every solve is a fresh instance, so `n_cold_solves` counts them all and `degraded` is True from
+    the start. On the triangle each solve still returns the right answer; the point is the counting
+    and that nothing warm-starts.
+    """
+    reduced = triangle()
+    session = _SolveSession(reduced, cold_only=True)
+    assert session.degraded is True
+    n = reduced.n_free
+    cost = np.zeros(n)
+    cost[0] = 1.0
+    session.maximize(cost)
+    session.maximize(-cost)
+    assert session.n_cold_solves == 2
+
+
+def test_blocked_reactions_reraises_a_non_kunknown_status(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """`blocked_reactions` escalates only ``kUnknown``; a model verdict is not silently retried.
+
+    Codex's M11.2 closing catch: the warm bracket used to turn *every* `LPNotOptimalError` into
+    "unresolved" and cold-escalate, so an infeasible or unbounded status (a fact about the model a
+    fresh basis cannot change) would be swallowed. `_warm_width_bracket` now re-raises anything but
+    ``kUnknown``. Injected via a program that raises ``kInfeasible`` on its first solve.
+    """
+    reduced = triangle()
+
+    class _Infeasible:
+        def maximize(self, costs: NDArray[np.float64]) -> object:
+            raise LPNotOptimalError("HighsModelStatus.kInfeasible", "flux_only")
+
+    with pytest.raises(LPNotOptimalError, match="kInfeasible"):
+        blocked_reactions(reduced, cast(HighsLinearProgram, _Infeasible()), tol=1e-9)
+
+
+def test_a_warm_resolution_failure_is_re_confirmed_by_a_fully_cold_sweep(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """End-to-end (Codex, M11.2): a `resolution > span_tol` refusal re-sweeps fully cold first.
+
+    `width_upper` is a weak-duality bound that a warm-started basis can leave *loose*, so a warm
+    sweep can report `resolution > span_tol` on a geometry a cold sweep certifies. Before refusing,
+    `build_geometry` re-sweeps fully cold and gates on *that*. Here `sweep_complement` is monkey-
+    patched to return a certificate that fails the gate **once** (the warm sweep) and passes it on
+    the fully-cold re-sweep — so the build must consult the second, not the first, and succeed.
+
+    Non-vacuous: without the re-sweep the first (failing) certificate reaches the raise and the
+    build aborts; the assertion that it *succeeds* cannot pass.
+    """
+    reduced = triangle()
+    real_sweep = ag.sweep_complement
+    calls: list[int] = []
+
+    def flaky_sweep(program, *args, **kwargs):  # type: ignore[no-untyped-def]
+        certificate, failing = real_sweep(program, *args, **kwargs)
+        calls.append(1)
+        if len(calls) == 1 and failing is None:
+            # First call is the warm sweep: force a resolution just over span_tol so the gate fires.
+            certificate = dataclasses.replace(certificate, exhaustive=False)
+        return certificate, failing
+
+    monkeypatch.setattr(ag, "sweep_complement", flaky_sweep)
+    geometry = build_geometry(reduced, model_id="triangle")  # must not raise
+    assert geometry.certificate.exhaustive  # it consulted the cold re-sweep, which passed
+    assert len(calls) >= 2  # warm sweep + the fully-cold re-confirmation
+
+
 def test_a_contradictory_bracket_is_loud_not_repaired() -> None:
     """`L_i > U_i` breaks the arithmetic contract, so it raises — it is never maxed away (M11.1).
 
@@ -437,8 +579,13 @@ def test_a_capped_certificate_is_never_called_exhaustive() -> None:
 
 def test_an_uncertifiable_geometry_is_refused_by_default() -> None:
     """`exhaustive_span_certificate` defaults to true, and then a partial check is a hard failure —
-    spec §15.4 forbids silently sampling a lower-dimensional subset."""
-    with pytest.raises(GeometryError, match="not exhaustive"):
+    spec §15.4 forbids silently sampling a lower-dimensional subset.
+
+    Here the cause is a **cap** (`max_span_probes=1` on a 2-wide complement), which leaves a
+    direction genuinely unprobed — so the resolution gate (M11.2) refuses via `leakage·diameter`,
+    not via `n_inconclusive`. That the *capped* path still refuses is the point: M11.2 relaxed the
+    noise-swamped-probe case, not the genuinely-incomplete one."""
+    with pytest.raises(GeometryError, match="does not resolve the polytope to span_tol"):
         build_geometry(
             two_free_dimensions(),
             config=GeometryConfig(max_span_probes=1),

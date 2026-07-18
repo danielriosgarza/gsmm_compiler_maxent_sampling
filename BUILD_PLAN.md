@@ -1086,6 +1086,54 @@ stream rather than on the input*; after the fix the only refusals are two strain
     commits to accumulated support/span state, else the stage needs a full cold restart. And the
     shared cause is a **measurement M11.2 must make first** (the paired warm-vs-fresh experiment),
     not a fact the census established.
+
+#### M11.2 — the span gate, the build-wide solve session, and a floor the sweep *split* in two
+
+**Built.** (A) the span certificate's `exhaustive` is `resolution ≤ span_tol`, not `n_inconclusive
+== 0` — the flatness claim rests only on each probe's rigorous `width_upper`, so a noise-swamped
+probe (a *primal* discovery signal) is no reason to refuse (§1.6.10's open question, answered *no*).
+One extracted `_span_resolution` feeds both the report and the gate. (B) a build-wide `_SolveSession`
+owns the LP instance: warm until the first `kUnknown`, cold-only after — fixing the leak Codex found,
+where M11.1's `warm = None` was function-local to `blocked_reactions` while `build_geometry` kept
+warm-starting the later stages off the same degraded instance. A `resolution > span_tol` refusal is
+re-confirmed by a **fully-cold re-sweep** before it is final.
+
+**Measured, build-geometry over all 40: OK 4 → 20 → 30; `kUnknown@flux_only` 8 → 0** (the session
+eliminated every one; the paired warm-vs-fresh experiment confirmed each is warm-start history, as
+required before building). The control (Bifido) never leaves the warm path (`n_cold_solves = 0`).
+
+**The closing `/collab` found four places the diff did not match the approved design, all fixed:**
+(1) `blocked_reactions` caught *every* `LPNotOptimalError`, not only `kUnknown` — an infeasible or
+unbounded status (a model verdict a fresh basis cannot change) would have been silently cold-retried;
+`_reraise_unless_kunknown` now re-raises all but `kUnknown`. (2) the cold pair bypassed the approved
+`solve_fresh_once`; it uses it now. (3) `degraded_at`/`n_cold_solves` and `n_lp_solves` counted
+different solve populations without saying so — `degraded_at` (a session index that read 0 when the
+degradation was in `blocked_reactions`) became `degraded: bool`, and each counter now documents
+exactly what it counts and the serialized-build assumption behind the global one.
+
+🔴 **(4) is the one that changed a conclusion, and it is the reason to run the measurement Codex
+demanded.** I had called the 2 span refusals "genuine, deterministic, confirmed cold." A cold
+re-sweep *keeps the RNG-discovered basis*, so a different `model_id` gives a different resolution — I
+had measured one seed each. The 8-seed sweep **split them**:
+  - **pumilus: 8/8 seeds refuse** (resolution 2.35e-9…5.20e-9, d = 88). A **genuine √k floor** — the
+    axis-wise complement certificate cannot certify it to 1e-9 under *any* seed. `resolution =
+    √k·max_width` with `k = n_free − d = 391` and `max_width ≈ 1.4e-10`; the √k (subadditivity, §1.4)
+    is not optional, so this is a real limit of *this* certificate, deferred like *Hafnia*.
+  - **Liquorilactobacillus: 3/8 seeds *pass*** (resolution 7.67e-10…4.57e-9, d = 56). **RNG-marginal,
+    not a floor.** `max_width` is a property of the *discovered basis*, so the resolution straddles
+    span_tol by seed — §1.6.10 resurfacing at the *resolution* level. The fix is a **tighter,
+    basis-independent** span certificate (the true worst width over `range(B)ᗮ` is basis-independent;
+    `√k·max_width` over an arbitrary orthonormal basis is a loose, basis-dependent estimate of it),
+    which is genuine new work, **not** the gate change M11.2 made. Deferred.
+
+**So M11.2 closes on its stated scope** — the `kUnknown` crashes and the noise-swamped span refusals
+are fixed — and leaves a refined, honest residue: pumilus (a genuine √k floor) and Liquorilactobacillus
+(the √k certificate's basis-dependence). The "samples are valid to resolution `R`" contract (accept a
+coarser-than-`span_tol` geometry and *report* `R`) is a **separate milestone**, because a small
+orthogonal-width bound does not by itself bound the sampled distribution's error — a thin polytope's
+cross-sectional volume can vary strongly along the retained directions, and in total variation the
+slice law can be singular against the full-dimensional target (Codex). *Getting a bar to pass is not
+the same as earning the claim behind it — the milestone's own recurring lesson, one level up.*
 - **Span gates on `resolution ≤ span_tol`**, replacing `n_inconclusive == 0`. See §1.6.10's open
   question: the answer is **no**, an inconclusive probe is evidence of nothing about the span.
   Measured — the two failing directions are **conclusive** when re-probed cold *and* when re-probed
@@ -1225,7 +1273,7 @@ step that rescaled the pressure by an arbitrary median every iteration. Recorded
 | **M9** | Performance & GSMM hardening | `benchmark.py` (new module) + `maxent benchmark` CLI → [benchmarks/M9_REPORT.md](benchmarks/M9_REPORT.md); worker-count sweep {1,2,4,7,14} by **ESS(J)/wall-sec**; allocation + sort profiling; `reduced` storage-mode validation; **the reachable-state mass-balance certificate (§1.4.2)** — scope added mid-milestone when the benchmark's own worker sweep could not run | benchmark report produced; all performance assertions hold (no per-step HiGHS, no scipy, no Python loop in chord, no element-wise highspy extraction, no full reconstruction every step) |
 | **M10** | Deferred extensions | **(1) pilot rerounding + pilot-based `s_J` — DONE**, as one DAG (bootstrap `T₀` → geometry pilot → `T₁` → scale pilot → `σ̂₀`), `energy_scale="pilot_sd"` additive beside `warmup_range` (§1.6.6). **(2a) wire the DAG into `batch`/CLI — DONE**; the recorded "fork §1.1 does not settle" was plain/code drift (§1.6.7). **(2b) key the pilots into the cache — DONE** (§1.6.6b, §1.6.7): the pilots are the DAG's only expensive node (19.3 s vs geometry's 1.17 s). **(2c) overlap `prepare_model` with sampling across models — DONE** (§1.6.9): §1.2 did mandate it *and* the arithmetic backed it, but only at a real ladder — at the `betas=(0.0,)` default the same overlap is worth ~5%, and the default is what a reader would have measured. A one-model lookahead (submit `i` → prepare `i+1` → drain `i`); measured A/B at M=3 **131.6 s → 93.1 s (1.41×**, 96% of the 1.47× achievable at that M; asymptote 1.93×). The recorded "two-phase pool dispatch" was indeed the **weaker** remedy — but for an unstated reason: once prepare overlaps sampling the pilots are *free*, so pooling them adds **0.7%**. **(2d) L0 cached — DONE** (M10.2d): warm `prepare_model` 1.21 s → 0.645 s, and a warm run never imports cobra. Then: β→performance calibration (spec §22.3, now cheap — `q(β)` and `r_eff(κ)` are already computed); parallel tempering; slice line kernel; downstream mode-feature extraction | each behind its own tests; none alters the validated v1 target distribution. **(1) PASSED 2026-07-16** (37 new tests; `/collab` 4 rounds AGREE; ladder closes 75.8% of the gap at β=16 vs 13% before, cond(C_q) 2.57× better — *see §1.6.6b: the 2.87× recorded here was pre-M10.2a and stale*). **(2b) PASSED 2026-07-17** (18 new tests; `/collab` 3 rounds — round 1 refuted my payload design, round 3 found a hit/miss asymmetry **inside my own repair**; `prepare_model` 22.9 s → 1.2 s warm, `T₁`/`s_J` bit-identical). **(2c) PASSED 2026-07-17** (4 new tests, both overlap tests proved non-vacuous against the serial order; 1.41× at M=3, draws bit-identical to the un-overlapped path). 🔴 **(2c) also measured a live defect it did not cause: the span certificate refuses 12.5% of valid strains (2 of 16 `model_id`s) — see §1.6.10** |
 
-| **M11** | 🔴 **v1 on the real batch** — the 40 curated strains the package exists for (§1.6.11) | **(0) the L3 lookup key names its solver — DONE** (M11.0): `highs_backend.solver_identity` (`BACKEND_IMPL_VERSION` + the installed HiGHS version, read from `importlib.metadata` so the key never imports the solver) folded into `batch.geometry_cache_key`. **Forced first**: every remaining item changes solve bytes, and without this a bumped backend was a *hit* that then died on the content key (§1.1 wants a miss), while the HiGHS version was in **neither** identity — a `uv sync` silently reused another solver's geometry. Then: **(1)** `blocked_reactions`' third state + one bounded cold escalation (22 + 9 strains); **(2)** span gates on `resolution ≤ span_tol` (2 strains, and the ~12% seed lottery); **(3)** reachability's caller-specific dual-witness path (1 strain); **(4)** re-run the 40-strain census; **(5)** release: LICENSE, README/docs, a manifest that reads the real `strains.tsv` | `build-geometry` succeeds on the curated 40, or refuses for a reason that is a property of the **model** rather than of the RNG stream — the disease being a gate whose verdict the seed decides. Every remedy names the measurement that confirms its premise *first*. **(0) PASSED 2026-07-17** (962 tests, +4; the two key tests fail on the shipped code with an identical digest, and the subprocess isolation test is proved non-vacuous by sabotage). **(1) PASSED 2026-07-17** (965 tests; `/collab` DISAGREE×3, all adopted): the three-state classifier + fully-cold escalation takes **build-geometry OK from 4 → 20 of 40**; `blocked_reactions` now refuses only the **2 *Hafnia*** strains, structurally deterministic (it takes no seed) — the RNG-marginal *disease* is fixed. 🔴 The stated "zero-unresolved" gate is **not** met (Codex): *Hafnia* is a repeatable certificate floor, deferred, not closed. The 13 remaining `kUnknown`/span failures are the same degradation in later stages → M11.2/M11.3. ⚠️ **Still measures geometry only** — rounding, the pilot DAG and the sampler have **never run on an aerobe**, and §1.2's "at d≤55 sequential wins" is a claim about the one anaerobe |
+| **M11** | 🔴 **v1 on the real batch** — the 40 curated strains the package exists for (§1.6.11) | **(0) the L3 lookup key names its solver — DONE** (M11.0): `highs_backend.solver_identity` (`BACKEND_IMPL_VERSION` + the installed HiGHS version, read from `importlib.metadata` so the key never imports the solver) folded into `batch.geometry_cache_key`. **Forced first**: every remaining item changes solve bytes, and without this a bumped backend was a *hit* that then died on the content key (§1.1 wants a miss), while the HiGHS version was in **neither** identity — a `uv sync` silently reused another solver's geometry. Then: **(1)** `blocked_reactions`' third state + one bounded cold escalation (22 + 9 strains); **(2)** span gates on `resolution ≤ span_tol` (2 strains, and the ~12% seed lottery); **(3)** reachability's caller-specific dual-witness path (1 strain); **(4)** re-run the 40-strain census; **(5)** release: LICENSE, README/docs, a manifest that reads the real `strains.tsv` | `build-geometry` succeeds on the curated 40, or refuses for a reason that is a property of the **model** rather than of the RNG stream — the disease being a gate whose verdict the seed decides. Every remedy names the measurement that confirms its premise *first*. **(0) PASSED 2026-07-17** (962 tests, +4; the two key tests fail on the shipped code with an identical digest, and the subprocess isolation test is proved non-vacuous by sabotage). **(1) PASSED 2026-07-17** (965 tests; `/collab` DISAGREE×3, all adopted): the three-state classifier + fully-cold escalation takes **build-geometry OK from 4 → 20 of 40**; `blocked_reactions` now refuses only the **2 *Hafnia*** strains, structurally deterministic (it takes no seed) — the RNG-marginal *disease* is fixed. 🔴 The stated "zero-unresolved" gate is **not** met (Codex): *Hafnia* is a repeatable certificate floor, deferred, not closed. **(2) PASSED 2026-07-18** (span gate `resolution ≤ span_tol` + a build-wide solve session; `/collab` design-review + DISAGREE×1 closing, 4 discrepancies fixed): **build-geometry OK 20 → 30 of 40**, `kUnknown@flux_only` **8 → 0** (the session fixed the leak where M11.1's abandonment did not cross stages), the §1.6.10 noise-swamped span refusals gone. The 8-seed sweep Codex demanded **split** the 2 span residues: **pumilus is a genuine √k floor** (8/8 refuse), **Liquorilactobacillus is RNG-marginal** (3/8 pass — a basis-dependence needing a tighter certificate). Both deferred; the "valid to resolution R" contract is a separate milestone. ⚠️ **Still measures geometry only** — rounding, the pilot DAG and the sampler have **never run on an aerobe**, and §1.2's "at d≤55 sequential wins" is a claim about the one anaerobe |
 
 ### 2.1 What M6 ships, and what it does not  *(M6 finding; SETTLED — and it constrains M10)*
 
