@@ -18,3 +18,7 @@ htmlcov/
 # Run artifacts
 results/
 cache/
+
+# Generated plots — regenerable from benchmark scripts (deterministic, seed 0); kept out of git
+# to match the benchmarks/ convention of tracking scripts + reports + JSON, not binary figures.
+benchmarks/plots/
